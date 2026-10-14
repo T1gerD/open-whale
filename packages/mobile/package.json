@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@babel/core": "^7.28.0",
+    "@babel/preset-typescript": "^7.28.0",
     "@openwhale/protocol": "workspace:*",
     "babel-preset-expo": "~57.0.15",
     "expo": "~57.0.28",
