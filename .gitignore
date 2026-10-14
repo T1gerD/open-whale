@@ -16,6 +16,10 @@ packages/mobile/dist/
 *.aab
 *.keystore
 
+# Locally built release artifacts (scripts/build-plugin-package.mjs, expo builds).
+# The published copies live on the GitHub Release, not in the source tree.
+release/
+
 # Plugin runtime state, if someone runs the plugin from a checkout
 openwhale.log
 state.json

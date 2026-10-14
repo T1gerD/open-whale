@@ -1,0 +1,128 @@
+name: release
+
+# Builds the two distributables and publishes them as a GitHub Release:
+#   * dsh-openwhale-<version>.tgz — the computer plugin (installed with
+#     `dsh plugin --profile <p> add <tarball>`)
+#   * open-whale-<version>.apk    — the Android app
+#
+# The APK is built here rather than in the repository author's environment because
+# that machine has no JDK and no Android SDK. GitHub's runners do, and this also
+# makes every release reproducible by anyone who can push a tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '同时创建/更新 GitHub Release（手动触发时）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Read versions from the repository
+        id: meta
+        run: |
+          node -e "
+            const p=require('./packages/plugin/package.json');
+            const m=require('./packages/mobile/package.json');
+            if(p.version!==m.version) throw new Error('plugin and mobile versions differ: '+p.version+' vs '+m.version);
+            const fs=require('fs');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'version='+p.version+'\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'tag=v'+p.version+'\n');
+          "
+
+      # No install step: every suite in this repository runs against a bare Node.
+      - name: Run all test suites
+        run: node scripts/run-tests.mjs
+
+      - name: Build the plugin tarball
+        run: node scripts/build-plugin-package.mjs
+
+      # --- Android app -------------------------------------------------------
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install workspace dependencies
+        # Installed at the repo root so the workspace link for
+        # `@openwhale/protocol` resolves. The mobile app's Metro config also points
+        # at the root `node_modules`, which is how Expo expects a pnpm monorepo.
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Align Expo package versions
+        working-directory: packages/mobile
+        # A few Expo packages are declared as "*". Pin them to the versions that
+        # match the pinned Expo SDK so a brand-new upstream release cannot break
+        # the build. Advisory: if the Expo CLI cannot reach the registry we carry
+        # on with what the resolver installed and let prebuild/Gradle decide.
+        run: |
+          npx --yes expo install --check || true
+          npx --yes expo install --fix || true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Generate the Android project
+        working-directory: packages/mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Build the release APK
+        working-directory: packages/mobile/android
+        run: |
+          chmod +x ./gradlew
+          # Release build, signed with the debug keystore: installable for personal
+          # use without maintaining a keystore in CI. See docs/mobile-build.md for
+          # how to sign a distributable build.
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Collect the APK
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          APK="$(find packages/mobile/android/app/build/outputs/apk/release -name '*.apk' | head -n1)"
+          if [ -z "$APK" ]; then echo "no APK produced"; exit 1; fi
+          cp "$APK" "release/open-whale-${{ steps.meta.outputs.version }}.apk"
+          ls -lh release/
+
+      - name: Checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: open-whale-${{ steps.meta.outputs.version }}
+          path: release/*
+          if-no-files-found: error
+
+      # Publishing happens on a tag push. A manual run only builds and uploads
+      # artifacts, so a workflow_dispatch can never move a release people may
+      # already be pointing at.
+      - name: Publish the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Open Whale ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: false
+          files: release/*
