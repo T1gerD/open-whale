@@ -175,14 +175,45 @@ export function binaryNames(platform = process.platform) {
  * @param {NodeJS.Platform} [platform]
  * @param {Record<string, string|undefined>} [env]
  */
-export function defaultCacheDir(platform = process.platform, env = process.env) {
-  if (platform === 'win32') {
-    const base = env.LOCALAPPDATA ?? env.APPDATA ?? join(homedir(), 'AppData', 'Local')
-    return join(base, 'openwhale', 'cloudflared')
+/**
+ * Join path segments using the separators of a *target* platform.
+ *
+ * `node:path.join` uses the separator of the platform the code is running on,
+ * which is wrong here: every function in this module takes an explicit `platform`
+ * describing the machine being managed, and callers use it to reason about a
+ * different OS than the current one (the plugin is also exercised on Linux CI while
+ * targeting Windows). Mixing the two produced paths like `C:\cache/dir` on Linux —
+ * still recognisable to a human, but not equal to the string a Windows target would
+ * actually have, so discovery silently found nothing.
+ *
+ * @param {NodeJS.Platform} platform
+ * @param {string[]} segments
+ * @returns {string}
+ */
+function joinForPlatform(platform, ...segments) {
+  const separator = platform === 'win32' ? '\\' : '/'
+  const cleaned = []
+  for (const segment of segments) {
+    const text = String(segment ?? '')
+    if (text === '') continue
+    cleaned.push(cleaned.length === 0 ? text.replace(/[\\/]+$/, '') : text.replace(/^[\\/]+|[\\/]+$/g, ''))
   }
-  if (platform === 'darwin') return join(homedir(), 'Library', 'Caches', 'openwhale', 'cloudflared')
-  const base = env.XDG_CACHE_HOME ?? join(homedir(), '.cache')
-  return join(base, 'openwhale', 'cloudflared')
+  const joined = cleaned.join(separator)
+  // Preserve an explicit root, so '/a' + 'b' does not become 'a/b'.
+  return segments.length > 0 && String(segments[0] ?? '').startsWith(separator) && !joined.startsWith(separator)
+    ? separator + joined
+    : joined
+}
+
+export function defaultCacheDir(platform = process.platform, env = process.env) {
+  const home = homedir()
+  if (platform === 'win32') {
+    const base = env.LOCALAPPDATA ?? env.APPDATA ?? joinForPlatform(platform, home, 'AppData', 'Local')
+    return joinForPlatform(platform, base, 'openwhale', 'cloudflared')
+  }
+  if (platform === 'darwin') return joinForPlatform(platform, home, 'Library', 'Caches', 'openwhale', 'cloudflared')
+  const base = env.XDG_CACHE_HOME ?? joinForPlatform(platform, home, '.cache')
+  return joinForPlatform(platform, base, 'openwhale', 'cloudflared')
 }
 
 /**
@@ -213,7 +244,7 @@ function pathCandidates(names, env, platform) {
   for (const dir of dirs) {
     for (const name of names) {
       for (const ext of extensions) {
-        out.push(join(dir, ext && !name.toLowerCase().endsWith(ext) ? name + ext : name))
+        out.push(joinForPlatform(platform, dir, ext && !name.toLowerCase().endsWith(ext) ? name + ext : name))
       }
     }
   }
@@ -244,13 +275,13 @@ function cacheCandidates(cacheDir, platform, isFile, readdir = readdirSync) {
   }
   for (const entry of entries.sort().reverse()) {
     if (!names.some(n => entry.startsWith(n))) continue
-    const full = join(cacheDir, entry)
+    const full = joinForPlatform(platform, cacheDir, entry)
     // Go through `isFile` (never statSync directly) so the whole discovery path —
     // including cache entries — stays injectable for tests, and so "exists" and
     // "is a regular file" are decided in exactly one place.
     if (isFile(full)) out.push(full)
   }
-  for (const name of names) out.push(join(cacheDir, name))
+  for (const name of names) out.push(joinForPlatform(platform, cacheDir, name))
   return out
 }
 
@@ -462,7 +493,7 @@ export async function installCloudflared(options = {}) {
 
   mkdirSync(cacheDir, { recursive: true })
   const filename = platform === 'win32' ? `cloudflared-${version}.exe` : `cloudflared-${version}`
-  const target = join(cacheDir, filename)
+  const target = joinForPlatform(platform, cacheDir, filename)
   const tmp = `${target}.${process.pid}.part`
   writeFileSync(tmp, bytes, { mode: 0o755 })
   renameSync(tmp, target)
