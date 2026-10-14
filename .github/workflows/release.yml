@@ -79,20 +79,47 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - name: Check the preinstalled Android SDK
+        # Deliberately not `android-actions/setup-android`: that action tries to
+        # install the legacy `tools` package, which no longer exists, and fails the
+        # whole job ("Failed to find package 'tools'"). The ubuntu runner image
+        # already ships a complete SDK, and Gradle downloads any missing component
+        # once the licences are accepted.
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          test -d "$SDK" || { echo "no Android SDK at $SDK"; exit 1; }
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          ls "$SDK"
+
+      - name: Accept the Android SDK licences
+        # A fresh runner usually has these accepted; doing it explicitly means Gradle
+        # can auto-download whatever build-tools/platform version the project asks for
+        # instead of failing halfway through the build.
+        run: |
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || \
+          yes | "${ANDROID_HOME}/cmdline-tools/16.0/bin/sdkmanager" --licenses > /dev/null 2>&1 || \
+          echo "::warning::could not accept the SDK licences automatically; Gradle may need preinstalled components"
 
       - name: Generate the Android project
         working-directory: packages/mobile
         run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Point Gradle at the SDK
+        working-directory: packages/mobile/android
+        run: echo "sdk.dir=${ANDROID_HOME}" > local.properties
 
       - name: Build the release APK
         working-directory: packages/mobile/android
         run: |
           chmod +x ./gradlew
           # Release build, signed with the debug keystore: installable for personal
-          # use without maintaining a keystore in CI. See docs/mobile-build.md for
-          # how to sign a distributable build.
-          ./gradlew assembleRelease --no-daemon
+          # use without keeping a keystore in CI. See docs/mobile-build.md for how to
+          # sign a distributable build.
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Collect the APK
         run: |

@@ -16,9 +16,24 @@ const here = dirname(fileURLToPath(import.meta.url))
 const authorityPath = join(here, '..', '..', 'protocol', 'src', 'index.mjs')
 const copyPath = join(here, '..', 'src', 'protocol.mjs')
 
+/**
+ * Read a source file with line endings normalised.
+ *
+ * The comparison is about *content*: Git rewrites LF to CRLF on checkout unless
+ * `.gitattributes` stops it, and even with `-text` pinned the flag can be bypassed
+ * by a different checkout, a tool that rewrites files, or `core.autocrlf` on a
+ * fresh clone. Normalising here means a CRLF checkout cannot masquerade as a stale
+ * copy — which is exactly how this test failed on Windows CI while passing on the
+ * machine the file was generated on.
+ * @param {string} path
+ */
+function readNormalised(path) {
+  return readFileSync(path, 'utf8').replaceAll('\r\n', '\n')
+}
+
 test('the plugin copy matches the authoritative protocol byte for byte', () => {
-  const authority = readFileSync(authorityPath, 'utf8')
-  const copy = readFileSync(copyPath, 'utf8')
+  const authority = readNormalised(authorityPath)
+  const copy = readNormalised(copyPath)
   const expectedHash = hashOf(authority)
   const marker = copy.split('\n').find(line => line.startsWith(MARKER_PREFIX))
   assert.ok(marker, 'the generated copy must carry its source hash marker')
@@ -52,7 +67,7 @@ test('regenerating the copy is deterministic', () => {
 })
 
 test('the generated copy never escapes the package', () => {
-  const copy = readFileSync(copyPath, 'utf8')
+  const copy = readNormalised(copyPath)
   // A relative import that leaves src/ would resolve differently once the plugin
   // is copied into a profile.
   const escaping = [...copy.matchAll(/from '(\.[^']+)'/g)]
@@ -64,7 +79,7 @@ test('the generated copy never escapes the package', () => {
 test('the plugin sources only import the protocol from inside the package', () => {
   const sources = ['index.mjs', 'gateway.mjs', 'pairer.mjs', 'power.mjs', 'state.mjs', 'dsh-bridge.mjs']
   for (const file of sources) {
-    const text = readFileSync(join(here, '..', 'src', file), 'utf8')
+    const text = readNormalised(join(here, '..', 'src', file))
     const imports = [...text.matchAll(/from '([^']*protocol[^']*)'/g)].map(match => match[1])
     for (const spec of imports) {
       assert.equal(
