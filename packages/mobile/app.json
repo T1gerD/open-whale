@@ -2,7 +2,7 @@
   "expo": {
     "name": "Open Whale",
     "slug": "open-whale",
-    "version": "1.0.0",
+    "version": "1.0.7",
     "orientation": "portrait",
     "scheme": "openwhale",
     "userInterfaceStyle": "dark",
@@ -10,7 +10,7 @@
     "primaryColor": "#5b8cff",
     "android": {
       "package": "dev.openwhale.app",
-      "versionCode": 1,
+      "versionCode": 7,
       "edgeToEdgeEnabled": true,
       "permissions": [
         "android.permission.INTERNET",

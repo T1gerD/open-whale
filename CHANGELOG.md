@@ -2,6 +2,46 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.7] - 2026-10-14
+
+**首个带可安装产物的版本。** 电脑端插件安装包与安卓 APK 均由 GitHub Actions 构建并随
+[Release](https://github.com/T1gerD/open-whale/releases/latest) 发布。
+
+### 新增
+
+- 发布流水线（`.github/workflows/release.yml`）：在 tag 上构建插件 tarball 与 APK，
+  生成 `SHA256SUMS.txt`，并创建 GitHub Release
+- `scripts/build-plugin-package.mjs`：可复现的插件打包（显式文件清单、标准 npm 布局、
+  缺文件即失败）
+- 安装包 tarball 的端到端验证：在隔离 `DSH_HOME` 中真实安装并启动，10/10 项通过
+  （健康检查、二维码生成与手机侧校验、携带公钥、WebSocket 握手、设备绑定、用二维码公钥
+  验签、聊天到达助手层、**已绑定设备免扫码重连**）
+
+### 修复
+
+这一版几乎全部工作都在「让别人的机器上也能构建成功」。以下每个问题都是 CI 实测出来的：
+
+- **云隧道路径拼接**：`node:path.join` 按运行平台拼分隔符，而模块参数里的 `platform`
+  是目标平台；在 Linux 上会构造出 `C:\cache/x` 这类混合路径，导致发现逻辑静默失败
+- **大文件传输缺少背压**：整个文件灌入 socket 内部队列，macOS 上 700 KB 即超时；
+  改为「发一帧 → 若缓冲则等 drain」
+- **协议副本比对绑定 checkout 行尾**：Windows 的 CRLF 使哈希不一致；生成器与测试统一
+  按内容（LF）判定，`sync --check` 同理
+- **`android-actions/setup-android@v3` 已损坏**：它会安装早已移除的 `tools` 包；
+  改用 runner 预装的 SDK
+- **`babel-preset-expo` 版本号写错**：Expo SDK 是 57.0.28，而该 preset 的版本线是
+  57.0.15；错误版本直接让 `pnpm install` 失败
+- **`.mts` 未被剥离类型**：Metro 只把 `.ts`/`.tsx` 当 TypeScript，`export interface`
+  在打包时报语法错误；最终在顶层 presets 加入 `@babel/preset-typescript`
+  （`overrides` 写法会因 Metro 不传文件名而失败）
+- 关闭握手回显被 RST 丢弃、升级前 HTTP 头被当作帧、非本插件 upgrade 路径连接悬挂、
+  `gateway.close()` 永不返回
+
+### 变更
+
+- 仓库内所有版本号统一为 `1.0.7`（此前 tag 与产物名不一致）
+- 通过 API 创建的 tag 不触发 `push` 事件，`release.yml` 因此支持手动传入 `tag`
+
 ## [1.0.0] - 2026-10-13
 
 第一版。电脑端 DSH 插件 + 手机端 Expo 应用，两侧通过配对后的加密身份互相认证，
@@ -68,4 +108,5 @@
 - 端到端覆盖防冒充、防二维码重放、防单机双绑、附件落盘、大文件分片哈希一致
 - 发布包（tarball）另行做了「安装后启动并完成绑定/对话/重连」的实测
 
+[1.0.7]: https://github.com/T1gerD/open-whale/releases/tag/v1.0.7
 [1.0.0]: https://github.com/T1gerD/open-whale/releases/tag/v1.0.0

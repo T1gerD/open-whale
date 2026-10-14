@@ -72,15 +72,15 @@ open-whale/
 
 | 文件 | 装到哪 | 怎么装 |
 |---|---|---|
-| `dsh-openwhale-1.0.0.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-1.0.0.tgz`，然后重启 DSH |
-| `open-whale-1.0.0.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装；扫码绑定电脑 |
+| `dsh-openwhale-1.0.7.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-1.0.7.tgz`，然后重启 DSH |
+| `open-whale-1.0.7.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装；扫码绑定电脑 |
 
 APK 由 GitHub Actions 在发布时构建（本仓库作者的环境里没有 JDK 与 Android SDK），用 debug keystore 签名，**适合个人自用安装**；要出正式签名的包见 [docs/mobile-build.md](docs/mobile-build.md)。
 
 插件包同样可以自己打：
 
 ```bash
-node scripts/build-plugin-package.mjs     # → release/dsh-openwhale-1.0.0.tgz
+node scripts/build-plugin-package.mjs     # → release/dsh-openwhale-1.0.7.tgz
 ```
 
 ---
@@ -92,7 +92,7 @@ node scripts/build-plugin-package.mjs     # → release/dsh-openwhale-1.0.0.tgz
 从 Release 的 tarball 安装：
 
 ```bash
-dsh plugin --profile desktop add ./dsh-openwhale-1.0.0.tgz
+dsh plugin --profile desktop add ./dsh-openwhale-1.0.7.tgz
 ```
 
 或者从源码目录安装（开发时更方便，改动只需重启 DSH）：
