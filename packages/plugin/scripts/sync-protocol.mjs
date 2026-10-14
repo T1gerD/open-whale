@@ -71,7 +71,11 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       console.error('src/protocol.mjs is missing — run `node scripts/sync-protocol.mjs`')
       process.exit(1)
     }
-    if (current !== content) {
+    // Compare content, not checkout form: Git rewrites LF to CRLF on Windows, and
+    // `.gitattributes` would have to be honoured by every checkout path to prevent
+    // it. A CRLF working copy is not a stale copy.
+    const normalise = text => text.replaceAll('\r\n', '\n')
+    if (normalise(current) !== normalise(content)) {
       console.error('src/protocol.mjs is out of sync with packages/protocol/src/index.mjs')
       console.error('run `node packages/plugin/scripts/sync-protocol.mjs` and commit the result')
       process.exit(1)
