@@ -267,6 +267,36 @@ export class WsConnection extends EventEmitter {
     return this.#send(encodeFrame(OPCODE.TEXT, Buffer.from(text, 'utf8')))
   }
 
+  /**
+   * Send one text frame and report whether the socket kept up.
+   *
+   * Bulk transfers use this instead of `send()` so they can await `waitForDrain()`
+   * when the peer is slower than the disk: queueing a whole file into an
+   * un-drained socket makes the transfer stall instead of completing.
+   * @param {string} text
+   * @returns {boolean} false when the connection is gone or the write buffered
+   */
+  sendWithBackpressure(text) {
+    if (this.closed) return false
+    return this.#send(encodeFrame(OPCODE.TEXT, Buffer.from(text, 'utf8')))
+  }
+
+  /** Resolve once the socket has drained, or immediately if it is already gone. */
+  waitForDrain() {
+    if (this.closed || this.socket.writableEnded || this.socket.destroyed) return Promise.resolve()
+    return new Promise(resolve => {
+      const done = () => {
+        this.socket.off('drain', done)
+        this.socket.off('close', done)
+        this.socket.off('error', done)
+        resolve(undefined)
+      }
+      this.socket.once('drain', done)
+      this.socket.once('close', done)
+      this.socket.once('error', done)
+    })
+  }
+
   /** @param {number} [code] @param {string} [reason] @param {{echo?: boolean}} [options] */
   close(code = 1000, reason = '', options = {}) {
     if (this.closed) return

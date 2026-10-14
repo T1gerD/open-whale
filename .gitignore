@@ -36,3 +36,9 @@ Thumbs.db
 *.log
 npm-debug.log*
 yarn-error.log*
+
+# A `.gitattributes` in this repository pins `src/protocol.mjs` to LF on checkout.
+# It has to: the file is a *generated copy* whose sha256 is asserted against the
+# authoritative source, and Git's default `core.autocrlf` behaviour on Windows would
+# rewrite its line endings on checkout and break that assertion (observed on Windows
+# CI). Do not add other rules there without keeping that one.

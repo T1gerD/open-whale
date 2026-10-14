@@ -53,8 +53,10 @@ jobs:
       # --- Android app -------------------------------------------------------
 
       - uses: pnpm/action-setup@v4
+        # No explicit version: the action reads `packageManager` from
+        # package.json. Passing both is what made this step fail.
         with:
-          version: 9
+          run_install: false
 
       - name: Install workspace dependencies
         # Installed at the repo root so the workspace link for

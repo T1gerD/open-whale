@@ -1,0 +1,17 @@
+# Line endings are part of the contract for one generated file.
+#
+# `packages/plugin/src/protocol.mjs` is generated from `packages/protocol/src/index.mjs`
+# and carries a sha256 of its source; `test/protocol-copy.test.mjs` asserts the copy
+# matches the authority byte for byte, and CI re-checks it with
+# `sync-protocol.mjs --check`.
+#
+# On Windows, Git's default checkout behaviour (`core.autocrlf`) rewrites LF to CRLF,
+# which changes those bytes and makes the assertion fail on a clean clone — observed
+# on Windows CI while passing on the developer's machine. Pinning this file to LF
+# keeps the hash stable everywhere.
+packages/plugin/src/protocol.mjs -text
+
+# Everything else is normalised: text files are stored with LF in the repository and
+# checked out with the platform's convention, so a Windows working copy still gets
+# CRLF for editors that expect it.
+* text=auto

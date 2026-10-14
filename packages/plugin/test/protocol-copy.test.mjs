@@ -30,6 +30,20 @@ test('the plugin copy matches the authoritative protocol byte for byte', () => {
   assert.equal(copy.endsWith(authority), true, 'the copy body must be the authority, unmodified')
 })
 
+test('the generated copy is LF-only, so the hash cannot depend on the checkout', () => {
+  // Git rewrites LF to CRLF on Windows unless `.gitattributes` stops it, and that
+  // used to make the copy's hash disagree with the authority on Windows CI while
+  // passing locally. Normalising in the generator removes the coupling entirely.
+  const { content } = renderCopy()
+  assert.equal(content.includes('\r\n'), false, 'generated copy must not contain CRLF')
+})
+
+test('a CRLF source hashes the same as its LF form', () => {
+  const authority = readFileSync(authorityPath, 'utf8').replaceAll('\r\n', '\n')
+  const crlf = authority.replaceAll('\n', '\r\n')
+  assert.equal(hashOf(crlf.replaceAll('\r\n', '\n')), hashOf(authority))
+})
+
 test('regenerating the copy is deterministic', () => {
   const first = renderCopy()
   const second = renderCopy()

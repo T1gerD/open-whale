@@ -32,10 +32,17 @@ export function hashOf(text) {
 
 /**
  * Render the generated copy for the current protocol source.
+ *
+ * Line endings are normalised to LF before hashing. The copy's sha256 is asserted
+ * against the authority, and Git's checkout behaviour on Windows rewrites LF to CRLF
+ * unless a `.gitattributes` rule stops it — a divergence that showed up as a failing
+ * test on Windows CI while passing on the developer's machine. Normalising here means
+ * the hash describes the content rather than the checkout, so the check holds
+ * regardless of anyone's `core.autocrlf` setting.
  * @returns {{content: string, hash: string}}
  */
 export function renderCopy() {
-  const original = readFileSync(source, 'utf8')
+  const original = readFileSync(source, 'utf8').replaceAll('\r\n', '\n')
   const hash = hashOf(original)
   const header = [
     '// GENERATED FILE — do not edit by hand.',

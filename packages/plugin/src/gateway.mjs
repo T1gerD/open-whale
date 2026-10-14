@@ -657,20 +657,44 @@ export class Gateway {
           aborted = true
           break
         }
-        const ok = session.send({
+
+        // Respect the socket's write buffer. Pushing a whole large file at a
+        // socket that cannot drain it (a slow phone link, or a host with a smaller
+        // send buffer) queues the remainder in Node's internals, and the transfer
+        // then stalls instead of finishing — observed as a timeout on macOS CI for a
+        // 700 KiB file. Waiting for `drain` bounds memory to one chunk.
+        const frame = JSON.stringify({
           t: SERVER_FRAME.FILE_CHUNK,
           fileId,
-          seq: seq++,
+          seq,
           dataBase64: /** @type {Buffer} */ (chunk).toString('base64'),
         })
-        if (!ok) {
-          aborted = true
-          break
+        const accepted = typeof session.connection.sendWithBackpressure === 'function'
+          ? session.connection.sendWithBackpressure(frame)
+          : session.send({
+            t: SERVER_FRAME.FILE_CHUNK,
+            fileId,
+            seq,
+            dataBase64: /** @type {Buffer} */ (chunk).toString('base64'),
+          })
+        if (!accepted) {
+          // Either the connection is gone or the frame buffered. Distinguish them:
+          // a buffered write must be waited for, a dead connection must abort.
+          if (session.connection.closed) {
+            aborted = true
+            break
+          }
+          await session.connection.waitForDrain()
+          if (session.connection.closed || aborted) {
+            aborted = true
+            break
+          }
         }
+
+        seq += 1
         sent += /** @type {Buffer} */ (chunk).length
-        // Yield to the event loop periodically so a huge file cannot starve
-        // incoming frames (including the phone's cancel).
-        if (seq % 8 === 0) await new Promise(resolve => setImmediate(resolve))
+        // Yield so incoming frames (including the phone's cancel) are never starved.
+        if (seq % 4 === 0) await new Promise(resolve => setImmediate(resolve))
       }
     } finally {
       session.connection.off('close', onClose)
