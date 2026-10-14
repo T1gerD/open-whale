@@ -1,0 +1,19 @@
+﻿{
+  "name": "open-whale",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Open Whale 鈥?remote-connect your phone to DeepSeek Harness on your computer, as a personal-assistant chat app.",
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/run-tests.mjs",
+    "test:protocol": "node packages/protocol/test/protocol.test.mjs",
+    "test:plugin": "node scripts/run-tests.mjs packages/plugin",
+    "test:mobile": "node packages/mobile/test/run.mjs",
+    "sync:protocol": "node packages/plugin/scripts/sync-protocol.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "packageManager": "pnpm@9.15.0"
+}

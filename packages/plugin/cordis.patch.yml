@@ -1,0 +1,23 @@
+# Open Whale plugin bundle patch.
+#
+# `dsh.bundle.patch` points here, and this whole file is applied after every
+# bundle layer in the profile. Rows are addressed by `id`; a later row replaces an
+# earlier row's `config` **entirely** (no deep merge), and file order does not
+# decide load order.
+- insert:
+    - id: openwhale
+      name: 'dsh-openwhale'
+      config:
+        host: Open Whale 电脑
+        enabled: true
+        lanEnabled: true
+        port: 8787
+        heartbeatMs: 25000
+        voice: personal-assistant
+        assistantName: 助理
+        cwd: ''
+        allowRemoteShutdown: true
+        shutdownDelaySeconds: 30
+        autoApproveTools: false
+        tunnelMode: off
+        cloudflaredPath: ''

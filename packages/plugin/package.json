@@ -1,0 +1,31 @@
+﻿{
+  "name": "dsh-openwhale",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open Whale — connect your phone to this computer's DeepSeek Harness as a personal-assistant chat, over LAN or the internet.",
+  "type": "module",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "comment": "Zero runtime dependencies on purpose. The harness provides @deepseek-ai/* when a plugin is loaded from a profile; the QR encoder, the WebSocket server and the wire protocol are implemented in-tree (src/qr.mjs, src/ws.mjs, src/protocol.mjs) so the plugin installs by plain copy with no build step and no dependency tree. `src/protocol.mjs` is generated from packages/protocol by `npm run sync:protocol` and checked by test/protocol-copy.test.mjs.",
+  "scripts": {
+    "sync:protocol": "node scripts/sync-protocol.mjs",
+    "test": "node ../../scripts/run-tests.mjs packages/plugin"
+  },
+  "license": "MIT"
+}

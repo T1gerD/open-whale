@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # The plugin targets DSH on Windows first but must not be Windows-only: the
+    # protocol, gateway, QR encoder and state layer are plain Node code, and the
+    # mobile app's logic is pure TypeScript.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['22', '24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # No install step: every package in this repository has zero runtime
+      # dependencies, so the suites run against a bare Node.
+      - name: Run test suites
+        run: node scripts/run-tests.mjs
+
+      - name: Check that the in-package protocol copy is in sync
+        run: node packages/plugin/scripts/sync-protocol.mjs --check
+
+  mobile-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      # Parses the mobile app's TypeScript without needing the Expo toolchain.
+      - name: Check mobile sources parse
+        run: node packages/mobile/scripts/check-syntax.mjs

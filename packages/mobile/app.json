@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "Open Whale",
+    "slug": "open-whale",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "openwhale",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "primaryColor": "#5b8cff",
+    "android": {
+      "package": "dev.openwhale.app",
+      "versionCode": 1,
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "dev.openwhale.app",
+      "supportsTablet": true
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Open Whale 需要相机来扫描电脑上的绑定二维码。",
+          "recordAudioAndroid": false,
+          "barcodeScannerEnabled": true
+        }
+      ],
+      "expo-sqlite",
+      "expo-secure-store",
+      [
+        "expo-file-system",
+        {
+          "enableFileSharing": true
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

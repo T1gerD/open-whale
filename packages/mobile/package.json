@@ -1,0 +1,43 @@
+{
+  "name": "@openwhale/mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open Whale 手机端：扫码绑定电脑上的 dsh-openwhale 插件，以个人助理聊天的方式远程使用 DSH。",
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "prebuild": "expo prebuild --platform android",
+    "test": "node test/run.mjs",
+    "check": "node scripts/check-syntax.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openwhale/protocol": "workspace:*",
+    "expo": "~57.0.28",
+    "expo-camera": "~57.0.6",
+    "expo-file-system": "~57.0.7",
+    "expo-secure-store": "~57.0.4",
+    "expo-sharing": "~57.0.23",
+    "expo-sqlite": "~57.0.4",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "tweetnacl": "1.0.3",
+    "expo-constants": "*",
+    "expo-crypto": "*",
+    "expo-document-picker": "*",
+    "expo-linking": "*",
+    "expo-router": "*",
+    "expo-status-bar": "*",
+    "react-native-safe-area-context": "*",
+    "react-native-screens": "*"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "typescript": "~5.9.0"
+  },
+  "engines": {
+    "node": ">=22.11"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+packages:
+  - packages/*
+
+# `qrcode` is the only runtime dependency, and its own deps (dijkstrajs, pngjs,
+# yargs) must be resolvable from packages/plugin/src. The default isolated linker
+# marks them "private" and does not hoist them, so a plain `require` inside the
+# CJS qrcode package cannot find them. The hoisted linker keeps the tree flat and
+# makes the module resolvable from any package in the workspace.
+nodeLinker: hoisted
+autoInstallPeers: false

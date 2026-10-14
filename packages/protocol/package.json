@@ -1,0 +1,18 @@
+{
+  "name": "@openwhale/protocol",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Open Whale wire protocol + shared helpers (computer plugin and mobile app both depend on this).",
+  "type": "module",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

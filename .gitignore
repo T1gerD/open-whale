@@ -1,0 +1,34 @@
+# Dependencies — the plugin and protocol ship with zero runtime dependencies on
+# purpose, and the mobile app's dependencies are installed by `pnpm install`.
+node_modules/
+.pnpm-store/
+
+# Test runner scratch output (one log per suite when run through
+# scripts/run-tests.mjs).
+.test-logs/
+
+# Native build output for the mobile app
+packages/mobile/android/
+packages/mobile/ios/
+packages/mobile/.expo/
+packages/mobile/dist/
+*.apk
+*.aab
+*.keystore
+
+# Plugin runtime state, if someone runs the plugin from a checkout
+openwhale.log
+state.json
+uploads/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*

@@ -1,0 +1,14 @@
+# 依赖与构建产物
+node_modules/
+.expo/
+dist/
+*.log
+
+# CNG：android/ 与 ios/ 由 `npx expo prebuild` 生成，不进版本管理
+android/
+ios/
+
+# 本地签名材料（千万不要提交）
+*.keystore
+*.jks
+credentials.json
