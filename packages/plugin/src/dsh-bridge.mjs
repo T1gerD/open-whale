@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from './voice.mjs'
 
@@ -53,11 +54,15 @@ export class DshBridge {
     this.config = options.config
     this.emitRaw = options.emit
     this.log = options.log ?? (() => {})
+    // 让模块级的宿主模块解析也走同一条日志，方便排错。
+    setBridgeDiagnostic(this.log)
     this.defaultCwd = options.defaultCwd ?? (() => process.cwd())
     this.createUserMessage = options.createUserMessage ?? null
     this.modelSelection = options.modelSelection ?? (() => undefined)
     /** deviceId → entry */
     this.entries = new Map()
+    /** sessionId → entry（协作模式下多台设备共用同一个会话） */
+    this.bySession = new Map()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
     /** callId → { deviceId, text, toolCalls, startedAt } */
@@ -87,8 +92,10 @@ export class DshBridge {
       } catch { /* already unwound */ }
     }
     this.subscriptions = []
-    const disposals = [...this.entries.values()].map(entry => entry.handle?.dispose?.().catch(() => {}))
+    const handlers = [...new Set([...this.entries.values()].map(entry => entry.handle))].filter(Boolean)
+    const disposals = handlers.map(handle => handle.dispose().catch(() => {}))
     this.entries.clear()
+    this.bySession.clear()
     this.calls.clear()
     this.files.clear()
     await Promise.all(disposals)
@@ -109,10 +116,18 @@ export class DshBridge {
    */
   async send(input) {
     if (this.disposed) throw new Error('bridge 已关闭')
+    bridgeDiagnostic(`bridge: send 开始 device=${input.deviceId} callId=${input.callId} 文本长度=${input.text?.length ?? 0} 附件=${input.attachments?.length ?? 0}`)
+
     const entry = await this.#ensureAgent(input.deviceId)
     if (!entry) throw new Error('无法创建会话')
+    bridgeDiagnostic(`bridge: 会话就绪 sessionId=${entry.sessionId}`)
 
-    const text = this.#composeText(input)
+    let text = this.#composeText(input)
+    if (this.config.collaboration && input.speaker) {
+      // DSH 会话里没有「发言人」概念，用文本前缀把身份带进去，
+      // 这样电脑端和 GPT 侧都能看出多人协作里是谁在说话。
+      text = `[${input.speaker}] ${text}`
+    }
     this.calls.set(input.callId, {
       deviceId: input.deviceId,
       callId: input.callId,
@@ -124,10 +139,12 @@ export class DshBridge {
     this.emit({ kind: 'typing', deviceId: input.deviceId, callId: input.callId, active: true })
 
     const createUserMessage = this.createUserMessage ?? await loadCreateUserMessage()
+    bridgeDiagnostic('bridge: createUserMessage 已就绪，准备 followup')
     entry.agent.followup(createUserMessage({
       content: [{ type: 'text', text }],
       source: { kind: 'user' },
     }))
+    bridgeDiagnostic(`bridge: followup 已提交 callId=${input.callId}`)
   }
 
   /** Abort the turn that owns this call, if it is still running. */
@@ -194,6 +211,18 @@ export class DshBridge {
     if (existing?.agent && this.ctx.agents.get(existing.sessionId)) return existing
 
     const sessionId = this.sessionIdFor(deviceId)
+
+    // 协作模式：另一个设备已经为这个会话建过 agent，直接挂上去。
+    // 没有这一步，两台手机同时发言会走到 create() 并撞名
+    // （session "ow-xxx" already exists），正是 10-19 那个 bug 的形态。
+    const sharedEntry = this.bySession.get(sessionId)
+    if (sharedEntry?.agent && this.ctx.agents.get(sharedEntry.sessionId)) {
+      const entry = { sessionId, agent: sharedEntry.agent, handle: null }
+      this.entries.set(deviceId, entry)
+      this.bySession.set(sessionId, entry)
+      return entry
+    }
+
     const live = this.ctx.agents.get(sessionId)
 
     /** @type {(agentCtx: any, agent: any) => void} */
@@ -225,6 +254,24 @@ export class DshBridge {
     if (live) {
       const entry = { sessionId, agent: live, handle: null }
       this.entries.set(deviceId, entry)
+      this.bySession.set(sessionId, entry)
+      return entry
+    }
+
+    // 到这里说明：内存里没有活动 agent。但会话可能已经**持久化在磁盘上**
+    // （DSH 重启后内存清空，会话文件仍在）。此时直接 `create()` 会撞名：
+    //   session "ow-xxx" already exists
+    // 这个问题曾导致手机消息全部投递失败，而现象只是「一直发送中」。
+    //
+    // 正确顺序是：
+    //   ① 先 `resume()` 恢复磁盘上的既有会话（保留历史，且能接管上次中断的轮次）
+    //   ② 只有确认磁盘上也没有时，才 `create()` 新建
+    const resumed = await this.#tryResumeAgent(sessionId, setup)
+    if (resumed) {
+      const entry = { sessionId, agent: resumed.agent, handle: resumed.handle }
+      this.entries.set(deviceId, entry)
+      this.bySession.set(sessionId, entry)
+      this.log(`bridge: resumed conversation ${sessionId} for device ${deviceId}`)
       return entry
     }
 
@@ -238,6 +285,41 @@ export class DshBridge {
     this.entries.set(deviceId, entry)
     this.log(`bridge: created conversation ${sessionId} for device ${deviceId}`)
     return entry
+  }
+
+  /**
+   * 尝试恢复一个已持久化的会话。
+   *
+   * `ctx.agents.resume()` 用 `resumeSessionId` 定位磁盘会话（注意字段名与
+   * `create()` 的 `sessionId` 不同），并从会话 header 恢复 meta/cwd，因此
+   * 这里不需要传 `meta`。会话不存在或持久化层未启用时它会 reject，此时
+   * 返回 null 交给调用方走新建分支。
+   *
+   * @param {string} sessionId
+   * @param {(agentCtx: any, agent: any) => void} setup
+   * @returns {Promise<{ agent: any, handle: any } | null>}
+   */
+  async #tryResumeAgent(sessionId, setup) {
+    if (typeof this.ctx.agents?.resume !== 'function') {
+      bridgeDiagnostic('bridge: agents.resume 不可用，跳过恢复')
+      return null
+    }
+    try {
+      const handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions: this.#agentOptions(),
+        setup,
+      })
+      if (!handle?.agent) {
+        bridgeDiagnostic('bridge: resume 返回空 handle，转为新建')
+        return null
+      }
+      return { agent: handle.agent, handle }
+    } catch (error) {
+      // 会话不存在属于正常情况（首次使用），只能降级为 debug 级别提示。
+      bridgeDiagnostic(`bridge: resume 未成功（将尝试新建）：${/** @type {Error} */ (error).message}`)
+      return null
+    }
   }
 
   /**
@@ -278,8 +360,15 @@ export class DshBridge {
    * @param {any} event
    */
   #onSessionEvent(session, event) {
-    const deviceId = this.#deviceForSession(session)
-    if (!deviceId) return
+    // 一台电脑现在可以绑定多台手机；协作模式下它们还共用同一个会话，
+    // 因此回复要发给该会话下的**所有**设备，而不是只发给第一台。
+    const deviceIds = this.#devicesForSession(session)
+    if (deviceIds.length === 0) return
+    for (const deviceId of deviceIds) this.#dispatchSessionEvent(deviceId, event)
+  }
+
+  /** @param {string} deviceId @param {any} event */
+  #dispatchSessionEvent(deviceId, event) {
     const call = this.#currentCall(deviceId)
     if (!call) return
 
@@ -355,20 +444,25 @@ export class DshBridge {
   }
 
   /** @param {any} session */
-  #deviceForSession(session) {
+  #devicesForSession(session) {
     const id = session?.id ?? session?.header?.id
-    if (!id) return undefined
+    if (!id) return []
+    const devices = []
     for (const [deviceId, entry] of this.entries) {
-      if (entry.sessionId === id) return deviceId
+      if (entry.sessionId === id) devices.push(deviceId)
     }
-    return undefined
+    return devices
   }
 
   /** The most recent call still awaiting completion for a device. */
   #currentCall(deviceId) {
+    // 优先取本设备发起的轮次；协作模式下再放开到「同一会话的任何轮次」，
+    // 否则只有发消息的那台手机能看到回复，围观的人全是空白。
     let latest
+    const sessionId = this.entries.get(deviceId)?.sessionId
     for (const call of this.calls.values()) {
-      if (call.deviceId !== deviceId) continue
+      const sameSession = sessionId !== undefined && this.entries.get(call.deviceId)?.sessionId === sessionId
+      if (call.deviceId !== deviceId && !sameSession) continue
       if (!latest || call.startedAt >= latest.startedAt) latest = call
     }
     return latest
@@ -418,10 +512,112 @@ export class DshBridge {
  * The returned factory attaches the message `id` that the agent inbox requires.
  * @returns {Promise<(input: {content: Array<{type: string, text: string}>, source: {kind: string}}) => any>}
  */
+/**
+ * 解析宿主提供的 `@deepseek-ai/*` 包。
+ *
+ * 顺序很关键：**先按宿主 asar 的直接路径导入，最后才退回裸 `import()`**。
+ *
+ * 裸 `import()` 是按**本模块自身所在的位置**解析的。本插件以 `link:` 方式安装时
+ * （`profiles/<profile>/node_modules/dsh-openwhale` 是指向仓库的符号链接），Node 会
+ * 把它解析成仓库的真实路径，而宿主的包只存在于 `app.asar` 里。实测：
+ *  - 旧写法（只做裸导入）→ 抛 `Cannot find package '@deepseek-ai/dsh-llm'`，
+ *    手机端每条消息都收到「处理失败」；
+ *  - 先裸导入、失败再回退 → 裸导入这一步本身会**挂住不返回**（既不 resolve 也不
+ *    reject），`await` 永不结束，于是连回退都走不到，手机端只显示「正在输入…」。
+ *
+ * 宿主进程是 Electron（`D:\AI\DeepSeek Harness.exe` 加载 `app.asar` 内的入口），
+ * 对 asar 内的路径可以像普通文件一样 `import`，实测可直接拿到 `createUserMessage`。
+ */
+const HOST_MODULE_ROOTS = (() => {
+  const roots = []
+  const push = r => {
+    if (r && !roots.includes(r)) roots.push(r)
+  }
+  if (process.env.OPENWHALE_DSH_ROOT) push(process.env.OPENWHALE_DSH_ROOT)
+  const resources = process.resourcesPath
+  if (resources) {
+    push(join(resources, 'app.asar', 'dsh', 'node_modules'))
+    push(join(resources, 'app.asar.unpacked', 'dsh', 'node_modules'))
+  }
+  if (process.execPath) {
+    const dir = dirname(process.execPath)
+    push(join(dir, 'resources', 'app.asar', 'dsh', 'node_modules'))
+    push(join(dir, 'resources', 'app.asar.unpacked', 'dsh', 'node_modules'))
+  }
+  return roots
+})()
+
 let createUserMessageFactory
+
+async function importHostModule(name) {
+  const tried = []
+  // 1) 宿主 asar 直接路径（确定且不依赖模块解析规则）
+  for (const root of HOST_MODULE_ROOTS) {
+    for (const entry of ['lib/index.js', 'index.js']) {
+      const file = join(root, ...name.split('/'), entry)
+      try {
+        const mod = await import(pathToFileURL(file).href)
+        if (mod) return mod
+      } catch (error) {
+        tried.push(`${file} → ${/** @type {Error} */ (error).message}`)
+      }
+    }
+  }
+  // 2) 最后才是裸导入（tarball 安装、或宿主已把自身路径暴露出来时可行）
+  try {
+    return await import(name)
+  } catch (error) {
+    tried.push(`bare ${name} → ${/** @type {Error} */ (error).message}`)
+  }
+  throw new Error(`${name} 无法解析。已尝试：\n  ${tried.join('\n  ') || '（没有任何候选路径）'}`)
+}
+
+/**
+ * 解析宿主模块时的诊断输出。
+ *
+ * 这一段曾经"静默失败"过两次，每次都只能靠手机端的现象反推，代价很大：
+ *  1. 裸导入抛 `Cannot find package` → 手机收到「处理失败」；
+ *  2. 改成"先裸导入再回退"后，裸导入这一步**挂住不返回**，手机只显示「正在输入…」。
+ * 所以这里把每次解析的结果写进插件日志，并给整个加载过程加超时——宁可报错，
+ * 也不要让用户对着一个永远转圈的「正在输入…」。
+ */
+let bridgeDiagnostic = () => {}
+/** 由 bridge 实例注入日志函数，便于在模块级函数里输出诊断。 */
+export function setBridgeDiagnostic(fn) {
+  if (typeof fn === 'function') bridgeDiagnostic = fn
+}
+
+/** 加载宿主模块的超时时间：超过就明确报错，不再无限等待。 */
+const HOST_MODULE_TIMEOUT_MS = 10_000
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} 超过 ${ms}ms 未返回（疑似挂起）`)), ms),
+    ),
+  ])
+}
+
 async function loadCreateUserMessage() {
   if (!createUserMessageFactory) {
-    const module = await import('@deepseek-ai/dsh-llm')
+    let module
+    try {
+      module = await withTimeout(
+        importHostModule('@deepseek-ai/dsh-llm'),
+        HOST_MODULE_TIMEOUT_MS,
+        'importHostModule(@deepseek-ai/dsh-llm)',
+      )
+    } catch (error) {
+      const message = /** @type {Error} */ (error).message
+      bridgeDiagnostic(`bridge: 加载 @deepseek-ai/dsh-llm 失败：${message}`)
+      throw error
+    }
+    const resolved = typeof module.createUserMessage === 'function'
+    bridgeDiagnostic(
+      `bridge: 已加载 @deepseek-ai/dsh-llm（createUserMessage ${resolved ? '可用' : '不可用'}）`,
+    )
+    if (!resolved) throw new Error('@deepseek-ai/dsh-llm 里没有 createUserMessage')
     createUserMessageFactory = module.createUserMessage
   }
   return createUserMessageFactory

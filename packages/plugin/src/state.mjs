@@ -23,6 +23,16 @@ import { DEFAULT_PORT, PAIR_SECRET_TTL_MS, timingSafeEqual } from './protocol.mj
 /** Schema version of the state file; bump with a migration when the shape changes. */
 export const STATE_VERSION = 1
 
+/**
+ * How many phones may be bound to one computer.
+ *
+ * It used to be implicitly 1: the gateway refused a second device even with a
+ * valid pairing secret. A five-person demo needs more, and devices are already
+ * isolated per device by `sessionIdFor`, so the only real cost is unbounded
+ * growth from a leaked QR — hence a hard cap rather than "unlimited".
+ */
+export const MAX_DEVICES = 5
+
 function base64url(buffer) {
   return Buffer.from(buffer).toString('base64url')
 }
@@ -338,6 +348,22 @@ export class StateStore {
   sessionIdFor(deviceId) {
     const digest = createHash('sha256')
       .update(`${this.computerId}:${deviceId}`)
+      .digest('hex')
+      .slice(0, 32)
+    return `ow-${digest}`
+  }
+
+  /**
+   * The session id shared by *every* device, used in collaboration mode.
+   *
+   * Deliberately derived from the computer id only: all phones bound to this
+   * computer land in one DSH conversation, so the five people at a demo table
+   * are talking to the same assistant and see each other's turns.
+   * @returns {string}
+   */
+  sharedSessionId() {
+    const digest = createHash('sha256')
+      .update(`${this.computerId}:shared`)
       .digest('hex')
       .slice(0, 32)
     return `ow-${digest}`

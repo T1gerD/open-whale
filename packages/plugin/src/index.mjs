@@ -26,15 +26,34 @@ import { pairingAvailability, renderPairingQr } from './pairer.mjs'
 export const name = 'openwhale'
 
 /**
- * Service keys this plugin needs.
+ * Service keys this plugin REQUIRES.
  *
- * `agentDefaultModel` is listed because Cordis refuses property access to an
- * undeclared service ("cannot get property ... without inject"). Reading it gives
- * the authoritative provider/model for a new conversation; the plugin still has
- * three fallbacks when it is absent, so a profile without this service degrades
- * instead of failing.
+ * Cordis `inject` is a hard dependency list: the plugin mounts only when every
+ * listed service is provided. It is **not** a permission to read — a service read
+ * as a plain property without being declared throws
+ * (`cannot get property "..." without inject`), and declaring it to silence that
+ * error turns an optional service into a mount blocker, which is strictly worse
+ * than degrading.
+ *
+ * So only what the plugin cannot function without is listed:
+ *   · `agents` — the bridge creates and drives agent sessions
+ *     (`dsh-bridge.mjs` calls `ctx.agents.create()` / `.get()`).
+ *
+ * Everything else is read through `ctx.get(name)`, which Cordis documents as
+ * "read a service from the store without the inject requirement" and which
+ * returns `undefined` when the service is not provided. That matches what the rest
+ * of this file and the README's fault-tolerance table already assume:
+ *   · `webServer`         → falls back to this plugin's own listener
+ *   · `commands`          → `/openwhale` is simply not registered
+ *   · `agentDefaultModel` → `resolveModelSelection` falls back to profile config,
+ *                           then to the live agent list
+ *
+ * Historical note: this list used to carry six services (`agents`, `commands`,
+ * `webServer`, `systemPrompt`, `tools`, `agentDefaultModel`). `systemPrompt` and
+ * `tools` were never read anywhere in the package, and the other three were
+ * already handled defensively — so all five were pure mount risk.
  */
-export const inject = ['agents', 'commands', 'webServer', 'systemPrompt', 'tools', 'agentDefaultModel']
+export const inject = ['agents']
 
 /**
  * Default configuration, used as the fallback when the schema below cannot be
@@ -53,6 +72,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   allowRemoteShutdown: true,
   shutdownDelaySeconds: 30,
   autoApproveTools: false,
+  collaboration: false,
   tunnelMode: 'off',
   cloudflaredPath: '',
 })
@@ -81,11 +101,28 @@ async function buildConfigSchema() {
       allowRemoteShutdown: z.boolean().default(true).description('允许手机远程关机/重启（取消始终可用）'),
       shutdownDelaySeconds: z.number().default(30).description('远程关机的宽限秒数，期间可取消'),
       autoApproveTools: z.boolean().default(false).description('手机会话是否自动批准所有工具调用（默认关闭，走 DSH 原有审批策略）'),
+      collaboration: z.boolean().default(false).description('多人协作：多台手机共用同一个对话并互相可见（默认关闭，各设备各自独立）'),
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
     })
   } catch {
-    return null
+    // MUST be `undefined`, never `null`.
+    //
+    // DSH's settings form asks each plugin for its schema like this
+    // (`@deepseek-ai/dsh-settings`):
+    //     const schema = entry.fiber?.runtime?.Config;
+    //     return schema !== void 0 && "toJSON" in schema ? schema : void 0;
+    // The guard excludes only `undefined`, so a `null` Config reaches
+    // `"toJSON" in null`, which throws a TypeError. That error escapes
+    // `settings/describe` as `{ ok: false }`, and the desktop main process turns
+    // a non-ok envelope into `desktop welcome: Web RPC failed` — a blank window
+    // and an application that never finishes starting.
+    //
+    // This is not hypothetical. `@deepseek-ai/schemastery` is provided by the
+    // harness, and for a `link:`-installed plugin Node resolves this dynamic
+    // import against the symlink TARGET (the checkout), where schemastery does
+    // not exist. So this catch is reached on every start of a linked install.
+    return undefined
   }
 }
 
@@ -103,7 +140,7 @@ export const Config = await buildConfigSchema()
 function volatilize(schema) {
   const dict = schema?.dict ?? {}
   const patches = {}
-  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'tunnelMode']) {
+  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'collaboration', 'tunnelMode']) {
     if (dict[key]?.volatile) patches[key] = dict[key].volatile()
   }
   return patches
@@ -126,6 +163,7 @@ export async function apply(ctx, config) {
     allowRemoteShutdown: config.allowRemoteShutdown !== false,
     shutdownDelaySeconds: config.shutdownDelaySeconds ?? 30,
     autoApproveTools: config.autoApproveTools === true,
+    collaboration: config.collaboration === true,
     tunnelMode: config.tunnelMode ?? 'off',
     cloudflaredPath: config.cloudflaredPath ?? '',
   }
@@ -167,8 +205,9 @@ export async function apply(ctx, config) {
   let tunnel = null
   const lanUrls = () => {
     if (!settings.lanEnabled) return []
-    const address = ctx.webServer?.port ? `http://127.0.0.1:${ctx.webServer.port}` : null
-    const lan = lanAddresses(settings.port || ctx.webServer?.port)
+    const webServer = ctx.get('webServer')
+    const address = webServer?.port ? `http://127.0.0.1:${webServer.port}` : null
+    const lan = lanAddresses(settings.port || webServer?.port)
     return [...new Set([...lan, ...(address ? [address] : [])])]
   }
 
@@ -179,8 +218,10 @@ export async function apply(ctx, config) {
       assistantName: settings.assistantName,
       cwd: settings.cwd,
       autoApproveTools: settings.autoApproveTools,
+      collaboration: settings.collaboration,
       agentOptions: {},
-      sessionIdFor: deviceId => store.sessionIdFor(deviceId),
+      // 协作模式下所有设备落到同一个 shared session，否则按设备隔离。
+      sessionIdFor: deviceId => (settings.collaboration ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
     },
     emit: event => gateway.pushEvent(event),
     log,
@@ -227,23 +268,27 @@ export async function apply(ctx, config) {
     qrPng: '/openwhale/qr.png',
     pairing: '/openwhale/pairing.json',
     page: '/openwhale',
+    // 手动解除绑定：手机没连上时它的 device/forget 发不出去，电脑端会一直占着绑定，
+    // 配对页又不再出二维码 —— 这个入口用来打破那个死锁。
+    unbind: '/openwhale/unbind',
     download: '/openwhale/download',
   }
   let usingWebServer = false
-  if (ctx.webServer?.register) {
+  const webServer = ctx.get('webServer')
+  if (webServer?.register) {
     for (const path of Object.values(routes)) {
-      ctx.effect(() => ctx.webServer.register({
+      ctx.effect(() => webServer.register({
         kind: 'exact',
         path,
         handler: (req, res) => gateway.handleRequest(req, res),
       }), `openwhale: route ${path}`)
     }
-    ctx.effect(() => ctx.webServer.registerUpgrade({
+    ctx.effect(() => webServer.registerUpgrade({
       path: '/openwhale/ws',
       handler: (req, socket, head) => gateway.attachUpgradeHandler(req, socket, head),
     }), 'openwhale: websocket route')
     usingWebServer = true
-    gateway.port = ctx.webServer.port ?? settings.port
+    gateway.port = webServer.port ?? settings.port
     log(`HTTP 路由已挂载到 DSH Web 服务器（端口 ${gateway.port}）`)
   }
 
@@ -269,8 +314,9 @@ export async function apply(ctx, config) {
   }
 
   // The `/openwhale` command shows the binding QR inside the GUI/CLI.
-  if (ctx.commands?.register) {
-    ctx.effect(() => ctx.commands.register({
+  const commands = ctx.get('commands')
+  if (commands?.register) {
+    ctx.effect(() => commands.register({
       name: 'openwhale',
       description: '显示 Open Whale 绑定二维码 / 查看已绑定手机',
       handler: async invocation => {
@@ -359,7 +405,7 @@ export async function apply(ctx, config) {
 export function resolveModelSelection(ctx, log, configured = {}, readProfile = readProfileDefaultModel) {
   const fromService = (() => {
     try {
-      const selection = ctx.agentDefaultModel?.currentSelection?.()
+      const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
       return selection?.provider && selection?.model ? selection : undefined
     } catch (error) {
       log(`无法读取默认模型服务：${/** @type {Error} */ (error).message}`)

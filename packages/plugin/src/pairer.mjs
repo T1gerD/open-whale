@@ -7,6 +7,7 @@
 // The QR encoder is in-tree (src/qr.mjs) rather than an npm dependency so that a
 // fresh checkout can display a binding code with no install step at all.
 import { DEFAULT_PORT, PAIR_SECRET_TTL_MS } from './protocol.mjs'
+import { MAX_DEVICES } from './state.mjs'
 import { encode, toPng, toSvg, toTerminal } from './qr.mjs'
 
 /**
@@ -70,13 +71,18 @@ export async function renderPairingQr(payload, options = {}) {
  * @param {import('./state.mjs').StateStore} store
  */
 export function pairingAvailability(store) {
-  if (store.isPaired) {
+  const bound = store.devices.length
+  if (bound >= MAX_DEVICES) {
     const labels = store.devices.map(d => d.label ?? d.deviceName).join('、')
     return {
       available: false,
-      reason: 'already-paired',
-      message: `此电脑已绑定手机（${labels}）。一台电脑只能绑定一台手机；请先在手机端解绑，或在电脑端解除绑定。`,
+      reason: 'too-many-devices',
+      message: `此电脑已绑定 ${bound} 台设备（${labels}），达到上限 ${MAX_DEVICES} 台。请先在电脑端解除不用的设备。`,
     }
   }
-  return { available: true, reason: 'ready', message: '可以绑定一台手机。' }
+  return {
+    available: true,
+    reason: 'ready',
+    message: bound === 0 ? '可以绑定第一台手机。' : `已绑定 ${bound} 台，最多可再绑定 ${MAX_DEVICES - bound} 台。`,
+  }
 }

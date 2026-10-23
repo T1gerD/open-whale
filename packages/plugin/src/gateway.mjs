@@ -36,6 +36,7 @@ import {
   timingSafeEqual,
 } from './protocol.mjs'
 import { pairingAvailability, renderPairingQr } from './pairer.mjs'
+import { MAX_DEVICES } from './state.mjs'
 import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 
 /** Path the phone opens its WebSocket on. */
@@ -334,6 +335,32 @@ export class Gateway {
       return true
     }
 
+    // 强制解除绑定。
+    // 手机端的 device/forget 需要走 WebSocket：手机没连上（网络变了、隧道换了地址）
+    // 就发不出去，于是出现「手机已解绑、电脑仍占着」的死锁 —— 电脑端不给二维码，
+    // 手机端又连不上来解绑。这个入口只在本机/局域网可达（与配对页同一保护级别），
+    // 供用户手动解开。
+    if (path === '/openwhale/unbind') {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'POST' })
+        res.end('请用 POST 调用')
+        return true
+      }
+      const removed = this.store.devices ?? []
+      for (const device of removed) {
+        const deviceId = device.id ?? device.deviceId
+        try {
+          this.store.unbindDevice(deviceId)
+          this.bridge.forgetDevice?.(deviceId)?.catch?.(() => {})
+          this.log(`pairing: device ${deviceId} unbound from desktop page`)
+        } catch (error) {
+          this.log(`pairing: 手动解绑 ${deviceId} 失败：${/** @type {Error} */ (error).message}`)
+        }
+      }
+      this.log(`pairing: manual unbind finished, removed ${removed.length} device(s)`)
+      return this.#json(res, 200, { ok: true, removed: removed.length })
+    }
+
     if (path === '/openwhale/download') {
       return this.#handleDownload(url, res)
     }
@@ -443,9 +470,12 @@ export class Gateway {
     if (!existing) {
       // A brand new device needs the pairing secret, and the computer must not
       // already be bound to another phone.
-      if (this.store.devices.length > 0) {
-        session.sendError('already-paired', '此电脑已绑定另一台手机。请先在手机端解绑，或在电脑端解除绑定。')
-        return session.close(1008, 'already paired')
+      if (this.store.devices.length >= MAX_DEVICES) {
+        session.sendError(
+          'too-many-devices',
+          `此电脑已绑定 ${this.store.devices.length} 台设备（上限 ${MAX_DEVICES} 台）。请先在电脑端解除不用的设备。`,
+        )
+        return session.close(1008, 'too many devices')
       }
       const presented = String(frame.pairSecret ?? '')
       if (!presented) {
@@ -548,17 +578,21 @@ export class Gateway {
   /** @param {Session} session @param {any} frame */
   async #handleChatSend(session, frame) {
     const callId = String(frame.callId ?? frame.rid ?? '')
-    if (!callId) return session.sendError('bad-frame', 'chat/send 缺少 callId')
+    this.log(`chat: 收到消息 rid=${frame.rid} callId=${callId} 文本长度=${typeof frame.text === 'string' ? frame.text.length : 0} 附件=${Array.isArray(frame.files) ? frame.files.length : 0}`)
+    if (!callId) {
+      this.log('chat: 缺少 callId，拒绝')
+      return session.sendError('bad-frame', 'chat/send 缺少 callId')
+    }
     const text = typeof frame.text === 'string' ? frame.text : ''
     const attachments = Array.isArray(frame.files) ? frame.files : []
     if (!text.trim() && attachments.length === 0) {
+      this.log('chat: 内容为空，拒绝')
       return session.sendError('empty-message', '消息内容为空')
     }
     if (text.length > 100_000) {
+      this.log(`chat: 消息过长 ${text.length} 字符，拒绝`)
       return session.sendError('too-long', '消息过长，请拆分后发送')
     }
-
-    session.send({ t: SERVER_FRAME.CHAT_ACK, rid: frame.rid, callId })
 
     // Persist phone attachments so the assistant can read them as real files.
     /** @type {Array<{name: string, mime?: string, dataBase64: string, path?: string}>} */
@@ -582,12 +616,26 @@ export class Gateway {
       stored.push({ name: String(attachment.name ?? 'upload.bin'), mime: attachment.mime, dataBase64: attachment.dataBase64, path })
     }
 
-    await this.bridge.send({
-      deviceId: /** @type {string} */ (session.deviceId),
-      callId,
-      text,
-      attachments: stored,
-    })
+    try {
+      const sender = this.store.device(/** @type {string} */ (session.deviceId))
+      await this.bridge.send({
+        deviceId: /** @type {string} */ (session.deviceId),
+        callId,
+        text,
+        attachments: stored,
+        // 协作模式下所有手机共用一个会话，没有这行就分不清「谁说的」。
+        speaker: sender?.label ?? sender?.deviceName,
+      })
+    } catch (error) {
+      // 投递失败必须在日志里留痕：否则手机端已经收到 ACK、显示「已发送」，
+      // 而消息其实从未进入 AI 会话，现象会表现为「发了没反应」且毫无线索。
+      const message = /** @type {Error} */ (error).message
+      this.log(`chat: 投递失败 rid=${frame.rid} → ${message}`)
+      return session.sendError('send-failed', `消息未能送达电脑上的 AI：${message}`)
+    }
+
+    this.log(`chat: 投递成功 rid=${frame.rid}`)
+    session.send({ t: SERVER_FRAME.CHAT_ACK, rid: frame.rid, callId })
     return undefined
   }
 
@@ -966,8 +1014,12 @@ export class Gateway {
  code{background:#0b1220;padding:2px 6px;border-radius:6px;font-size:13px}
  .fp{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:#9ee7c0;word-break:break-all}
  .warn{color:#ffd479} .bad{color:#ff9a9a}
- ul{padding-left:18px;line-height:1.8;font-size:14px}
+ <ul{padding-left:18px;line-height:1.8;font-size:14px}
  li{margin:2px 0}
+ .btn{background:#ef4444;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:14px;cursor:pointer;margin-top:8px}
+ .btn:hover{background:#dc2626}
+ .btn[disabled]{background:#475569;cursor:not-allowed}
+ .hint{color:#93a4c8;font-size:13px;margin-top:6px}
 </style></head><body><div class="wrap">
 <h1>Open Whale</h1>
 <div class="sub">用手机上的 Open Whale 应用扫描右侧二维码即可完成绑定。</div>
@@ -980,7 +1032,30 @@ export class Gateway {
       <p><b>可用地址</b>：</p><ul>${endpoints.map(e => `<li><code>${escapeHtml(e)}</code></li>`).join('')}</ul>
       <p><b>二维码有效期</b>：${escapeHtml(expiry)}</p>
       <p class="warn">二维码包含一次性绑定密钥，请勿截图外发。绑定成功后二维码立即失效。</p>
-    ` : `<p class="bad">${escapeHtml(payload.message)}</p>`}
+    ` : `<p class="bad">${escapeHtml(payload.message)}</p>
+      ${
+        (this.store.devices ?? []).length
+          ? `<button class="btn" id="unbind">解除绑定</button>
+      <p class="hint">手机端解绑时如果网络不通，电脑端不会自动解除。点上方按钮可强制解除，之后手机需重新扫码绑定。</p>
+      <script>
+        document.getElementById('unbind')?.addEventListener('click', async (ev) => {
+          const btn = ev.currentTarget
+          if (!confirm('确定解除当前手机的绑定？解除后该手机需要重新扫码。')) return
+          btn.disabled = true
+          btn.textContent = '正在解除…'
+          try {
+            const r = await fetch('/openwhale/unbind', { method: 'POST' })
+            if (!r.ok) throw new Error(await r.text())
+            location.reload()
+          } catch (e) {
+            alert('解除失败：' + e.message)
+            btn.disabled = false
+            btn.textContent = '解除绑定'
+          }
+        })
+      </script>`
+          : ''
+      }`}
     <p style="color:#93a4c8;font-size:13px">状态：${status} · 电脑 ID <code>${escapeHtml(this.store.computerId)}</code></p>
   </div>
 </div></div></body></html>`
