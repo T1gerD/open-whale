@@ -37,6 +37,17 @@ export interface Outbox {
 
 export const DEFAULT_OUTBOX_LIMIT = 200
 
+/**
+ * 自动重发上限。
+ *
+ * 原先是 3，而且计数语义是"只要写进 socket 就算一次"，两者叠加非常脆弱：
+ * 连接一抖动，同一条消息几秒内就能把 3 次机会耗光，之后**永远不再自动重发**，
+ * 用户看到的现象就是「消息发出去十几分钟才收到回复」（要等某次手动重试或重启）。
+ *
+ * 现在：上限提高到 8，且计数只统计"未获确认的发送"（见 releaseInflight）。
+ */
+export const DEFAULT_MAX_ATTEMPTS = 8
+
 export function createOutbox(limit: number = DEFAULT_OUTBOX_LIMIT): Outbox {
   return { entries: [], limit: Math.max(1, Math.floor(limit)) }
 }
@@ -62,7 +73,6 @@ export function markInflight(outbox: Outbox, rid: string, now: number): Outbox {
   return patch(outbox, rid, entry => ({
     ...entry,
     state: 'inflight',
-    attempts: entry.attempts + 1,
     lastAttemptAt: now,
     retryAfter: undefined,
   }))
@@ -77,12 +87,22 @@ export function markFailed(outbox: Outbox, rid: string, error: string, retryAfte
   return patch(outbox, rid, entry => ({ ...entry, state: 'failed', error, retryAfter }))
 }
 
-/** 断线：飞行中的条目退回 pending，这样重连后会被重发。 */
+/**
+ * 断线：飞行中的条目退回 pending，这样重连后会被重发。
+ *
+ * **同时 `attempts + 1`**：计数语义是"这条消息有过几次**未获确认**的发送"。
+ * 以前在 `markInflight` 里就自增，结果是"只要写进 socket 就算一次尝试"，
+ * 而抖动时 socket 可能已经是半死的，消息根本没被电脑端处理，
+ * 3 次抖动就能把重试机会烧光，消息永远卡在队列里——
+ * 这正是「消息发了十几分钟才收到回复」的直接原因。
+ */
 export function releaseInflight(outbox: Outbox): Outbox {
   return {
     ...outbox,
     entries: outbox.entries.map(entry =>
-      entry.state === 'inflight' ? { ...entry, state: 'pending' as OutboxState } : entry,
+      entry.state === 'inflight'
+        ? { ...entry, state: 'pending' as OutboxState, attempts: entry.attempts + 1 }
+        : entry,
     ),
   }
 }
@@ -97,7 +117,7 @@ export function resendableEntries(
   outbox: Outbox,
   options: { now: number; maxAttempts?: number } = { now: Date.now() },
 ): OutboxEntry[] {
-  const maxAttempts = options.maxAttempts ?? 3
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   return outbox.entries
     .filter(entry => entry.state === 'pending')
     .filter(entry => entry.attempts < maxAttempts)
@@ -106,13 +126,25 @@ export function resendableEntries(
 }
 
 /** 自动重发已放弃、但用户仍可手动重试的条目。 */
-export function exhaustedEntries(outbox: Outbox, maxAttempts: number = 3): OutboxEntry[] {
+export function exhaustedEntries(outbox: Outbox, maxAttempts: number = DEFAULT_MAX_ATTEMPTS): OutboxEntry[] {
   return outbox.entries.filter(entry => entry.state === 'failed' || entry.attempts >= maxAttempts)
 }
 
-/** 手动重试：清零计数并允许立即重发。 */
+/**
+ * 手动重试：**真正清零计数**并允许立即重发。
+ *
+ * 以前这里只把状态改回 pending，忘记重置 `attempts`，
+ * 而 `resendableEntries` 会用 `attempts < maxAttempts` 过滤，
+ * 于是"重试"按钮对已经放弃的条目**完全无效**——点了也不发。
+ */
 export function retryEntry(outbox: Outbox, rid: string): Outbox {
-  return patch(outbox, rid, entry => ({ ...entry, state: 'pending', error: undefined, retryAfter: undefined }))
+  return patch(outbox, rid, entry => ({
+    ...entry,
+    state: 'pending',
+    attempts: 0,
+    error: undefined,
+    retryAfter: undefined,
+  }))
 }
 
 export function removeEntry(outbox: Outbox, rid: string): Outbox {

@@ -106,13 +106,60 @@ export function normalizeEndpoints(list: unknown): string[] {
   return out
 }
 
+/** 判断是否为 USB 调试通道地址（回环地址，靠 adb reverse 转发）。 */
+export function isLoopbackEndpoint(endpoint: string): boolean {
+  const parsed = parseEndpoint(endpoint)
+  if (!parsed) return false
+  const host = parsed.host.toLowerCase()
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]'
+}
+
+/** 判断是否为私有网段的局域网直连地址（不含回环）。 */
+export function isPrivateLanEndpoint(endpoint: string): boolean {
+  const parsed = parseEndpoint(endpoint)
+  if (!parsed) return false
+  if (parsed.isSecure) return false
+  if (isLoopbackEndpoint(endpoint)) return false
+  const host = parsed.host
+  return (
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+    host.startsWith('[')
+  )
+}
+
+export interface EndpointLadderOptions {
+  /** 允许局域网直连地址（设置 →「高级连接方式」）。默认 false。 */
+  allowLan?: boolean
+  /** 允许 USB 回环地址（仅内部测试模式）。默认 false。 */
+  allowUsb?: boolean
+}
+
+/**
+ * 该地址在当前策略下是否允许使用。
+ * 公网隧道（https/wss 或域名）一律允许——那是常规连接方式。
+ */
+export function isEndpointPermitted(endpoint: string, options: EndpointLadderOptions = {}): boolean {
+  if (isLoopbackEndpoint(endpoint)) return options.allowUsb === true
+  if (isPrivateLanEndpoint(endpoint)) return options.allowLan === true
+  return true
+}
+
 /**
  * 重连时要依次尝试的地址阶梯：
  * 上次成功的地址优先（可能是局域网直连，最省流量），然后 https 隧道，最后其余。
  * 与 protocol 的 `pickEndpoint` 语义一致，但这里返回**完整序列**，供逐级重试。
+ *
+ * `options` 决定哪些地址类型可见：默认只留公网隧道，
+ * 局域网与 USB 通道必须在设置里显式开启（见 connection-policy）。
  */
-export function endpointLadder(endpoints: string[], preferred?: string): string[] {
-  const valid = normalizeEndpoints(endpoints)
+export function endpointLadder(
+  endpoints: string[],
+  preferred?: string,
+  options: EndpointLadderOptions = {},
+): string[] {
+  const valid = normalizeEndpoints(endpoints).filter(endpoint => isEndpointPermitted(endpoint, options))
   const out: string[] = []
   const seen = new Set<string>()
   const push = (value: string | undefined): void => {
@@ -120,7 +167,9 @@ export function endpointLadder(endpoints: string[], preferred?: string): string[
     seen.add(value)
     out.push(value)
   }
-  if (preferred) push(normalizeEndpoint(preferred))
+  // 上次成功的地址也要过策略：否则关掉 USB 之后它还会被优先使用一次。
+  const sticky = normalizeEndpoint(preferred ?? '')
+  if (sticky && isEndpointPermitted(sticky, options)) push(sticky)
   for (const endpoint of valid) if (endpoint.startsWith('https://')) push(endpoint)
   for (const endpoint of valid) push(endpoint)
   return out

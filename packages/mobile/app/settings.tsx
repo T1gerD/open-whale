@@ -3,8 +3,9 @@
 // 把限制写进 App 而不是只写在 README：用户看不到 README，而“为什么开不了机”“为什么
 // 隧道地址会变”这类问题是必须要提前说清楚的。
 
-import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native'
+import { Alert, ScrollView, StyleSheet, Switch, Text, View } from 'react-native'
 
+import { DEFAULT_CONNECTION_POLICY } from '../src/core/connection-policy.mts'
 import { DEFAULT_HEARTBEAT_MS, PROTOCOL_VERSION } from '../src/protocol/runtime'
 import { clearDownloads, downloadsLocationHint } from '../src/services/transfers'
 import { useAppSnapshot, useAppStore } from '../src/state/store'
@@ -14,6 +15,7 @@ import { colors, font, spacing } from '../src/ui/theme'
 export default function SettingsScreen() {
   const snapshot = useAppSnapshot()
   const store = useAppStore()
+  const policy = snapshot.connectionPolicy ?? DEFAULT_CONNECTION_POLICY
 
   const clearFiles = () => {
     Alert.alert('清理已下载的文件？', '聊天记录会保留，文件卡片需要重新下载。', [
@@ -36,7 +38,19 @@ export default function SettingsScreen() {
         style: 'destructive',
         onPress: () => {
           void (async () => {
-            for (const view of snapshot.assistants) await store.remove(view.assistant.id, true)
+            let notNotified = 0
+            for (const view of snapshot.assistants) {
+              const { remoteNotified } = await store.remove(view.assistant.id, true)
+              if (!remoteNotified) notNotified += 1
+            }
+            if (notNotified > 0) {
+              // 未连上电脑时解绑请求发不出去，电脑端会继续保持绑定状态。
+              Alert.alert(
+                '本机已解绑，但有电脑未解除',
+                `${notNotified} 台电脑没有收到解绑请求（当时未连接）。\n\n请在那台电脑的浏览器打开配对页（http://127.0.0.1:19387/openwhale），点「解除绑定」。`,
+                [{ text: '知道了' }],
+              )
+            }
           })()
         },
       },
@@ -64,6 +78,37 @@ export default function SettingsScreen() {
         <Muted style={styles.hint}>
           断线后等待时间从 1 秒翻倍到 30 秒封顶；回到前台时会立刻重试一次。手机在后台时系统可能冻结连接，
           这是 Android/iOS 的限制，不是可以绕过的 bug。
+        </Muted>
+      </Card>
+
+      <SectionTitle>高级连接方式</SectionTitle>
+      <Card>
+        <Muted style={styles.hint}>
+          常规连接只走公网隧道（https），一般不需要改这里。
+          只有在「局域网能直连」或「需要走数据线调试」这类特殊场景下才打开下面的开关。
+        </Muted>
+        <SettingSwitch
+          label="允许局域网直连"
+          description="手机与电脑在同一个局域网内时直连，不绕公网隧道。校园网/宿舍网常有客户端隔离，开了也连不上。"
+          value={policy.allowLan}
+          onValueChange={value => void store.updateConnectionPolicy({ allowLan: value })}
+        />
+        <SettingSwitch
+          label="内部测试模式"
+          description="仅供内部人员测试。打开后才会出现下面的 USB 调试通道开关。"
+          value={policy.internalTestMode}
+          onValueChange={value => void store.updateConnectionPolicy({ internalTestMode: value })}
+        />
+        {policy.internalTestMode ? (
+          <SettingSwitch
+            label="USB 调试通道"
+            description="用数据线连接，靠 adb reverse 把手机本机端口转发到电脑。需要电脑端先执行 adb reverse tcp:19387 tcp:19387。"
+            value={policy.allowUsb}
+            onValueChange={value => void store.updateConnectionPolicy({ allowUsb: value })}
+          />
+        ) : null}
+        <Muted style={styles.hint}>
+          关闭「内部测试模式」会同时关闭 USB 通道，避免测试开关被带进正式使用环境。
         </Muted>
       </Card>
 
@@ -114,6 +159,27 @@ export default function SettingsScreen() {
   )
 }
 
+/**
+ * 一行带说明的开关。设置页里这类"有副作用的开关"必须写清它能干什么、有什么前提，
+ * 否则用户只会看到一个不知道要不要打开的滑块。
+ */
+function SettingSwitch(props: {
+  label: string
+  description: string
+  value: boolean
+  onValueChange: (value: boolean) => void
+}) {
+  return (
+    <View style={styles.switchRow}>
+      <View style={styles.switchText}>
+        <Text style={styles.switchLabel}>{props.label}</Text>
+        <Muted style={styles.switchHint}>{props.description}</Muted>
+      </View>
+      <Switch value={props.value} onValueChange={props.onValueChange} />
+    </View>
+  )
+}
+
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
@@ -121,4 +187,14 @@ const styles = StyleSheet.create({
   limitTitle: { color: colors.text, fontSize: font.body, fontWeight: '600', marginTop: spacing.md },
   footer: { marginTop: spacing.xl, alignItems: 'center' },
   footerText: { color: colors.textMuted, fontSize: font.tiny },
+  switchRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: spacing.md,
+    marginTop: spacing.md,
+  },
+  switchText: { flex: 1 },
+  switchLabel: { color: colors.text, fontSize: font.body, fontWeight: '600' },
+  switchHint: { marginTop: 2, lineHeight: 17 },
 })

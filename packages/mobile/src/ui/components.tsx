@@ -99,7 +99,14 @@ export function Banner({
     <View style={[styles.banner, toneStyle]}>
       <View style={styles.bannerBody}>
         {title ? <Text style={styles.bannerTitle}>{title}</Text> : null}
-        {typeof children === 'string' ? <Text style={styles.bannerText}>{children}</Text> : children}
+        {/*
+          永远包在 <Text> 里。
+          调用方常传数组（例如 `{error.message}{hint ? ... : ''}`），而 React Native
+          不会渲染 View 下的裸字符串——正文会静默消失。之前的写法只处理了
+          `typeof children === 'string'`，数组走 else 分支后就什么都不显示，
+          于是所有绑定失败提示都变成了没有正文的空横幅。
+        */}
+        {children ? <Text style={styles.bannerText}>{children}</Text> : null}
       </View>
       {actionLabel && onAction ? (
         <Pressable onPress={onAction} accessibilityRole="button" style={styles.bannerAction}>
