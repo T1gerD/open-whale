@@ -123,11 +123,13 @@ export class DshBridge {
     bridgeDiagnostic(`bridge: 会话就绪 sessionId=${entry.sessionId}`)
 
     let text = this.#composeText(input)
-    if (this.config.collaboration && input.speaker) {
+    const collaboration = this.config.isCollaboration ? this.config.isCollaboration() : this.config.collaboration === true
+    if (collaboration && input.speaker) {
       // DSH 会话里没有「发言人」概念，用文本前缀把身份带进去，
       // 这样电脑端和 GPT 侧都能看出多人协作里是谁在说话。
       text = `[${input.speaker}] ${text}`
     }
+
     this.calls.set(input.callId, {
       deviceId: input.deviceId,
       callId: input.callId,

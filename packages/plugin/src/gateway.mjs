@@ -229,7 +229,7 @@ export class Gateway {
     const connection = acceptUpgrade(req, socket, head)
     const session = new Session(this, connection)
     this.sessions.add(session)
-    this.log(`ws: client connected (${session.id})`)
+    this.log(`ws: client connected (${session.id}) host=${req.headers.host ?? '-'} remote=${socket.remoteAddress ?? '-'}`)
   }
 
   /**
@@ -340,11 +340,56 @@ export class Gateway {
     // 就发不出去，于是出现「手机已解绑、电脑仍占着」的死锁 —— 电脑端不给二维码，
     // 手机端又连不上来解绑。这个入口只在本机/局域网可达（与配对页同一保护级别），
     // 供用户手动解开。
+    if (path === '/openwhale/collaboration') {
+      if (req.method === 'POST') {
+        const on = url.searchParams.get('on')
+        const value = on === '1' || on === 'true'
+        this.store.setPreference('collaboration', value)
+        this.log(`collab: 协作模式 → ${value ? '开' : '关'}`)
+      }
+      return this.#json(res, 200, {
+        ok: true,
+        collaboration: this.store.getPreference('collaboration', false) === true,
+      })
+    }
+
+    if (path === '/openwhale/device-rename') {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'POST' })
+        res.end('请用 POST 调用')
+        return true
+      }
+      const deviceId = url.searchParams.get('deviceId')
+      const label = String(url.searchParams.get('label') ?? '').trim()
+      if (!deviceId || !label) return this.#json(res, 400, { ok: false, error: 'missing-params' })
+      if (label.length > 24) return this.#json(res, 400, { ok: false, error: 'label-too-long' })
+      const updated = this.store.updateDevice(deviceId, { label })
+      if (!updated) return this.#json(res, 404, { ok: false, error: 'device-not-found' })
+      this.log(`device: ${deviceId} 改名为「${label}」`)
+      return this.#json(res, 200, { ok: true, device: { id: updated.id, label: updated.label } })
+    }
+
     if (path === '/openwhale/unbind') {
       if (req.method !== 'POST') {
         res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'POST' })
         res.end('请用 POST 调用')
         return true
+      }
+      // 多设备支持后，"全部解绑"不够用了：队友手机丢了不该连自己的也一起踢。
+      // 带 ?deviceId=xxx 只解绑那一台，不带则维持原来的全量解绑语义。
+      const targetDeviceId = url.searchParams.get('deviceId')
+      if (targetDeviceId) {
+        const device = this.store.device(targetDeviceId)
+        if (!device) return this.#json(res, 404, { ok: false, error: 'device-not-found' })
+        try {
+          this.store.unbindDevice(targetDeviceId)
+          this.bridge.forgetDevice?.(targetDeviceId)?.catch?.(() => {})
+          this.log(`pairing: device ${targetDeviceId} unbound from desktop page`)
+        } catch (error) {
+          this.log(`pairing: 手动解绑 ${targetDeviceId} 失败：${/** @type {Error} */ (error).message}`)
+          return this.#json(res, 500, { ok: false, error: 'unbind-failed' })
+        }
+        return this.#json(res, 200, { ok: true, removed: 1 })
       }
       const removed = this.store.devices ?? []
       for (const device of removed) {
@@ -437,6 +482,8 @@ export class Gateway {
         return this.#handleFileFetch(session, frame)
       case 'assistant/rename':
         return this.#handleRename(session, frame)
+      case 'device/rename':
+        return this.#handleDeviceRename(session, frame)
       case 'power/request':
         return this.#handlePower(session, frame)
       case 'device/forget':
@@ -766,6 +813,20 @@ export class Gateway {
   }
 
   /** @param {Session} session @param {any} frame */
+  async #handleDeviceRename(session, frame) {
+    const deviceId = /** @type {string} */ (session.deviceId)
+    const label = String(frame.label ?? '').trim()
+    if (!label) return session.sendError('bad-label', '昵称不能为空')
+    if (label.length > 24) return session.sendError('bad-label', '昵称最多 24 个字符')
+    const updated = this.store.updateDevice(deviceId, { label })
+    if (!updated) return session.sendError('device-not-found', '找不到这台设备')
+    this.log(`device: ${deviceId} 昵称改为「${label}」`)
+    // 顺带把新列表推回去，手机端就不用再拉一次。
+    session.send({ t: SERVER_FRAME.ASSISTANTS, assistants: this.#assistantList() })
+    return undefined
+  }
+
+  /** @param {Session} session @param {any} frame */
   async #handleForget(session, frame) {
     const deviceId = /** @type {string} */ (session.deviceId)
     if (String(frame.deviceId ?? '') !== deviceId) {
@@ -999,6 +1060,10 @@ export class Gateway {
     const expiry = payload.ok
       ? new Date(payload.payload.expires).toLocaleString('zh-CN')
       : ''
+    // 已绑定台数与名单：以前只出二维码不回显，用户绑定第二台后没有任何可见反馈，
+    // 分不清"新手机扫上了"还是"二维码白扫了"。
+    const boundDevices = this.store.devices ?? []
+    const remaining = Math.max(0, MAX_DEVICES - boundDevices.length)
     return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1020,6 +1085,11 @@ export class Gateway {
  .btn:hover{background:#dc2626}
  .btn[disabled]{background:#475569;cursor:not-allowed}
  .hint{color:#93a4c8;font-size:13px;margin-top:6px}
+ .devs{list-style:none;padding:0;margin:6px 0 2px}
+ .devs li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 10px;background:#0b1220;border:1px solid #24304d;border-radius:8px;margin:6px 0;font-size:14px}
+ .btn-sm{background:#334155;color:#e8eefc;border:0;border-radius:6px;padding:5px 12px;font-size:13px;cursor:pointer}
+ .btn-sm:hover{background:#475569}
+ .btn-sm[disabled]{opacity:.5;cursor:not-allowed}
 </style></head><body><div class="wrap">
 <h1>Open Whale</h1>
 <div class="sub">用手机上的 Open Whale 应用扫描右侧二维码即可完成绑定。</div>
@@ -1028,6 +1098,60 @@ export class Gateway {
   <div class="card" style="min-width:320px;flex:1">
     ${payload.ok ? `
       <p><b>电脑名称</b>：${escapeHtml(payload.payload.host)}</p>
+      <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
+      ${boundDevices.length
+        ? `<ul class="devs">${boundDevices.map(d => `<li><span>${escapeHtml(d.label ?? d.deviceName)}</span><span><button class="btn-sm" data-rename="${escapeHtml(d.id)}">改名</button> <button class="btn-sm" data-unbind="${escapeHtml(d.id)}">移除</button></span></li>`).join('')}</ul>
+      <script>
+        document.querySelectorAll('[data-rename]').forEach(function (btn) {
+          btn.addEventListener('click', async function () {
+            var id = btn.getAttribute('data-rename')
+            var name = prompt('给这台设备起个昵称（多人协作时消息会带这个前缀）')
+            if (!name) return
+            btn.disabled = true
+            try {
+              var r = await fetch('/openwhale/device-rename?deviceId=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(name), { method: 'POST' })
+              if (!r.ok) throw new Error(await r.text())
+              location.reload()
+            } catch (e) {
+              alert('改名失败：' + e.message)
+              btn.disabled = false
+            }
+          })
+        })
+        document.querySelectorAll('[data-unbind]').forEach(function (btn) {
+          btn.addEventListener('click', async function () {
+            var id = btn.getAttribute('data-unbind')
+            if (!confirm('确定移除这台设备？移除后它需要重新扫码才能再连。')) return
+            btn.disabled = true
+            try {
+              var r = await fetch('/openwhale/unbind?deviceId=' + encodeURIComponent(id), { method: 'POST' })
+              if (!r.ok) throw new Error(await r.text())
+              location.reload()
+            } catch (e) {
+              alert('移除失败：' + e.message)
+              btn.disabled = false
+            }
+          })
+        })
+      </script>`
+        : '<p class="hint">还没有绑定任何手机，用手机上的 Open Whale 扫左侧二维码。</p>'}
+      <p><b>协作模式</b>：${this.store.getPreference('collaboration', false) === true ? '<span style="color:#9ee7c0">已开启（多台手机共用一个对话）</span>' : '关闭（每台设备各自独立）'}
+        <button class="btn-sm" id="collab">${this.store.getPreference('collaboration', false) === true ? '关闭' : '开启'}</button></p>
+      <script>
+        document.getElementById('collab')?.addEventListener('click', async function (ev) {
+          var btn = ev.currentTarget
+          var nextOn = btn.textContent.trim() === '开启'
+          btn.disabled = true
+          try {
+            var r = await fetch('/openwhale/collaboration?on=' + (nextOn ? '1' : '0'), { method: 'POST' })
+            if (!r.ok) throw new Error(await r.text())
+            location.reload()
+          } catch (e) {
+            alert('切换失败：' + e.message)
+            btn.disabled = false
+          }
+        })
+      </script>
       <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.payload.fp))}</span></p>
       <p><b>可用地址</b>：</p><ul>${endpoints.map(e => `<li><code>${escapeHtml(e)}</code></li>`).join('')}</ul>
       <p><b>二维码有效期</b>：${escapeHtml(expiry)}</p>

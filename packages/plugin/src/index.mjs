@@ -211,6 +211,9 @@ export async function apply(ctx, config) {
     return [...new Set([...lan, ...(address ? [address] : [])])]
   }
 
+  // 每次调用都重新读 preference：改协作开关不必重启插件。
+  const collaborationOn = () => store.getPreference('collaboration', settings.collaboration) === true
+
   const bridge = new DshBridge({
     ctx,
     config: {
@@ -221,7 +224,9 @@ export async function apply(ctx, config) {
       collaboration: settings.collaboration,
       agentOptions: {},
       // 协作模式下所有设备落到同一个 shared session，否则按设备隔离。
-      sessionIdFor: deviceId => (settings.collaboration ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
+      sessionIdFor: deviceId => (collaborationOn() ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
+      // 协作开关做成了运行时读取：改设置不必重启插件。
+      isCollaboration: () => collaborationOn(),
     },
     emit: event => gateway.pushEvent(event),
     log,
@@ -271,6 +276,8 @@ export async function apply(ctx, config) {
     // 手动解除绑定：手机没连上时它的 device/forget 发不出去，电脑端会一直占着绑定，
     // 配对页又不再出二维码 —— 这个入口用来打破那个死锁。
     unbind: '/openwhale/unbind',
+    collaboration: '/openwhale/collaboration',
+    deviceRename: '/openwhale/device-rename',
     download: '/openwhale/download',
   }
   let usingWebServer = false
