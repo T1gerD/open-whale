@@ -41,15 +41,42 @@ export default function ChatScreen() {
   const [attachment, setAttachment] = useState<PickedAttachment | undefined>()
   const [notice, setNotice] = useState<string | undefined>()
   const listRef = useRef<FlatList<ChatMessage>>(null)
+  // 首屏消息异步从数据库读出，FlatList 又虚拟化：第一次 onContentSizeChange 只反映
+  // 「已布局的那部分」，滚到的是当时的底部；长消息/图片继续撑高后就再没人滚，
+  // 于是打开会话停在中途。现在改成「高度还在变就继续贴底」，直到用户自己拖动。
+  const lastContentHeight = useRef(0)
+  const userTookOver = useRef(false)
+  // 用户往上翻历史时不该被新消息拽回底部。
+  const nearBottom = useRef(true)
 
   const messages = view?.chat.messages ?? []
   const transfers = view?.chat.transfers ?? {}
 
   useEffect(() => {
-    // 新消息到达就滚到底部（聊天窗口最常见的期待）。
+    // 新消息到达就滚到底部（聊天窗口最常见的期待），但用户正在翻历史时不打断。
+    if (!nearBottom.current) return
     const timer = setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 60)
     return () => clearTimeout(timer)
   }, [messages.length])
+
+  // 进入会话时的“落到最底部”。
+  //
+  // 只靠 onContentSizeChange 不够：FlatList 是虚拟化的，长消息在测量完高度后
+  // 内容高度就不再变化，补偿滚动也就停了，最后一条会卡在输入框后面。
+  // 这里按几个时间点连跑几次（布局/字体/图片都在这段时间内陆续完成），
+  // 用户在任何一个时刻拖动列表（onScrollBeginDrag 置位）就立刻停止。
+  useEffect(() => {
+    if (messages.length === 0) return
+    const timers = [0, 60, 200, 500, 900, 1400].map(delay =>
+      setTimeout(() => {
+        if (userTookOver.current) return
+        listRef.current?.scrollToEnd({ animated: false })
+      }, delay),
+    )
+    return () => timers.forEach(clearTimeout)
+    // 只在进入会话（消息首次可用）时跑一次；后续新消息由上面的 effect 处理。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length === 0])
 
   const onSend = useCallback(async () => {
     if (!controller) return
@@ -128,6 +155,23 @@ export default function ChatScreen() {
         ref={listRef}
         data={messages}
         keyExtractor={message => message.id}
+        onContentSizeChange={(_w, height) => {
+          if (messages.length === 0) return
+          if (userTookOver.current) return
+          // 高度没变说明只是重复测量，不必再滚（避免和用户手势打架）。
+          if (Math.abs(height - lastContentHeight.current) < 1) return
+          lastContentHeight.current = height
+          listRef.current?.scrollToEnd({ animated: false })
+        }}
+        onScrollBeginDrag={() => {
+          // 用户一旦开始拖动，就交还控制权，别再把人家拽回底部。
+          userTookOver.current = true
+        }}
+        onScroll={event => {
+          const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent
+          nearBottom.current = contentSize.height - contentOffset.y - layoutMeasurement.height < 80
+        }}
+        scrollEventThrottle={16}
         ListHeaderComponent={header}
         contentContainerStyle={styles.list}
         ListEmptyComponent={
