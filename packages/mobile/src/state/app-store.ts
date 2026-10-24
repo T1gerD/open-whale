@@ -9,6 +9,7 @@
 
 import {
   deleteAssistant as deleteAssistantRow,
+  getSetting,
   listAssistants,
   loadMessages,
   loadOutbox,
@@ -19,9 +20,19 @@ import {
   saveOutbox,
   saveTransfer,
   setAssistantOnline,
+  setSetting,
   upsertAssistant,
 } from '../services/db'
 import { base64ToBytes } from '../core/base64.mts'
+import {
+  CONNECTION_POLICY_KEYS,
+  DEFAULT_CONNECTION_POLICY,
+  formatPolicyFlag,
+  getConnectionPolicy,
+  parsePolicyFlag,
+  setConnectionPolicy,
+  type ConnectionPolicy,
+} from '../core/connection-policy.mts'
 import { endpointLabel } from '../core/endpoint.mts'
 import {
   buildAssistantFromPairing,
@@ -39,6 +50,7 @@ import {
 import {
   createOutbox,
   deserializeOutbox,
+  DEFAULT_MAX_ATTEMPTS,
   enqueue,
   markFailed as markOutboxFailed,
   markInflight,
@@ -91,6 +103,8 @@ export interface AppSnapshot {
   deviceId?: string
   deviceName?: string
   lastError?: string
+  /** 连接策略（高级连接方式 / 内部测试模式）。 */
+  connectionPolicy?: ConnectionPolicy
 }
 
 export interface PairResult {
@@ -249,7 +263,7 @@ class ChatController {
   private flushOutbox(): void {
     const link = this.link
     if (!link || !link.isOnline) return
-    const entries = resendableEntries(this.outbox, { now: Date.now(), maxAttempts: 3 })
+    const entries = resendableEntries(this.outbox, { now: Date.now(), maxAttempts: DEFAULT_MAX_ATTEMPTS })
     for (const entry of entries) {
       const sent = link.sendChat({ rid: entry.rid, text: entry.text, files: entry.files })
       if (!sent) break
@@ -375,7 +389,11 @@ class ChatController {
  * 订阅者（React）只看到不可变的 `AppSnapshot`；每次变化替换快照对象。
  */
 export class AppStore {
-  private snapshotValue: AppSnapshot = { ready: false, assistants: [] }
+  private snapshotValue: AppSnapshot = {
+    ready: false,
+    assistants: [],
+    connectionPolicy: { ...DEFAULT_CONNECTION_POLICY },
+  }
   private readonly listeners = new Set<() => void>()
   private readonly rows = new Map<string, StoredAssistantRow>()
   private readonly controllers = new Map<string, ChatController>()
@@ -400,6 +418,8 @@ export class AppStore {
   /** 启动：读取设备身份与助理列表，然后按需建连。 */
   async init(): Promise<void> {
     try {
+      // 先加载连接策略：它决定哪些地址类型可用，必须早于任何建连。
+      await this.loadConnectionPolicy()
       const identity = await loadIdentity()
       if (identity) {
         this.identity = identity
@@ -416,6 +436,47 @@ export class AppStore {
     } catch (error) {
       this.notify({ ready: true, lastError: `初始化失败：${(error as Error).message}` })
     }
+  }
+
+  /** 从设置 KV 读取连接策略并写进内存策略（建连前调用）。 */
+  private async loadConnectionPolicy(): Promise<void> {
+    try {
+      const [lan, usb, test] = await Promise.all([
+        getSetting(CONNECTION_POLICY_KEYS.allowLan),
+        getSetting(CONNECTION_POLICY_KEYS.allowUsb),
+        getSetting(CONNECTION_POLICY_KEYS.internalTestMode),
+      ])
+      const next = setConnectionPolicy({
+        allowLan: parsePolicyFlag(lan),
+        // internalTestMode 必须一起传，否则 setConnectionPolicy 会把 USB 强制关掉。
+        internalTestMode: parsePolicyFlag(test),
+        allowUsb: parsePolicyFlag(usb),
+      })
+      this.snapshotValue = { ...this.snapshotValue, connectionPolicy: next }
+    } catch {
+      // 设置读不出来不该阻塞启动：退回默认（只用公网隧道）。
+      setConnectionPolicy({ ...DEFAULT_CONNECTION_POLICY })
+      this.snapshotValue = { ...this.snapshotValue, connectionPolicy: getConnectionPolicy() }
+    }
+  }
+
+  /**
+   * 更新「高级连接方式」开关并持久化，然后立刻重连让它们生效。
+   *
+   * USB 是内部测试用的通道：只有 `internalTestMode` 打开时才允许开启，
+   * 关掉内部测试模式会连带关闭 USB（约束在 connection-policy 里强制执行）。
+   */
+  async updateConnectionPolicy(patch: Partial<ConnectionPolicy>): Promise<ConnectionPolicy> {
+    const next = setConnectionPolicy(patch)
+    await Promise.all([
+      setSetting(CONNECTION_POLICY_KEYS.allowLan, formatPolicyFlag(next.allowLan)),
+      setSetting(CONNECTION_POLICY_KEYS.allowUsb, formatPolicyFlag(next.allowUsb)),
+      setSetting(CONNECTION_POLICY_KEYS.internalTestMode, formatPolicyFlag(next.internalTestMode)),
+    ])
+    this.notify({ connectionPolicy: next })
+    // 策略变了就重建连接：新允许的地址要立刻尝试，新禁止的地址要立刻失效。
+    for (const id of this.rows.keys()) this.reconnectNow(id)
+    return next
   }
 
   // ---------------------------------------------------------------------------
@@ -525,6 +586,18 @@ export class AppStore {
     this.links.get(assistantId)?.renameAssistant(trimmed)
   }
 
+  /** 我在电脑端的昵称：多人协作时作为消息前缀，存在设置 KV 里并推给电脑端。 */
+  async setMyNickname(assistantId: string, nickname: string): Promise<void> {
+    const trimmed = nickname.trim().slice(0, 24)
+    await setSetting('device.nickname', trimmed || undefined)
+    this.links.get(assistantId)?.renameDevice(trimmed)
+  }
+
+  /** 读取本机保存的昵称（为空表示用设备默认名）。 */
+  async getMyNickname(): Promise<string> {
+    return (await getSetting('device.nickname')) ?? ''
+  }
+
   async setWakeSetting(assistantId: string, setting: WakeSetting): Promise<void> {
     const row = this.rows.get(assistantId)
     if (!row) return
@@ -534,10 +607,26 @@ export class AppStore {
     this.notify()
   }
 
-  /** 本地解绑；`forgetRemote` 为真时同时通知电脑端（电脑端可能不支持，失败无所谓）。 */
-  async remove(assistantId: string, forgetRemote = true): Promise<void> {
-    if (forgetRemote) this.links.get(assistantId)?.forgetDevice()
-    this.links.get(assistantId)?.stop()
+  /**
+   * 本地解绑；`forgetRemote` 为真时同时通知电脑端。
+   *
+   * 注意：电脑端的 `device/forget` 必须走 WebSocket。手机此刻没连上时这一步必然失败，
+   * 而本地记录已经删了 —— 于是形成「手机已解绑、电脑仍占着」的死锁：电脑端不再出二维码，
+   * 手机端也没有可重试的对象。所以这里把是否通知成功如实返回，让 UI 明确提示用户
+   * 「电脑端未解除，请到电脑的配对页面手动解除」，而不是假装全部成功。
+   */
+  async remove(assistantId: string, forgetRemote = true): Promise<{ remoteNotified: boolean }> {
+    const link = this.links.get(assistantId)
+    let remoteNotified = true
+    if (forgetRemote) {
+      // 未建立连接时 forgetDevice() 返回 false；抛错也同样视为未通知。
+      try {
+        remoteNotified = link?.forgetDevice() ?? false
+      } catch {
+        remoteNotified = false
+      }
+    }
+    link?.stop()
     this.links.delete(assistantId)
     this.controllers.get(assistantId)?.dispose()
     this.controllers.delete(assistantId)
@@ -545,6 +634,7 @@ export class AppStore {
     this.rows.delete(assistantId)
     await deleteAssistantRow(assistantId)
     this.notify()
+    return { remoteNotified }
   }
 
   /** 唤醒：没有配置唤醒代理时返回引导文案，绝不发假帧。 */

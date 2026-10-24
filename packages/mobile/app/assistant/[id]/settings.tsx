@@ -4,7 +4,7 @@
 // （原因写在 core/wake.mts 的注释里：关机后手机连不上它，协议里也没有 WOL 帧）。
 
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Alert, ScrollView, StyleSheet, TextInput, View } from 'react-native'
 
 import { endpointLabel } from '../../../src/core/endpoint.mts'
@@ -22,9 +22,14 @@ export default function AssistantSettingsScreen() {
   const router = useRouter()
 
   const [name, setName] = useState(view?.assistant.name ?? '')
+  const [nickname, setNickname] = useState('')
   const [wakeUrl, setWakeUrl] = useState(view?.assistant.wakeProxyUrl ?? '')
   const [wakeMac, setWakeMac] = useState(view?.assistant.wakeMac ?? '')
   const [wakeNotice, setWakeNotice] = useState<{ tone: 'info' | 'warning' | 'error' | 'success'; text: string; steps?: string[] } | undefined>()
+
+  useEffect(() => {
+    void store.getMyNickname().then(setNickname)
+  }, [store])
 
   if (!view) {
     return (
@@ -65,6 +70,12 @@ export default function AssistantSettingsScreen() {
     Alert.alert('已保存', '备注名只影响这台手机上的显示；电脑端不支持时会自动跳过同步。')
   }
 
+  const saveNickname = async () => {
+    await store.setMyNickname(assistantId, nickname)
+    const trimmed = nickname.trim()
+    Alert.alert('已保存', trimmed ? `多人协作时，你的消息会带上「${trimmed}」前缀。` : '已清空昵称，电脑端会回到设备默认名。')
+  }
+
   const saveWake = async () => {
     await store.setWakeSetting(assistantId, { url: wakeUrl.trim() || undefined, mac: wakeMac.trim() || undefined })
     Alert.alert('已保存', '唤醒代理只影响这台手机，不会发给电脑端。')
@@ -80,7 +91,20 @@ export default function AssistantSettingsScreen() {
           text: '解绑',
           style: 'destructive',
           onPress: () => {
-            void store.remove(assistantId, true).then(() => router.replace('/'))
+            void store.remove(assistantId, true).then(({ remoteNotified }) => {
+              if (remoteNotified) {
+                router.replace('/')
+                return
+              }
+              // 电脑端没收到 device/forget（通常是手机此刻没连上电脑）。
+              // 此时电脑仍占着这台手机的绑定，不会再生成二维码 —— 必须让用户知道
+              // 该去哪一步解开，否则会一直卡在「手机说已解绑、电脑说已绑定」。
+              Alert.alert(
+                '本机已解绑，但电脑端未解除',
+                '这台手机没有连上电脑，所以解绑请求没能送达。\n\n请回到电脑，在浏览器打开配对页（http://127.0.0.1:8787/openwhale），点「解除绑定」，再用本机重新扫码。',
+                [{ text: '知道了', onPress: () => router.replace('/') }],
+              )
+            })
           },
         },
       ],
@@ -124,6 +148,22 @@ export default function AssistantSettingsScreen() {
         />
         <PrimaryButton label="保存备注名" onPress={() => void saveName()} disabled={name.trim().length === 0 || name.trim() === assistant.name} />
         <Muted style={styles.hint}>备注只保存在本机。电脑端支持 `assistant/rename` 时会一并同步，不支持时静默跳过。</Muted>
+      </Card>
+
+      <SectionTitle>我在对话里的昵称</SectionTitle>
+      <Card>
+        <TextInput
+          value={nickname}
+          onChangeText={setNickname}
+          placeholder="例如“小明”，多人协作时消息会带这个前缀"
+          placeholderTextColor={colors.textMuted}
+          style={styles.input}
+          maxLength={24}
+        />
+        <PrimaryButton label="保存昵称" onPress={() => void saveNickname()} />
+        <Muted style={styles.hint}>
+          这个昵称保存在电脑端，多台手机共用同一个对话时，你的每条消息都会带上「昵称」前缀，方便区分谁在说话。留空则使用设备默认名。
+        </Muted>
       </Card>
 
       <SectionTitle>远程电源</SectionTitle>

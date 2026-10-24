@@ -181,6 +181,12 @@ export interface AssistantRenameFrame {
   label: string
 }
 
+export interface DeviceRenameFrame {
+  t: 'device/rename'
+  /** 我在这台电脑上的昵称；多人协作时消息前缀用它。 */
+  label: string
+}
+
 export interface DeviceForgetFrame {
   t: 'device/forget'
   deviceId: string
@@ -235,6 +241,7 @@ export type ClientFrame =
   | FileFetchFrame
   | FileCancelFrame
   | AssistantRenameFrame
+  | DeviceRenameFrame
   | DeviceForgetFrame
   | PowerRequestFrame
 
