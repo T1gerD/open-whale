@@ -2,7 +2,7 @@
   "expo": {
     "name": "Open Whale",
     "slug": "open-whale",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "orientation": "portrait",
     "scheme": "openwhale",
     "userInterfaceStyle": "dark",
@@ -10,7 +10,7 @@
     "primaryColor": "#5b8cff",
     "android": {
       "package": "dev.openwhale.app",
-      "versionCode": 7,
+      "versionCode": 8,
       "edgeToEdgeEnabled": true,
       "permissions": [
         "android.permission.INTERNET",
@@ -39,7 +39,9 @@
         {
           "enableFileSharing": true
         }
-      ]
+      ],
+      "expo-status-bar",
+      "./plugins/withCleartextTraffic"
     ],
     "experiments": {
       "typedRoutes": true
