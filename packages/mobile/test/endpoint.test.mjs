@@ -62,26 +62,31 @@ test('normalizeEndpoints drops junk, trailing slashes and duplicates', () => {
 
 test('the reconnect ladder puts the remembered endpoint first, then https', () => {
   const endpoints = ['http://192.168.1.20:8787', 'https://tunnel.example.com']
-  assert.deepEqual(endpointLadder(endpoints, 'http://192.168.1.20:8787'), [
+  // 局域网直连属于「高级连接方式」，默认关闭（见 core/connection-policy）：
+  // 不开这个开关时，阶梯里根本不会出现 192.168.* 的地址。
+  assert.deepEqual(endpointLadder(endpoints, 'http://192.168.1.20:8787'), ['https://tunnel.example.com'])
+
+  const lan = { allowLan: true }
+  assert.deepEqual(endpointLadder(endpoints, 'http://192.168.1.20:8787', lan), [
     'http://192.168.1.20:8787',
     'https://tunnel.example.com',
   ])
   // 刻意与 protocol 的 `pickEndpoint` 不同：那里要求 preferred 仍在列表里才用它，
   // 而重连阶梯会先试一次“上次成功的地址”——电脑端这次没通告局域网地址，不代表它失效了。
   // 失败后阶梯会继续走到下一个地址。
-  assert.deepEqual(endpointLadder(endpoints, 'https://dead.example.com'), [
+  assert.deepEqual(endpointLadder(endpoints, 'https://dead.example.com', lan), [
     'https://dead.example.com',
     'https://tunnel.example.com',
     'http://192.168.1.20:8787',
   ])
   // 阶梯不重复同一个地址（记住的地址如果也在通告列表里，只出现一次）
-  assert.deepEqual(endpointLadder(endpoints, 'https://tunnel.example.com'), [
+  assert.deepEqual(endpointLadder(endpoints, 'https://tunnel.example.com', lan), [
     'https://tunnel.example.com',
     'http://192.168.1.20:8787',
   ])
   assert.deepEqual(endpointLadder([], undefined), [])
   // 没有“上次成功地址”时与 protocol 的 pickEndpoint 一致：https 优先，其余按二维码顺序
-  assert.deepEqual(endpointLadder(endpoints, undefined), ['https://tunnel.example.com', 'http://192.168.1.20:8787'])
+  assert.deepEqual(endpointLadder(endpoints, undefined, lan), ['https://tunnel.example.com', 'http://192.168.1.20:8787'])
 })
 
 test('endpointLabel and looksLocal describe the network position for the UI', () => {

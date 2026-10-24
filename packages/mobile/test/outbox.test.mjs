@@ -33,7 +33,12 @@ test('enqueue keeps one entry per rid (a double tap is not two messages)', () =>
   assert.equal(getEntry(outbox, 'r1').createdAt, 5)
   // 重复入队不能把重试次数清零，否则会无限重发
   outbox = markInflight(outbox, 'r1', 100)
+  // attempts 的语义是「有过几次**未获确认**的发送」：只有在条目退回 pending 时
+  // 才累加（写进 socket 但没等到 ack 的也算一次），所以这里仍是 0。
   outbox = enqueue(outbox, entry('r1', 6))
+  assert.equal(getEntry(outbox, 'r1').attempts, 0)
+  // 断线让飞行中的条目退回 pending，这一次才算作了用掉一次机会。
+  outbox = releaseInflight(outbox)
   assert.equal(getEntry(outbox, 'r1').attempts, 1)
 })
 
@@ -75,15 +80,23 @@ test('resend order follows enqueue order and respects backoff and attempt caps',
   assert.deepEqual(resendableEntries(outbox, { now: 50 }).map(item => item.rid), ['r1', 'r2'])
 
   // 达到自动重发上限后自动发不再尝试，但用户仍能手动重试
+  // 每轮「飞行中 → 断线退回」才算一次尝试，所以 3 轮之后 attempts = 3。
   let capped = enqueue(createOutbox(), entry('r9'))
-  for (let i = 0; i < 3; i++) capped = markInflight(capped, 'r9', i)
-  capped = releaseInflight(capped)
+  for (let i = 0; i < 3; i++) {
+    capped = markInflight(capped, 'r9', i)
+    capped = releaseInflight(capped)
+  }
+  assert.equal(getEntry(capped, 'r9').attempts, 3)
   assert.deepEqual(resendableEntries(capped, { now: 100, maxAttempts: 3 }), [])
   assert.deepEqual(exhaustedEntries(capped, 3).map(item => item.rid), ['r9'])
   capped = retryEntry(capped, 'r9')
   assert.equal(getEntry(capped, 'r9').state, 'pending')
   assert.equal(getEntry(capped, 'r9').error, undefined)
-  assert.deepEqual(resendableEntries(capped, { now: 100, maxAttempts: 3 }).map(item => item.rid), [])
+  // 手动重试是**用户的明确意图**，所以它会把计数真正清零、重新给满配额；
+  // 与「自动重发达到上限就放弃」并不矛盾：自动放弃是为了不无限刷，
+  // 手动重试是用户主动要求再试一次。
+  assert.equal(getEntry(capped, 'r9').attempts, 0)
+  assert.deepEqual(resendableEntries(capped, { now: 100, maxAttempts: 3 }).map(item => item.rid), ['r9'])
 })
 
 test('pruning never drops a message that still has to be sent', () => {

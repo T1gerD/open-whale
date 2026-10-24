@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: 6a02cad238af13541947ea8e633247edbcb4be8e15604fe56e0b7f2ff5e039da
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: 7d4032b66c7604ee45e583999db5d41deea8d61f2e96348d510a1b39dcca9f58
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -35,6 +35,7 @@ export const CLIENT_FRAME = /** @type {const} */ ({
   FILE_FETCH: 'file/fetch',
   FILE_CANCEL: 'file/cancel',
   ASSISTANT_RENAME: 'assistant/rename',
+  DEVICE_RENAME: 'device/rename',
   DEVICE_FORGET: 'device/forget',
   POWER: 'power/request',
 })

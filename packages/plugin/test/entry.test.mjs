@@ -13,11 +13,22 @@ import { join } from 'node:path'
 
 import { Config, DEFAULT_CONFIG, readProfileDefaultModel, resolveModelSelection } from '../src/index.mjs'
 
-/** A fake ctx exposing only what the resolver looks at. */
+/**
+ * A fake ctx exposing only what the resolver looks at.
+ *
+ * `agentDefaultModel` is read through `ctx.get(name)` rather than as a plain
+ * property: the plugin only declares `agents` in `inject`, and reading an
+ * undeclared service as a property throws in Cordis. `get()` is the documented
+ * way to read an optional service, so the fake mirrors that.
+ */
 function fakeCtx({ service, agents } = {}) {
+  const services = {}
+  if (service) services.agentDefaultModel = service
+  if (agents) services.agents = { list: () => agents }
   return {
     ...(service ? { agentDefaultModel: service } : {}),
     ...(agents ? { agents: { list: () => agents } } : {}),
+    get: name => services[name],
   }
 }
 
@@ -41,9 +52,13 @@ test('the plugin ships a default config even without schemastery', () => {
   assert.equal(DEFAULT_CONFIG.autoApproveTools, false)
   assert.equal(DEFAULT_CONFIG.allowRemoteShutdown, true)
   assert.equal(DEFAULT_CONFIG.voice, 'personal-assistant')
-  // `Config` may be null in a harness where schemastery is not resolvable; the
-  // defaults above are what `apply` falls back to, so behaviour is unchanged.
-  assert.ok(Config === null || typeof Config === 'object')
+  // `Config` is `undefined` when schemastery cannot be resolved (a `link:`
+  // install resolves this import against the checkout, which has no
+  // schemastery). It must never be `null`: DSH's settings page guards with
+  // `schema !== void 0 && 'toJSON' in schema`, so `null` throws a TypeError and
+  // the desktop window never finishes starting.
+  assert.ok(Config === undefined || typeof Config === 'object')
+  assert.notEqual(Config, null)
 })
 
 test('the harness default-model service wins over everything else', () => {

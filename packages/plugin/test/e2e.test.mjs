@@ -402,7 +402,8 @@ test('a photographed QR cannot be reused after the phone is bound', async t => {
   await new Promise(resolve => setTimeout(resolve, 50))
 
   // A second phone replays the photographed secret (which it can read from the
-  // QR) — the one-computer-one-phone policy and secret consumption both block it.
+  // QR). Multi-phone support means the computer is *not* what stops this: the
+  // single-use secret is. Replaying it after it was consumed must fail.
   const thief = new FakePhone()
   thief.paired = { secret: displayed.payload.secret }
   const attack = await thief.connect(computer.port)
@@ -415,7 +416,7 @@ test('a photographed QR cannot be reused after the phone is bound', async t => {
     pairSecret: displayed.payload.secret,
   })
   const refusal = await attack.waitFor(f => f.t === SERVER_FRAME.ERROR)
-  assert.equal(refusal.code, 'already-paired')
+  assert.equal(refusal.code, 'pairing-rejected')
   assert.equal(computer.store.devices.length, 1)
   attack.close()
 })

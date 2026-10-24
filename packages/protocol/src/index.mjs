@@ -27,6 +27,7 @@ export const CLIENT_FRAME = /** @type {const} */ ({
   FILE_FETCH: 'file/fetch',
   FILE_CANCEL: 'file/cancel',
   ASSISTANT_RENAME: 'assistant/rename',
+  DEVICE_RENAME: 'device/rename',
   DEVICE_FORGET: 'device/forget',
   POWER: 'power/request',
 })

@@ -360,7 +360,7 @@ test('pairing requires a secret and rejects a wrong one', async t => {
   wrong.close()
 })
 
-test('a second phone is refused even with a valid pairing secret', async t => {
+test('a second phone may pair because one computer serves up to MAX_DEVICES phones', async t => {
   const { gateway, store, port } = await makeGateway()
   t.after(() => gateway.close())
   const first = freshDevice()
@@ -375,14 +375,16 @@ test('a second phone is refused even with a valid pairing secret', async t => {
   })
   assert.ok(await one.waitFor(f => f.t === 'hello/ack'))
 
-  // Mint a fresh window for the second phone; the computer is still bound.
+  // The computer is already bound, but a new pairing window is still offered:
+  // multi-phone support means the page must keep handing out QR codes until the
+  // cap is reached.
   const second = freshDevice()
   const secondPayload = await (await fetch(`http://127.0.0.1:${port}/openwhale/pairing.json`)).json()
-  // Already paired: the page refuses to offer a new window at all.
-  assert.equal(secondPayload.error, 'already-paired')
+  assert.equal(secondPayload.ok, true)
+  assert.equal(typeof secondPayload.payload.secret, 'string')
 
   // A *different* phone. Its deviceId is unknown to the computer, so the
-  // pairing path is taken and the single-phone policy is what refuses it.
+  // pairing path is taken — and it is accepted now.
   const two = await connectClient(port)
   two.send({
     t: 'hello',
@@ -390,11 +392,10 @@ test('a second phone is refused even with a valid pairing secret', async t => {
     deviceName: '手机二',
     devicePublicKey: second.publicKeyB64,
     nonce: 'second-phone-nonce-1',
-    pairSecret: payload.payload.secret,
+    pairSecret: secondPayload.payload.secret,
   })
-  const refused = await two.waitFor(f => f.t === 'error')
-  assert.equal(refused.code, 'already-paired')
-  assert.equal(store.devices.length, 1)
+  assert.ok(await two.waitFor(f => f.t === 'hello/ack'))
+  assert.equal(store.devices.length, 2)
   one.close(); two.close()
 })
 
