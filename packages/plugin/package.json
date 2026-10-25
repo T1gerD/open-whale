@@ -1,6 +1,6 @@
 {
   "name": "dsh-openwhale",
-  "version": "1.0.8",
+  "version": "2.1.0",
   "private": true,
   "description": "Open Whale — connect your phone to this computer's DeepSeek Harness as a personal-assistant chat, over LAN or the internet.",
   "type": "module",

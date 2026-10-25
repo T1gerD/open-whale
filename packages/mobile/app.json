@@ -2,7 +2,7 @@
   "expo": {
     "name": "Open Whale",
     "slug": "open-whale",
-    "version": "1.0.8",
+    "version": "2.1.0",
     "orientation": "portrait",
     "scheme": "openwhale",
     "userInterfaceStyle": "dark",
