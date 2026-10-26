@@ -171,9 +171,17 @@ jobs:
         working-directory: packages/mobile/ios
         run: |
           set -euo pipefail
-          APP_DIR="build/Build/Products/Debug-iphonesimulator"
-          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
-          test -n "$APP_PATH"
+          # Don't assume the product directory name: Xcode has moved it around
+          # between versions (`Debug-iphonesimulator`, or a device-suffixed name for
+          # a generic destination). Find the built .app anywhere under derived data
+          # and fail with a listing if there is none, so a failure is actionable.
+          APP_PATH="$(find build -maxdepth 6 -type d -name '*.app' | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "no .app produced; derived data contents:"
+            find build -maxdepth 5 -type d -name 'Products' -o -maxdepth 5 -type d -name '*.app' || true
+            find build -maxdepth 3 -type d | head -n 40 || true
+            exit 1
+          fi
           echo "built: $APP_PATH"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" ios-simulator-app.zip
           ls -la ios-simulator-app.zip
