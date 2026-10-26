@@ -60,9 +60,48 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild -version
+          xcrun swift --version
           xcode-select -p
           node --version
           pnpm --version
+
+      - name: Select an Xcode with Swift 6.2+
+        # The prebuilt-RN path in ExpoModulesJSI resolves a SwiftPM dependency that
+        # declares `swift-tools-version: 6.2`. The default Xcode on `macos-15`
+        # (16.4) ships Swift 6.1, and xcodebuild then fails with
+        #   package 'apple' is using Swift tools version 6.2.0 but the installed version is 6.1.0
+        # Runner images usually keep several Xcodes under /Applications; pick the
+        # newest one reporting Swift >= 6.2. If none does, keep the default and warn
+        # instead of failing here — the build step will carry the real diagnostics.
+        run: |
+          set -euo pipefail
+          echo "available Xcodes:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          best=""
+          best_ver="0.0"
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app/Contents/Developer" ] || continue
+            raw="$(DEVELOPER_DIR="$app/Contents/Developer" xcrun swift --version 2>/dev/null | head -n1 || true)"
+            echo "  $app -> ${raw:-unknown}"
+            ver="$(printf '%s' "$raw" | sed -nE 's/.*[Vv]ersion ([0-9]+)\.([0-9]+).*/\1.\2/p')"
+            [ -n "$ver" ] || continue
+            major="${ver%%.*}"
+            minor="${ver##*.}"
+            if [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 2 ]; }; then
+              if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best_ver" "$ver" | sort -V | tail -n1)" = "$ver" ]; then
+                best="$app"
+                best_ver="$ver"
+              fi
+            fi
+          done
+          if [ -n "$best" ]; then
+            echo "selecting $best (Swift $best_ver)"
+            sudo xcode-select -s "$best/Contents/Developer"
+          else
+            echo "::warning::no installed Xcode reports Swift >= 6.2; keeping the default — SwiftPM resolution may fail"
+          fi
+          xcodebuild -version
+          xcrun swift --version
 
       - name: Install workspace dependencies
         # 与 .github/workflows/release.yml 一致：仓库没有提交 lockfile，
