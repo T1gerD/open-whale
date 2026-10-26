@@ -1,7 +1,13 @@
 # 手机端 Release 体积优化（2026-10-24）
 
 > 背景：APK 曾经 128.9 MB，装到手机上“应用大小”超过 100 MB。这里是最终配置与实测结果。
-> 注意：`packages/mobile/android/` 在 `.gitignore` 里（Expo prebuild 产物），所以下面的配置**不在仓库里**，需要在新机器上重新设置。
+>
+> **v2.2.0 更新**：`packages/mobile/android/` 是 `.gitignore` 里的 prebuild 产物，手工改它
+> 不会被 CI 继承——v2.2.0 首次 CI 构建又回到了 126 MB。现在这些设置由
+> [`packages/mobile/plugins/withReleaseSize.js`](../packages/mobile/plugins/withReleaseSize.js)
+> 这个 config plugin 在 prebuild 阶段写入（gradle properties + release 的 `abiFilters` +
+> proguard keep 规则），**源码即事实来源**，本地与 CI 行为一致。下面保留 v2.1.0 的手工步骤
+> 作为历史记录与对照。
 
 ## 最终配置
 

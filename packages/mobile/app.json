@@ -59,7 +59,8 @@
         }
       ],
       "expo-status-bar",
-      "./plugins/withCleartextTraffic"
+      "./plugins/withCleartextTraffic",
+      "./plugins/withReleaseSize"
     ],
     "experiments": {
       "typedRoutes": true

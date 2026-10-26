@@ -130,11 +130,16 @@ jobs:
         working-directory: packages/mobile/ios
         # 不硬编码 scheme：prebuild 生成的 scheme 名取决于 app name，升级 Expo SDK 后
         # 可能变化；`xcodebuild -list -json` 是唯一可靠来源。
+        # 关键：workspace 里同时存在大量 Pods scheme（Expo / ExpoModulesPackage /
+        # React-* / hermes …），构建它们只会得到 Pods 产物、**不会产出 .app**。
+        # 之前误选了 `Expo` scheme，于是 "BUILD SUCCEEDED" 但 Products 为空。
+        # 因此优先选与 app name（去掉空格）同名的 scheme，否则排除所有 Pods 前缀。
         run: |
           set -euo pipefail
           WORKSPACE="$(ls -d *.xcworkspace | head -n 1)"
           test -n "$WORKSPACE"
-          SCHEME="$(xcodebuild -list -json -workspace "$WORKSPACE" | node -e '
+          APP_NAME="$(node -p "require('../../app.json').expo.name" 2>/dev/null || true)"
+          SCHEME="$(xcodebuild -list -json -workspace "$WORKSPACE" | APP_NAME="$APP_NAME" node -e '
             let raw = "";
             process.stdin.on("data", chunk => { raw += chunk; });
             process.stdin.on("end", () => {
@@ -142,14 +147,19 @@ jobs:
               const list = (info.workspace && info.workspace.schemes)
                 || (info.project && info.project.schemes)
                 || [];
-              const app = list.find(name => !/^(Pods|EXConstants|ExpoModulesPackage|React[-A-Z])/i.test(name));
-              process.stdout.write((app || list[0] || "").trim());
+              const compact = (process.env.APP_NAME || "").replace(/\s+/g, "");
+              const isPod = name => /^(Pods|Expo|EX[A-Z]|React|RCT|RN|hermes|Yoga|Folly|DoubleConversion|glog|fmt)/i.test(name);
+              const exact = compact
+                ? list.find(name => name.replace(/\s+/g, "").toLowerCase() === compact.toLowerCase())
+                : undefined;
+              const app = exact || list.find(name => !isPod(name));
+              process.stdout.write((app || "").trim());
             });
           ')"
           test -n "$SCHEME"
           echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
-          echo "workspace=$WORKSPACE scheme=$SCHEME"
+          echo "workspace=$WORKSPACE scheme=$SCHEME (app name: ${APP_NAME:-unknown})"
 
       - name: Build for iOS Simulator (no signing)
         working-directory: packages/mobile/ios
