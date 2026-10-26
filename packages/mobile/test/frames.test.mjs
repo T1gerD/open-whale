@@ -7,26 +7,44 @@ import assert from 'node:assert/strict'
 
 import {
   ACTIVITY_KIND,
+  ALL_CAPABILITIES,
+  CAPABILITIES,
   CLIENT_FRAME,
+  CONNECTION_MODE,
   DEFAULT_HEARTBEAT_MS,
+  DEFAULT_PORT,
   FILE_CHUNK_BYTES,
   MAX_ASSISTANT_CHARS,
   MAX_FILE_BYTES,
+  MAX_UPLOAD_ATTACHMENTS,
+  MAX_UPLOAD_BYTES,
   POWER_REFUSAL,
   PROTOCOL_VERSION,
   SERVER_FRAME,
+  UPLOAD_CHUNK_BYTES,
+  UPLOAD_IDLE_TIMEOUT_MS,
+  ENDPOINT_KIND,
 } from '../../protocol/src/index.mjs'
 
 import {
   ACTIVITY_KIND as MIRROR_ACTIVITY,
+  ALL_CAPABILITIES as MIRROR_ALL_CAPABILITIES,
+  CAPABILITIES as MIRROR_CAPABILITIES,
   CLIENT_FRAME as MIRROR_CLIENT,
+  CONNECTION_MODE as MIRROR_CONNECTION_MODE,
   DEFAULT_HEARTBEAT_MS as MIRROR_HEARTBEAT,
+  DEFAULT_PORT as MIRROR_PORT,
   FILE_CHUNK_BYTES as MIRROR_CHUNK,
   MAX_ASSISTANT_CHARS as MIRROR_MAX_CHARS,
   MAX_FILE_BYTES as MIRROR_MAX_FILE,
+  MAX_UPLOAD_ATTACHMENTS as MIRROR_MAX_ATTACHMENTS,
+  MAX_UPLOAD_BYTES as MIRROR_MAX_UPLOAD,
   POWER_REFUSAL as MIRROR_REFUSAL,
   PROTOCOL_VERSION as MIRROR_VERSION,
   SERVER_FRAME as MIRROR_SERVER,
+  UPLOAD_CHUNK_BYTES as MIRROR_UPLOAD_CHUNK,
+  UPLOAD_IDLE_TIMEOUT_MS as MIRROR_UPLOAD_IDLE,
+  ENDPOINT_KIND as MIRROR_ENDPOINT_KIND,
 } from '../src/core/frames.mts'
 
 test('mirrored frame vocabularies match the protocol exactly', () => {
@@ -36,10 +54,25 @@ test('mirrored frame vocabularies match the protocol exactly', () => {
   assert.deepEqual(MIRROR_REFUSAL, POWER_REFUSAL)
 })
 
+test('mirrored capability names match the protocol exactly', () => {
+  assert.deepEqual(MIRROR_CAPABILITIES, CAPABILITIES)
+  assert.deepEqual([...MIRROR_ALL_CAPABILITIES], [...ALL_CAPABILITIES])
+})
+
+test('mirrored connection modes and endpoint kinds match the protocol exactly', () => {
+  assert.deepEqual(MIRROR_CONNECTION_MODE, CONNECTION_MODE)
+  assert.deepEqual(MIRROR_ENDPOINT_KIND, ENDPOINT_KIND)
+})
+
 test('mirrored numeric constants match the protocol exactly', () => {
   assert.equal(MIRROR_VERSION, PROTOCOL_VERSION)
   assert.equal(MIRROR_HEARTBEAT, DEFAULT_HEARTBEAT_MS)
+  assert.equal(MIRROR_PORT, DEFAULT_PORT)
   assert.equal(MIRROR_MAX_CHARS, MAX_ASSISTANT_CHARS)
   assert.equal(MIRROR_CHUNK, FILE_CHUNK_BYTES)
   assert.equal(MIRROR_MAX_FILE, MAX_FILE_BYTES)
+  assert.equal(MIRROR_UPLOAD_CHUNK, UPLOAD_CHUNK_BYTES)
+  assert.equal(MIRROR_MAX_UPLOAD, MAX_UPLOAD_BYTES)
+  assert.equal(MIRROR_MAX_ATTACHMENTS, MAX_UPLOAD_ATTACHMENTS)
+  assert.equal(MIRROR_UPLOAD_IDLE, UPLOAD_IDLE_TIMEOUT_MS)
 })

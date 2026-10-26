@@ -1,80 +1,76 @@
 # dsh-openwhale
 
-DeepSeek Harness 插件：让手机上的 **Open Whale** 应用以**个人助理聊天**的形式远程使用这台电脑上的 DSH。
+DeepSeek Harness 插件：让手机以**个人助理聊天**的形式远程使用这台电脑上的 DSH —— 扫码绑定一次，
+之后聊天、发图片/文件、看回复流式输出，多台手机还能在同一个会话里协作。
 
-- 展示一次性绑定二维码（浏览器页 / `/openwhale` 命令 / PNG / SVG）
-- 为每台手机建立**专属 DSH 会话**，不干扰你桌面上的对话
+**配套客户端**：安卓 App、iOS 构建（EAS/CI 流水线）、以及**零安装的网页版/PWA**（鸿蒙 NEXT、
+iOS Safari、任意手机浏览器都能用）。网页版由本插件自己提供，地址是
+`http://<电脑地址>:8787/openwhale/app`。
+
+- 一次性绑定二维码（浏览器页 / `/openwhale` 命令 / PNG / SVG），10 分钟有效、只能用一次
+- 为手机建立**专属 DSH 会话**（协作模式可共享），不干扰桌面上的对话
 - 在该会话作用域内注入**口语化个人助理语气**
-- 把手机会话的**流式回复、工具活动、产出文件**推给手机
+- 手机消息流式回复、工具活动、产出文件推送；手机 → 电脑分块上传（64 MiB，带进度）
+- 电脑 → 手机发文件（一次性下载链接）
+- **连接方式可选择**：自动 / 局域网 / **Tailscale** / 公网隧道；`自动` 优先直连，公网隧道不抢占
 - 远程关机 / 重启（可取消宽限窗口）与局域网唤醒代发
 - 可选公网隧道（cloudflared 快速隧道）
 
-完整说明见仓库根 [README.md](../../README.md)；安装与排错见 [docs/install.md](../../docs/install.md)；
-安全模型见 [docs/security.md](../../docs/security.md)。
+完整说明见仓库 [README](https://github.com/T1gerD/open-whale#readme)；安装与排错见
+[docs/install.md](https://github.com/T1gerD/open-whale/blob/main/docs/install.md)；
+安全模型见 [docs/security.md](https://github.com/T1gerD/open-whale/blob/main/docs/security.md)。
 
 ## 安装
 
+从 npm 安装（推荐）：
+
 ```bash
-dsh plugin --profile <你的profile> add ./packages/plugin
+dsh plugin --profile <你的profile> add dsh-openwhale
 ```
 
-然后重启 DSH，打开 `http://127.0.0.1:<DSH端口>/openwhale` 扫码。
+或从 Release 的 tarball 安装：
+
+```bash
+dsh plugin --profile <你的profile> add ./dsh-openwhale-2.2.0.tgz
+```
+
+然后重启 DSH，打开 `http://127.0.0.1:8787/openwhale`（或 DSH 端口下的 `/openwhale`）扫码。
+
+## v2.2.0 的主要变化
+
+- **连接**：Tailscale 成为独立连接方式（不再混在「局域网」里）；`自动` 顺序改为
+  「上次成功 → Tailscale → 局域网 → 公网隧道」；修掉「公网隧道被强制优先」的判定 bug。
+- **多端同步**：`chat/echo` 广播 + 会话事件日志/游标追赶 + 在线成员，新加入或断线的手机能
+  看到别人发的内容与正在生成的回复。
+- **去重**：按 `(设备, msgId)` 幂等，离线队列重发不会再让 AI 回两遍；助手消息按 DSH
+  `messageId` 聚合，修掉协作模式下的回复重复拼接。
+- **上传**：512 KiB 分块 + 背压 + 进度 + 断点重试；落盘到会话工作目录内，AI 能读到手机发的图片。
+- **网页版**：插件内置 `/openwhale/app`，鸿蒙/iOS 浏览器可用，可添加到主屏幕。
+- **协议 1.1.0**：只增不改，2.1.0 客户端可与 2.2.0 插件混用（能力协商决定新帧）。
+- 会改变电脑状态的 HTTP 接口（协作开关、解绑、改名、发送文件、连接方式）**仅本机可写**。
 
 ## 设计要点
 
 ### 零运行时依赖
 
 QR 编码器（`src/qr.mjs`）、WebSocket 服务端（`src/ws.mjs`）、线上协议（`src/protocol.mjs`）、
-状态层、电源层全部自实现，只用 Node 内置模块。原因很实际：插件要靠**一次复制**装进 profile，
-任何依赖树或构建步骤都会变成装机失败点。
+状态层、上传层、电源层全部自实现，只用 Node 内置模块。原因很实际：插件要靠**一次复制**装进
+profile，任何依赖树或构建步骤都会变成装机失败点。
 
 ### 协议副本是生成的
 
-`packages/protocol` 是协议的**唯一权威源**（手机端也直接引用它）。插件内 `src/protocol.mjs`
+`packages/protocol` 是协议的**唯一权威源**（手机端/网页版也直接引用它）。插件内 `src/protocol.mjs`
 是它的一份副本，由 `npm run sync:protocol` 生成，`test/protocol-copy.test.mjs` 保证不漂移。
 
-**为什么必须有副本**：DSH 安装插件是**复制**包内容（pnpm `link:` 在 Windows 上表现为 Junction，
-但打包/发布场景下是复制），任何 `../../` 形式的相对导入在装机后都会解析到包外并失败。
-这个坑在真实装机中踩到过，所以现在有测试守着：
-`test/protocol-copy.test.mjs` 会断言所有源码只从 `./protocol.mjs` 引入协议。
+**为什么必须有副本**：DSH 安装插件是复制包内容，任何 `../../` 形式的相对导入在装机后都会解析到
+包外并失败。这个坑在真实装机中踩到过，所以现在有测试守着。
 
-### 各模块职责
+### 网页版静态资源
 
-| 文件 | 职责 |
-|---|---|
-| `src/index.mjs` | cordis 插件入口：读配置、装配各部件、注册路由/命令、容错降级 |
-| `src/dsh-bridge.mjs` | 手机 ↔ DSH 会话桥：建会话、发消息、把 `session/event` 映射成手机能懂的帧、登记文件 |
-| `src/gateway.mjs` | HTTP + WebSocket 服务：鉴权、帧路由、文件分片、一次性下载令牌 |
-| `src/ws.mjs` | RFC 6455 服务端：握手校验、帧编解码、分片重组、ping/pong、关闭握手 |
-| `src/qr.mjs` | QR 编码器：v1-40、L/M/Q/H、8 种掩码自动择优、PNG/SVG/终端渲染 |
-| `src/state.mjs` | 电脑身份（Ed25519）、配对窗口、已绑定手机；原子写 + 0600 |
-| `src/pairer.mjs` | 二维码载荷构造与绑定可用性判断 |
-| `src/voice.mjs` | 个人助理语气 prompt section（要短，且不牺牲准确性） |
-| `src/power.mjs` | 关机/重启/取消 + WOL 魔术包 |
-| `src/tunnel.mjs` | cloudflared 快速隧道生命周期（可选） |
-| `src/wol-proxy.mjs` | 局域网唤醒代发（可选） |
+`webchat/` 目录是零构建的网页版客户端（原生 ESM，无打包步骤）。插件在 `/openwhale/app`
+提供它：开发时读仓库 `packages/webchat`，npm/打包安装时读包内 `webchat/`。
 
-### 容错降级
+### 只信任应用层
 
-插件的可选部件全部容错，绑定二维码这条核心路径不依赖它们：
-
-| 部件缺失 | 行为 |
-|---|---|
-| `@deepseek-ai/schemastery` 不可用 | 设置页没有字段，配置回落到内置默认值（不报错） |
-| `@deepseek-ai/dsh-home-paths` 不可用 | 数据目录回落到 `$DSH_HOME/openwhale` |
-| DSH web server 不可用 | 插件自己监听端口 |
-| cloudflared 不可用 | 记录一条日志并继续，局域网方案不受影响。**不自动下载**二进制 |
-
-## 测试
-
-```bash
-node test/run.mjs        # 或仓库根：node scripts/run-tests.mjs
-```
-
-不需要安装任何依赖。其中：
-
-- `qr-decode.test.mjs` **独立实现解码侧**（定位格式信息、还原掩码、按标准走位读取码元、
-  校验 RS 全零 syndrome、还原原文），用来证明生成的二维码真的可扫描，而不是只对结构打勾；
-- `ws.test.mjs` 用真实 socket 跑握手、分片、异常帧；
-- `e2e.test.mjs` 用真实 socket + 真实 Ed25519 签名，走完「扫码 → 绑定 → 聊天 → 流式回复 →
-  工具活动 → 文件拉取 → 解绑」，并覆盖防冒充与防二维码重放。
+隧道/中继一律不可信：鉴权靠手机侧 Ed25519 私钥签名，`hello/ack` 带电脑签名与二维码指纹可校验，
+重放由随机数防重放表拒绝。

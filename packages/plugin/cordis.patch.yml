@@ -19,5 +19,7 @@
         allowRemoteShutdown: true
         shutdownDelaySeconds: 30
         autoApproveTools: false
+        collaboration: false
+        connectionMode: auto
         tunnelMode: off
         cloudflaredPath: ''

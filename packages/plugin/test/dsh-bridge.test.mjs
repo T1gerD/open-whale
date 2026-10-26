@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
 
 import {
   DshBridge,
@@ -8,6 +9,15 @@ import {
   summarizeToolCall,
 } from '../src/dsh-bridge.mjs'
 import { VOICE_SECTION_NAME, assistantVoiceSection } from '../src/voice.mjs'
+
+/**
+ * The bridge's default cwd in tests. Windows-style path on Windows only: on
+ * POSIX a string like `C:\work` is treated as a plain relative name, so
+ * `path.relative()` cannot produce the relative attachment path the test checks.
+ * The production path is always the real platform separator, so the fixture must
+ * be platform-appropriate for the test to be meaningful on Linux/macOS CI.
+ */
+const WORKDIR = process.platform === 'win32' ? 'C:\\work' : '/work'
 
 /**
  * A fake DSH context that records what the bridge asks of it and lets tests
@@ -103,7 +113,7 @@ function makeBridge({ config = {}, fire } = {}) {
     },
     emit: event => events.push(event),
     log: () => {},
-    defaultCwd: () => 'C:\\work',
+    defaultCwd: () => WORKDIR,
     // Mirrors `createUserMessage` from @deepseek-ai/dsh-llm: it freezes the
     // message and attaches the unique id the agent inbox deduplicates on.
     createUserMessage: input => Object.freeze({ ...input, role: 'user', id: `msg_${++idCounter}` }),
@@ -117,7 +127,7 @@ test('a phone message creates one DSH conversation for that device', async () =>
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: '你好', attachments: [] })
   assert.equal(fake.created.length, 1)
   assert.equal(fake.created[0].sessionId, 'ow-dev_a')
-  assert.equal(fake.created[0].meta.cwd, 'C:\\work')
+  assert.equal(fake.created[0].meta.cwd, WORKDIR)
 })
 
 test('two phones never share a conversation', async () => {
@@ -186,7 +196,7 @@ test('a new conversation inherits the harness model selection', async () => {
     },
     emit: event => events.push(event),
     log: () => {},
-    defaultCwd: () => 'C:\\work',
+    defaultCwd: () => WORKDIR,
     createUserMessage: input => Object.freeze({ ...input, role: 'user', id: `m${++idCounter}` }),
     modelSelection: () => ({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'high' }),
   })
@@ -277,20 +287,30 @@ test('an empty message still reaches the assistant as an explicit placeholder', 
 test('typing is announced before the answer starts', async () => {
   const { bridge, events } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
-  assert.deepEqual(events[0], { kind: 'typing', deviceId: 'dev_a', callId: 'c1', active: true })
+  assert.deepEqual(events[0], {
+    kind: 'typing',
+    sessionId: 'ow-dev_a',
+    deviceId: 'dev_a',
+    callId: 'c1',
+    active: true,
+  })
 })
 
-test('an assistant message becomes a delta and a completed turn becomes done', async () => {
+test('an assistant message becomes a chat/message and a completed turn becomes done', async () => {
   const { bridge, fake, events } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const session = { id: 'ow-dev_a' }
 
-  fake.fire(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '你好，我在。' }] } } })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'text', text: '你好，我在。' }] } },
+  })
   fake.fire(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } })
 
-  const delta = events.find(e => e.kind === 'delta')
-  assert.equal(delta.text, '你好，我在。')
-  assert.equal(delta.seq, 0)
+  const message = events.find(e => e.kind === 'message')
+  assert.equal(message.text, '你好，我在。')
+  assert.equal(message.messageId, 'am_1')
+  assert.equal(message.index, 0)
   const done = events.find(e => e.kind === 'done')
   assert.equal(done.text, '你好，我在。')
   assert.equal(typeof done.durationMs, 'number')
@@ -302,12 +322,18 @@ test('several assistant messages in one turn accumulate instead of overwriting',
   const { bridge, fake, events } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const session = { id: 'ow-dev_a' }
-  fake.fire(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第一段' }] } } })
-  fake.fire(session, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '第二段' }] } } })
-  fake.fire(session, { type: 'turn/end', data: { reason: { kind: 'stop' } } })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'text', text: '第一段' }] } },
+  })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 1, message: { id: 'am_2', content: [{ type: 'text', text: '第二段' }] } },
+  })
+  fake.fire(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } })
 
-  const deltas = events.filter(e => e.kind === 'delta')
-  assert.deepEqual(deltas.map(d => d.seq), [0, 1])
+  const messages = events.filter(e => e.kind === 'message')
+  assert.deepEqual(messages.map(m => m.index), [0, 1])
   const done = events.find(e => e.kind === 'done')
   assert.match(done.text, /第一段/)
   assert.match(done.text, /第二段/)
@@ -318,10 +344,10 @@ test('reasoning blocks are not spoken as assistant prose', async () => {
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   fake.fire({ id: 'ow-dev_a' }, {
     type: 'assistant/message',
-    data: { message: { content: [{ type: 'reasoning', text: '让我想想……' }, { type: 'text', text: '答案是 42。' }] } },
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'reasoning', text: '让我想想……' }, { type: 'text', text: '答案是 42。' }] } },
   })
-  const delta = events.find(e => e.kind === 'delta')
-  assert.equal(delta.text, '答案是 42。')
+  const message = events.find(e => e.kind === 'message')
+  assert.equal(message.text, '答案是 42。')
 })
 
 test('tool calls surface as status rows, never as chat text', async () => {
@@ -372,15 +398,21 @@ test('two devices chatting at once keep their answers apart', async () => {
   const { bridge, fake, events } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'ca', text: 'a', attachments: [] })
   await bridge.send({ deviceId: 'dev_b', callId: 'cb', text: 'b', attachments: [] })
-  fake.fire({ id: 'ow-dev_a' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '给 A' }] } } })
-  fake.fire({ id: 'ow-dev_b' }, { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '给 B' }] } } })
-  const deltas = events.filter(e => e.kind === 'delta')
-  assert.equal(deltas.find(d => d.callId === 'ca').text, '给 A')
-  assert.equal(deltas.find(d => d.callId === 'cb').text, '给 B')
+  fake.fire({ id: 'ow-dev_a' }, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_a', content: [{ type: 'text', text: '给 A' }] } },
+  })
+  fake.fire({ id: 'ow-dev_b' }, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_b', content: [{ type: 'text', text: '给 B' }] } },
+  })
+  const messages = events.filter(e => e.kind === 'message')
+  assert.equal(messages.find(m => m.callId === 'ca').text, '给 A')
+  assert.equal(messages.find(m => m.callId === 'cb').text, '给 B')
 })
 
 test('tool results register files the phone is allowed to fetch', async () => {
-  const { bridge, fake } = makeBridge()
+  const { bridge, fake, events } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   fake.fire({ id: 'ow-dev_a' }, {
     type: 'tool/result',
@@ -388,7 +420,7 @@ test('tool results register files the phone is allowed to fetch', async () => {
       callId: 't1',
       name: 'write',
       ok: true,
-      message: { content: [{ type: 'file', path: 'C:\\out\\report.pdf', name: 'report.pdf', mime: 'application/pdf' }] },
+      message: { content: [{ type: 'file', path: 'C:\\out\\report.pdf', name: 'report.pdf', mime: 'application/pdf', size: 2048 }] },
     },
   })
   const fileIds = [...bridge.files.keys()]
@@ -396,6 +428,13 @@ test('tool results register files the phone is allowed to fetch', async () => {
   const resolved = await bridge.fileFor(fileIds[0])
   assert.equal(resolved.name, 'report.pdf')
   assert.equal(resolved.path, 'C:\\out\\report.pdf')
+
+  // The done frame must carry file *metadata*, not bare fileId strings: the phone
+  // reducer drops any file ref without a fileId/name/size object.
+  fake.fire({ id: 'ow-dev_a' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  const done = events.find(event => event.kind === 'done')
+  assert.equal(Array.isArray(done.files), true)
+  assert.deepEqual(done.files, [{ fileId: fileIds[0], name: 'report.pdf', size: 2048, mime: 'application/pdf' }])
 })
 
 test('an unknown file id resolves to undefined, never to a guess', async () => {
@@ -491,4 +530,131 @@ test('the voice section states every behavioural rule the product needs', () => 
   // Files are announced, because the app renders them itself.
   assert.match(text, /文件/)
   assert.ok(text.length < 1200, 'a persona prompt must stay short so it does not dilute task instructions')
+})
+
+// --- v2.2.0: assistant message dedupe and session-wide routing -------------
+
+test('one assistant message is emitted once even if DSH replays the same message id', async () => {
+  const { bridge, fake, events } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const session = { id: 'ow-dev_a' }
+  const message = { id: 'am_1', content: [{ type: 'text', text: '答案' }] }
+
+  // The same committed message delivered twice (replay after reconnect, or a
+  // second listener pass) must not append its text twice.
+  fake.fire(session, { type: 'assistant/message', data: { turn: 1, step: 0, message } })
+  fake.fire(session, { type: 'assistant/message', data: { turn: 1, step: 0, message } })
+
+  const messages = events.filter(event => event.kind === 'message')
+  assert.equal(messages.length, 1, 'the same messageId must only be emitted once')
+  assert.equal(messages[0].messageId, 'am_1')
+  assert.equal(messages[0].index, 0)
+  assert.equal(messages[0].sessionId, 'ow-dev_a', 'the event must say which conversation it belongs to')
+  assert.equal(messages[0].callId, 'c1')
+
+  fake.fire(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  const done = events.find(event => event.kind === 'done')
+  assert.equal(done.text, '答案', 'done.text must be the deduplicated answer, not answer + answer')
+})
+
+test('an attempt and the committed message for the same step are counted once', async () => {
+  const { bridge, fake, events } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const session = { id: 'ow-dev_a' }
+
+  // `assistant/attempt` is the fallback representation of a step; the loop then
+  // commits the same step as `assistant/message`. Only one of them may become a
+  // chat bubble.
+  fake.fire(session, { type: 'assistant/attempt', data: { turn: 1, step: 0, stream: [] } })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'text', text: '答案' }] } },
+  })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'text', text: '答案' }] } },
+  })
+  fake.fire(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+
+  assert.equal(events.filter(event => event.kind === 'message').length, 1)
+  assert.equal(events.find(event => event.kind === 'done').text, '答案')
+})
+
+test('two devices sharing one collaborative session do not multiply the answer', async () => {
+  const { bridge, fake, events } = makeBridge({
+    config: { sessionIdFor: () => 'ow-shared', isCollaboration: () => true },
+  })
+  await bridge.send({ deviceId: 'dev_a', callId: 'ca', text: 'a', attachments: [], speaker: 'A' })
+  await bridge.send({ deviceId: 'dev_b', callId: 'cb', text: 'b', attachments: [], speaker: 'B' })
+  const session = { id: 'ow-shared' }
+
+  // The exact production bug: the shared session's event is reduced once, not
+  // once per device — otherwise done.text became "答案\n\n答案".
+  fake.fire(session, { type: 'turn/start', data: { turn: 1 } })
+  fake.fire(session, {
+    type: 'assistant/message',
+    data: { turn: 1, step: 0, message: { id: 'am_1', content: [{ type: 'text', text: '答案' }] } },
+  })
+  fake.fire(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+
+  assert.equal(events.filter(event => event.kind === 'message').length, 1)
+  const done = events.filter(event => event.kind === 'done')
+  assert.equal(done.length, 1)
+  assert.equal(done[0].text, '答案')
+  assert.equal(done[0].callId, 'ca', 'the turn belongs to the message that started it')
+})
+
+test('a device is registered in its conversation before it ever speaks', () => {
+  const { bridge } = makeBridge({ config: { sessionIdFor: () => 'ow-shared' } })
+  bridge.attachDevice('dev_b')
+  assert.equal(bridge.entries.get('dev_b')?.sessionId, 'ow-shared')
+  assert.equal(bridge.bySession.has('ow-shared'), true)
+})
+
+test('bridge.send is idempotent for the same device and call id', async () => {
+  const { bridge, fake } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.equal(fake.live.get('ow-dev_a').messages.length, 1, 'a replayed chat/send must not reach the agent twice')
+})
+
+test('a second device with its own call id is a different message', async () => {
+  const { bridge, fake } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'a', attachments: [] })
+  await bridge.send({ deviceId: 'dev_b', callId: 'c1', text: 'b', attachments: [] })
+  assert.equal(fake.live.get('ow-dev_a').messages.length, 1)
+  assert.equal(fake.live.get('ow-dev_b').messages.length, 1)
+})
+
+test('attachments are described with a path relative to the working directory', async () => {
+  const { bridge, fake } = makeBridge()
+  await bridge.send({
+    deviceId: 'dev_a',
+    callId: 'c1',
+    text: '看图',
+    attachments: [
+      { name: 'photo.jpg', mime: 'image/jpeg', path: join(WORKDIR, '.openwhale', 'uploads', '1-photo.jpg') },
+      { name: '报表.xlsx', mime: 'application/vnd.ms-excel', path: join(WORKDIR, '.openwhale', 'uploads', '2-报表.xlsx') },
+    ],
+  })
+  const text = fake.live.get('ow-dev_a').messages[0].content[0].text
+  assert.match(text, /2 个附件/)
+  assert.match(text, /\.openwhale[\\/]uploads[\\/]1-photo\.jpg/)
+  assert.equal(text.includes(WORKDIR), false, 'the assistant gets a path relative to its cwd, not an absolute one')
+  assert.match(text, /图片/, 'an image must be called out as an image so the model reads it as one')
+  assert.match(text, /文件/, 'a non-image must be called out as a file')
+  assert.match(text, /read/, 'the model must be told it can read the file')
+})
+
+test('switching collaboration disposes the old mapping so sessions are rebuilt', async () => {
+  const { bridge, fake } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  bridge.attachDevice('dev_b')
+  assert.equal(bridge.entries.size, 2)
+
+  await bridge.resetSessionMapping()
+
+  assert.equal(bridge.entries.size, 0)
+  assert.equal(bridge.bySession.size, 0)
+  assert.equal(fake.live.size, 0, 'per-device conversations are retired when the session layout changes')
 })

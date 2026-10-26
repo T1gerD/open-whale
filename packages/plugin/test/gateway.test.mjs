@@ -1,12 +1,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
 
-import { helloAckProofMessage, helloSignatureMessage } from '../src/protocol.mjs'
+import {
+  CAPABILITIES,
+  MAX_UPLOAD_BYTES,
+  UPLOAD_CHUNK_BYTES,
+  helloAckProofMessage,
+  helloSignatureMessage,
+} from '../src/protocol.mjs'
 import { Gateway, WS_PATH } from '../src/gateway.mjs'
 import { StateStore } from '../src/state.mjs'
 
@@ -928,41 +934,813 @@ test('a bad handshake gets a real HTTP 400 rather than a hang', async t => {
   socket.destroy()
 })
 
-test('a new connection for the same device replaces the stale one', async t => {
+/** Open another authenticated socket for an already-bound device. */
+async function reconnectSession(port, device, options = {}) {
+  const client = await connectClient(port)
+  const nonce = `reconnect-${randomUUID()}`
+  client.send({
+    t: 'hello',
+    version: '1.0.0',
+    deviceId: device.deviceId,
+    deviceName: options.deviceName ?? '手机',
+    devicePublicKey: device.publicKeyB64,
+    nonce,
+    signature: sign(null, Buffer.from(helloSignatureMessage(nonce)), device.privateKey).toString('base64url'),
+    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+  })
+  const ack = await client.waitFor(f => f.t === 'hello/ack')
+  assert.ok(ack, 'a reconnect with a valid device key must be accepted')
+  assert.equal(ack.pairAccepted, false, 'a reconnect is not a new pairing')
+  return client
+}
+
+test('a device may hold several live sessions at once (endpoint racing)', async t => {
   const { gateway, port, store } = await makeGateway()
   t.after(() => gateway.close())
   const device = freshDevice()
-  const payload = await (await fetch(`http://127.0.0.1:${port}/openwhale/pairing.json`)).json()
-  const first = await connectClient(port)
-  first.send({
-    t: 'hello', deviceId: device.deviceId, deviceName: '手机', devicePublicKey: device.publicKeyB64, pairSecret: payload.payload.secret,
-  })
-  const ack = await first.waitFor(f => f.t === 'hello/ack')
-  assert.ok(ack, 'the first connection must be bound')
+  const caps = [CAPABILITIES.CHAT_MESSAGE, CAPABILITIES.CHAT_ECHO]
+  const first = await pairDevice(port, device, { capabilities: caps })
+  // The phone races two endpoints: both handshakes carry the same deviceId and
+  // both must stay usable. Kicking the older one here is exactly the infinite
+  // connect → kicked → reconnect loop reported in the field.
+  const second = await reconnectSession(port, device, { capabilities: caps })
+  assert.equal(gateway.sessionsForDevice(device.deviceId).length, 2)
+  assert.equal(gateway.deviceOnline(device.deviceId), true)
+  const health = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.equal(health.connections, 1, 'connections counts online devices, not racing sockets')
+  assert.equal(health.sessions, 2, 'the raw socket count is reported separately')
 
-  // The same device reconnects while the first socket is still open — what
-  // happens whenever an app is killed and restarted, or a network path changes.
-  // It must win, or the phone would be stuck talking to a half-dead socket.
-  const probe = await connectClient(port)
-  const probeNonce = 'probe-nonce-0000000001'
-  probe.send({
-    t: 'hello',
-    deviceId: device.deviceId,
-    deviceName: '手机',
-    devicePublicKey: device.publicKeyB64,
-    nonce: probeNonce,
-    signature: sign(null, Buffer.from(helloSignatureMessage(probeNonce)), device.privateKey).toString('base64url'),
-  })
-  const secondAck = await probe.waitFor(f => f.t === 'hello/ack')
-  assert.ok(secondAck, 'a reconnect with a valid device key must be accepted')
-  assert.equal(secondAck.pairAccepted, false, 'a reconnect is not a new pairing')
+  // A chat/echo from one session reaches both sockets of the same device: the
+  // racing loser must not miss frames (clients dedupe by msgId).
+  first.client.send({ t: 'chat/send', rid: 'r-echo', callId: 'c-echo', msgId: 'm-echo', text: '大家好' })
+  assert.ok(await first.client.waitFor(f => f.t === 'chat/echo' && f.msgId === 'm-echo'))
+  assert.ok(await second.waitFor(f => f.t === 'chat/echo' && f.msgId === 'm-echo'), 'both sessions of the device receive the echo')
 
-  // The stale socket is closed, and the device slot now belongs to the new one.
-  const closed = await first.waitFor(f => f.t === '__close')
-  assert.ok(closed, 'the stale connection must be closed so the phone stops using it')
-  assert.equal(gateway.sessionFor(device.deviceId)?.id !== undefined, true)
+  const conversationId = store.sessionIdFor(device.deviceId)
+  gateway.pushEvent({
+    kind: 'message', sessionId: conversationId, deviceId: device.deviceId, callId: 'c1', messageId: 'am_1', index: 0, text: '答',
+  })
+  assert.ok(await first.client.waitFor(f => f.t === 'chat/message'), 'the first socket still receives frames')
+  assert.ok(await second.waitFor(f => f.t === 'chat/message'), 'the racing socket receives the same frames')
+
+  // One of them goes away (the race loser is closed by the client): the device
+  // stays online through the other connection.
+  first.client.close()
+  await delay(80)
+  assert.equal(gateway.deviceOnline(device.deviceId), true, 'the device is still online via the surviving session')
+  assert.equal(gateway.sessionsForDevice(device.deviceId).length, 1)
+  gateway.pushEvent({
+    kind: 'message', sessionId: conversationId, deviceId: device.deviceId, callId: 'c1', messageId: 'am_2', index: 1, text: '继续',
+  })
+  assert.ok(await second.waitFor(f => f.t === 'chat/message' && f.messageId === 'am_2'), 'the survivor keeps working')
+
+  second.close()
+  await delay(80)
+  assert.equal(gateway.deviceOnline(device.deviceId), false, 'the device is offline once the last session closes')
   assert.equal(store.isPaired, true)
-  probe.close()
 })
+
+test('a fourth concurrent session for one device evicts the oldest connection', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const first = await pairDevice(port, device)
+  const second = await reconnectSession(port, device)
+  const third = await reconnectSession(port, device)
+  assert.equal(gateway.sessionsForDevice(device.deviceId).length, 3)
+
+  const fourth = await reconnectSession(port, device)
+  // The cap is 3, so authenticating a fourth session retires the oldest one.
+  assert.ok(await first.client.waitFor(f => f.t === '__close'), 'the oldest connection must be replaced')
+  assert.equal(gateway.sessionsForDevice(device.deviceId).length, 3)
+  assert.equal(gateway.deviceOnline(device.deviceId), true)
+  second.close()
+  third.close()
+  fourth.close()
+})
+
+// ---------------------------------------------------------------------------
+// v2.2.0: idempotency, multi-device broadcast, session sync, collaboration
+// ---------------------------------------------------------------------------
+
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** Bind one device and return its live client (hello already acked). */
+async function pairDevice(port, device, options = {}) {
+  const response = await fetch(`http://127.0.0.1:${port}/openwhale/pairing.json`)
+  const pairing = await response.json()
+  assert.equal(pairing.ok, true, `the computer must offer a QR: ${pairing.message ?? ''}`)
+  const client = await connectClient(port)
+  client.send({
+    t: 'hello',
+    version: '1.0.0',
+    deviceId: device.deviceId,
+    deviceName: options.deviceName ?? '我的手机',
+    devicePublicKey: device.publicKeyB64,
+    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+    ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+    ...(options.sessionId !== undefined ? { sessionId: options.sessionId } : {}),
+    pairSecret: pairing.payload.secret,
+  })
+  const ack = await client.waitFor(f => f.t === 'hello/ack')
+  assert.ok(ack, 'expected hello/ack')
+  return { client, ack, payload: pairing.payload }
+}
+
+test('a repeated chat/send is dropped by msgId and the second ack says duplicate', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device)
+
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  const first = await client.waitFor(f => f.t === 'chat/ack')
+  assert.equal(first.msgId, 'm1')
+  assert.equal(first.duplicate, undefined)
+
+  // The phone's outbox re-sends the same message when the first ack is lost.
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  const second = await client.waitFor(f => f.t === 'chat/ack' && f.duplicate === true)
+  assert.ok(second, 'a replay must be answered with duplicate:true')
+  assert.equal(second.msgId, 'm1')
+
+  await delay(50)
+  assert.equal(harness.sent.length, 1, 'the assistant must only be woken once')
+  client.close()
+})
+
+test('a v2.1 client without msgId is still deduplicated by its callId', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device)
+
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', text: '你好' })
+  const first = await client.waitFor(f => f.t === 'chat/ack')
+  assert.equal(first.msgId, 'c1', 'msgId falls back to the legacy callId')
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', text: '你好' })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack' && f.duplicate === true))
+  await delay(50)
+  assert.equal(harness.sent.length, 1)
+  client.close()
+})
+
+test('a duplicate while the first delivery is still in flight does not reach the bridge twice', async t => {
+  const sent = []
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const bridge = {
+    send: async input => {
+      sent.push(input)
+      await gate
+    },
+  }
+  const { gateway, port } = await makeGateway({ bridge })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device)
+
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack'))
+  // Retry before the first delivery resolved: the claim must already be in place,
+  // otherwise a slow resume() would make the user's message arrive twice.
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack' && f.duplicate === true))
+  release()
+  await delay(50)
+  assert.equal(sent.length, 1)
+  client.close()
+})
+
+test('a failed delivery releases the claim so the retry is delivered', async t => {
+  let attempts = 0
+  const received = []
+  const bridge = {
+    send: async input => {
+      attempts += 1
+      if (attempts === 1) throw new Error('电脑上的 AI 暂时不可用')
+      received.push(input)
+    },
+  }
+  const { gateway, port } = await makeGateway({ bridge })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device)
+
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  const failure = await client.waitFor(f => f.t === 'error' && f.code === 'send-failed')
+  assert.ok(failure, 'a failed delivery must be reported, not silently swallowed')
+
+  // The phone keeps the message in its outbox because of the error. The retry is
+  // acknowledged as a duplicate (so the outbox clears) and is delivered again —
+  // one transient DSH error must not permanently swallow the message.
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack' && f.duplicate === true))
+  await delay(50)
+  assert.equal(received.length, 1)
+  assert.equal(attempts, 2)
+  client.close()
+})
+
+test('a user message is echoed to every device in the conversation', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const first = freshDevice()
+  const second = freshDevice()
+  const caps = [CAPABILITIES.CHAT_ECHO]
+  const one = await pairDevice(port, first, { capabilities: caps })
+  const two = await pairDevice(port, second, { capabilities: caps, deviceName: '手机二' })
+
+  one.client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '大家好', speaker: '我' })
+  const echoOnB = await two.client.waitFor(f => f.t === 'chat/echo')
+  assert.ok(echoOnB, 'the other device must see the message')
+  assert.equal(echoOnB.deviceId, first.deviceId)
+  assert.equal(echoOnB.msgId, 'm1')
+  assert.equal(echoOnB.text, '大家好')
+  assert.equal(echoOnB.speaker, '我的手机')
+  assert.equal(typeof echoOnB.seq, 'number')
+
+  // The sender also receives the echo so clients dedupe by msgId instead of
+  // special-casing "my own message came back".
+  assert.ok(await one.client.waitFor(f => f.t === 'chat/echo' && f.msgId === 'm1'))
+  one.client.close()
+  two.client.close()
+})
+
+test('assistant frames are broadcast to the whole conversation, with a legacy fallback', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const newDevice = freshDevice()
+  const legacyDevice = freshDevice()
+  const modern = await pairDevice(port, newDevice, {
+    capabilities: [CAPABILITIES.CHAT_MESSAGE, CAPABILITIES.CHAT_ECHO],
+  })
+  const legacy = await pairDevice(port, legacyDevice, { deviceName: '老手机' })
+
+  gateway.pushEvent({
+    kind: 'message',
+    sessionId: 'conv-1',
+    deviceId: newDevice.deviceId,
+    callId: 'c1',
+    messageId: 'am_1',
+    index: 0,
+    text: '第一条',
+  })
+  const message = await modern.client.waitFor(f => f.t === 'chat/message')
+  assert.ok(message)
+  assert.equal(message.messageId, 'am_1')
+  assert.equal(message.text, '第一条')
+  assert.equal(typeof message.seq, 'number')
+
+  // A v2.1.0 client has no chat/message-v1 capability: it keeps the old delta
+  // frames instead of silently losing the answer.
+  const delta = await legacy.client.waitFor(f => f.t === 'chat/delta')
+  assert.ok(delta, 'a legacy device must still receive the answer')
+  assert.equal(delta.text, '第一条')
+  assert.equal(delta.seq, 0)
+  assert.equal(legacy.client.frames.some(f => f.t === 'chat/message'), false)
+
+  gateway.pushEvent({
+    kind: 'done',
+    sessionId: 'conv-1',
+    deviceId: newDevice.deviceId,
+    callId: 'c1',
+    text: '第一条',
+  })
+  assert.ok(await modern.client.waitFor(f => f.t === 'chat/done'))
+  assert.ok(await legacy.client.waitFor(f => f.t === 'chat/done'))
+  modern.client.close()
+  legacy.client.close()
+})
+
+test('hello pushes a session snapshot without a cursor and a replay with one', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  // Seed the conversation log before anyone connects: a fresh client must get a
+  // snapshot of what already happened, not an empty screen.
+  gateway.pushEvent({
+    kind: 'message', sessionId: 'conv-1', deviceId: 'dev_old', callId: 'c-old', messageId: 'am_old', index: 0, text: '旧消息',
+  })
+  gateway.pushEvent({ kind: 'done', sessionId: 'conv-1', deviceId: 'dev_old', callId: 'c-old', text: '旧消息' })
+  // No user message yet, so seed one through a real send on a throwaway device.
+  const seeder = freshDevice()
+  const seed = await pairDevice(port, seeder, { capabilities: [CAPABILITIES.CHAT_ECHO] })
+  seed.client.send({ t: 'chat/send', rid: 'r0', callId: 'c0', msgId: 'm0', text: '之前说的话' })
+  assert.ok(await seed.client.waitFor(f => f.t === 'chat/ack'))
+  seed.client.close()
+  await delay(30)
+
+  const fresh = freshDevice()
+  const snapshotClient = await pairDevice(port, fresh, {
+    capabilities: [CAPABILITIES.SESSION_SYNC],
+    deviceName: '新设备',
+  })
+  const state = await snapshotClient.client.waitFor(f => f.t === 'session/state')
+  assert.ok(state, 'a client without a cursor must receive session/state')
+  assert.equal(state.sessionId, 'conv-1')
+  assert.equal(typeof state.head, 'number')
+  assert.equal(state.collaboration, false)
+  assert.ok(Array.isArray(state.snapshot.messages))
+  assert.ok(state.snapshot.messages.some(message => message.text === '之前说的话'))
+  assert.equal(snapshotClient.client.frames.some(f => f.t === 'session/events'), false)
+  const head = state.head
+  snapshotClient.client.close()
+  await delay(30)
+
+  // Reconnecting with a cursor that is still in the log window gets the missed
+  // events instead of a full snapshot.
+  const returning = freshDevice()
+  const catchUp = await pairDevice(port, returning, {
+    capabilities: [CAPABILITIES.SESSION_SYNC],
+    cursor: 0,
+    deviceName: '回连设备',
+  })
+  const events = await catchUp.client.waitFor(f => f.t === 'session/events')
+  assert.ok(events, 'a client with a usable cursor must receive session/events')
+  assert.equal(events.sessionId, 'conv-1')
+  assert.equal(events.from, 0)
+  assert.ok(events.head >= head)
+  assert.ok(events.events.length > 0)
+  assert.deepEqual(events.events.map(event => event.seq), events.events.map(event => event.seq).slice().sort((a, b) => a - b))
+  catchUp.client.close()
+})
+
+test('a late joiner sees the in-flight assistant turn in the snapshot', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const first = freshDevice()
+  const one = await pairDevice(port, first, { capabilities: [CAPABILITIES.SESSION_SYNC] })
+  assert.ok(await one.client.waitFor(f => f.t === 'session/state'))
+
+  // The assistant is mid-answer: the message exists but no done frame yet.
+  gateway.pushEvent({
+    kind: 'message', sessionId: 'conv-1', deviceId: first.deviceId, callId: 'c1', messageId: 'am_1', index: 0, text: '正在写…',
+  })
+  const second = freshDevice()
+  const two = await pairDevice(port, second, { capabilities: [CAPABILITIES.SESSION_SYNC], deviceName: '后来者' })
+  const state = await two.client.waitFor(f => f.t === 'session/state')
+  assert.ok(state)
+  assert.equal(state.snapshot.activeCall.callId, 'c1')
+  assert.match(state.snapshot.activeCall.text, /正在写/)
+  assert.equal(state.snapshot.activeCall.typing, true)
+  one.client.close()
+  two.client.close()
+})
+
+test('typing and tool activity reach every device in the conversation', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const first = freshDevice()
+  const second = freshDevice()
+  const one = await pairDevice(port, first, { deviceName: '手机一' })
+  const two = await pairDevice(port, second, { deviceName: '手机二' })
+
+  gateway.pushEvent({ kind: 'typing', sessionId: 'conv-1', deviceId: first.deviceId, callId: 'c1', active: true })
+  gateway.pushEvent({
+    kind: 'tool', sessionId: 'conv-1', deviceId: first.deviceId, callId: 'c1',
+    phase: 'tool-start', toolCallId: 't1', tool: 'read_file', summary: '正在读取文件',
+  })
+  assert.ok(await two.client.waitFor(f => f.t === 'chat/typing' && f.active === true), 'the peer must see the typing state')
+  const tool = await two.client.waitFor(f => f.t === 'chat/tool')
+  assert.ok(tool, 'the peer must see the activity row')
+  assert.equal(tool.summary, '正在读取文件')
+  one.client.close()
+  two.client.close()
+})
+
+test('a hello whose sessionId disagrees with the computer gets a snapshot, never a replay', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  // Seed the log so a cursor replay would be possible if the session matched.
+  gateway.pushEvent({
+    kind: 'message', sessionId: 'conv-1', deviceId: 'dev_old', callId: 'c-old', messageId: 'am_old', index: 0, text: '旧消息',
+  })
+  gateway.pushEvent({ kind: 'done', sessionId: 'conv-1', deviceId: 'dev_old', callId: 'c-old', text: '旧消息' })
+
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, {
+    capabilities: [CAPABILITIES.SESSION_SYNC],
+    cursor: 0,
+    sessionId: 'conv-that-no-longer-exists',
+  })
+  const state = await client.waitFor(f => f.t === 'session/state')
+  assert.ok(state, 'a stale sessionId must yield a full snapshot')
+  assert.equal(state.sessionId, 'conv-1')
+  await delay(60)
+  assert.equal(client.frames.some(f => f.t === 'session/events'), false, 'no cross-session replay is allowed')
+  client.close()
+})
+
+test('session/sync asks for missed events on demand', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_SYNC] })
+  assert.ok(await client.waitFor(f => f.t === 'session/state'))
+
+  gateway.pushEvent({
+    kind: 'message', sessionId: 'conv-1', deviceId: device.deviceId, callId: 'c1', messageId: 'am_1', index: 0, text: '新内容',
+  })
+  client.send({ t: 'session/sync', rid: 's1', cursor: 0 })
+  const events = await client.waitFor(f => f.t === 'session/events' && f.sessionId === 'conv-1')
+  assert.ok(events, 'session/sync must return the missed events')
+  assert.ok(events.events.some(event => event.t === 'chat/message'))
+  client.close()
+})
+
+test('joining and leaving are announced through session/participants', async t => {
+  const { gateway, port } = await makeGateway({ sessionIdFor: () => 'conv-1' })
+  t.after(() => gateway.close())
+  const first = freshDevice()
+  const one = await pairDevice(port, first, { capabilities: [CAPABILITIES.PARTICIPANTS] })
+  const initial = await one.client.waitFor(f => f.t === 'session/participants')
+  assert.ok(initial)
+  assert.equal(initial.sessionId, 'conv-1')
+  assert.equal(initial.participants.length, 1)
+  assert.equal(initial.participants[0].online, true)
+
+  const second = freshDevice()
+  const two = await pairDevice(port, second, { capabilities: [CAPABILITIES.PARTICIPANTS], deviceName: '手机二' })
+  const joined = await one.client.waitFor(f => f.t === 'session/participants' && f.participants.length === 2)
+  assert.ok(joined, 'the existing device must see the new participant')
+  assert.equal(joined.participants.every(p => p.online === true), true)
+
+  two.client.close()
+  const left = await one.client.waitFor(f => f.t === 'session/participants' && f.participants.some(p => p.online === false))
+  assert.ok(left, 'a disconnect must mark the device offline')
+  one.client.close()
+})
+
+test('collab/set switches the shared session, bumps the epoch and broadcasts state', async t => {
+  const remapped = []
+  const bridge = {
+    send: async () => {},
+    attachDevice: deviceId => remapped.push(deviceId),
+    resetSessions: async () => { remapped.length = 0 },
+  }
+  const { gateway, store, port } = await makeGateway({
+    bridge,
+    // The conversation id follows the persisted preference, exactly like the
+    // real plugin wiring in index.mjs.
+    sessionIdFor: deviceId => (store.getPreference('collaboration', false) === true ? 'shared-conv' : `device-${deviceId}`),
+  })
+  t.after(() => gateway.close())
+  const first = freshDevice()
+  const one = await pairDevice(port, first, {
+    capabilities: [CAPABILITIES.COLLAB, CAPABILITIES.SESSION_SYNC, CAPABILITIES.PARTICIPANTS],
+  })
+  assert.equal(one.ack.sessionId, `device-${first.deviceId}`)
+  assert.equal(one.ack.collaboration, false)
+  const epochBefore = one.ack.sessionEpoch
+
+  one.client.send({ t: 'collab/set', rid: 'col1', on: true })
+
+  const state = await one.client.waitFor(f => f.t === 'collab/state')
+  assert.ok(state, 'the phone must be told the collaboration state changed')
+  assert.equal(state.on, true)
+  assert.equal(state.sessionId, 'shared-conv')
+  assert.equal(state.sessionEpoch, epochBefore + 1)
+  const snapshot = await one.client.waitFor(f => f.t === 'session/state' && f.sessionId === 'shared-conv')
+  assert.ok(snapshot, 'a session switch must resend the snapshot')
+  assert.equal(snapshot.sessionEpoch, epochBefore + 1)
+  await delay(30)
+  assert.deepEqual(remapped, [first.deviceId], 'the bridge mapping is rebuilt for every connected device')
+  one.client.close()
+})
+
+test('the HTTP collaboration switch keeps working and broadcasts to the phones', async t => {
+  const { gateway, port } = await makeGateway({
+    sessionIdFor: deviceId => (gateway.store.getPreference('collaboration', false) === true ? 'shared-conv' : `device-${deviceId}`),
+  })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.COLLAB] })
+
+  const response = await fetch(`http://127.0.0.1:${port}/openwhale/collaboration?on=1`, { method: 'POST' })
+  assert.equal(response.status, 200)
+  const state = await client.waitFor(f => f.t === 'collab/state')
+  assert.ok(state, 'the local page toggle must reach connected phones')
+  assert.equal(state.on, true)
+  assert.equal(state.sessionId, 'shared-conv')
+  client.close()
+})
+
+test('state-changing HTTP routes refuse requests that did not originate on this machine', async t => {
+  const { gateway, port, store } = await makeGateway()
+  t.after(() => gateway.close())
+  const base = `http://127.0.0.1:${port}`
+  // A request proxied through the public tunnel arrives as loopback on the socket,
+  // so the forwarding headers are what distinguish "this machine" from "internet".
+  const remote = { headers: { 'x-forwarded-for': '203.0.113.9' } }
+
+  const writes = [
+    [`${base}/openwhale/collaboration?on=1`, { method: 'POST' }],
+    [`${base}/openwhale/unbind`, { method: 'POST' }],
+    [`${base}/openwhale/device-rename?deviceId=x&label=y`, { method: 'POST' }],
+    [`${base}/openwhale/connection-mode?mode=lan`, { method: 'POST' }],
+    [`${base}/openwhale/send-file`, { method: 'POST', body: '{"path":"x"}' }],
+  ]
+  for (const [url, init] of writes) {
+    const response = await fetch(url, { ...init, ...remote })
+    assert.equal(response.status, 403, `${url} must not be writable from a remote origin`)
+  }
+  assert.equal(store.getPreference('collaboration'), undefined, 'a remote request must not flip the switch')
+
+  // Read-only routes stay reachable, which is what makes debugging from a phone possible.
+  assert.equal((await fetch(`${base}/openwhale/health`, remote)).status, 200)
+  assert.equal((await fetch(`${base}/openwhale/pairing.json`, remote)).status, 200)
+  // But the QR image carries the single-use pairing secret: local only.
+  assert.equal((await fetch(`${base}/openwhale/qr.png`, remote)).status, 403)
+
+  // The same routes do work from this machine.
+  const local = await fetch(`${base}/openwhale/connection-mode?mode=lan`, { method: 'POST' })
+  assert.equal(local.status, 200)
+  assert.equal((await local.json()).mode, 'lan')
+})
+
+test('connection-mode reports detected endpoint kinds and the QR follows it', async t => {
+  const { gateway, store, port } = await makeGateway({
+    lanUrls: ['http://192.168.1.9:8787', 'http://100.88.1.2:8787'],
+    tunnelUrls: ['https://example.trycloudflare.com'],
+  })
+  t.after(() => gateway.close())
+
+  const info = await (await fetch(`http://127.0.0.1:${port}/openwhale/connection-mode`)).json()
+  assert.equal(info.ok, true)
+  assert.equal(info.mode, 'auto')
+  assert.deepEqual(info.modes, ['auto', 'lan', 'tailscale', 'tunnel'])
+  // auto prefers Tailscale, then LAN, then the public tunnel (the whole 2.2.0 fix).
+  assert.deepEqual(info.endpoints.map(endpoint => endpoint.kind), ['tailscale', 'lan', 'tunnel'])
+  assert.deepEqual(info.detected.tailscale, ['http://100.88.1.2:8787'])
+  assert.deepEqual(info.detected.lan, ['http://192.168.1.9:8787'])
+  assert.deepEqual(info.detected.tunnel, ['https://example.trycloudflare.com'])
+
+  const switched = await (await fetch(`http://127.0.0.1:${port}/openwhale/connection-mode?mode=tailscale`, { method: 'POST' })).json()
+  assert.equal(switched.mode, 'tailscale')
+  assert.equal(store.getPreference('connectionMode'), 'tailscale')
+  assert.deepEqual(switched.endpoints.map(endpoint => endpoint.kind), ['tailscale'])
+
+  // The QR payload is ordered by the chosen mode and carries compact kind codes
+  // plus a web-client URL.
+  const pairing = await (await fetch(`http://127.0.0.1:${port}/openwhale/pairing.json`)).json()
+  assert.equal(pairing.ok, true)
+  assert.deepEqual(pairing.payload.endpoints, ['http://100.88.1.2:8787'])
+  assert.deepEqual(pairing.payload.epk, ['t'])
+  assert.equal(pairing.payload.mode, 'tailscale')
+  assert.equal(pairing.payload.web, 'http://100.88.1.2:8787/openwhale/app')
+  assert.equal(pairing.payload.version, '2.2.0')
+})
+
+test('hello/ack advertises capabilities, the conversation and classified endpoints', async t => {
+  const { gateway, store, port } = await makeGateway({
+    lanUrls: ['http://192.168.1.9:8787', 'http://100.88.1.2:8787'],
+    tunnelUrls: ['https://example.trycloudflare.com'],
+    sessionIdFor: () => 'conv-ack',
+    collaboration: () => true,
+  })
+  t.after(() => gateway.close())
+  store.setPreference('connectionMode', 'auto')
+  const device = freshDevice()
+  const { client, ack } = await pairDevice(port, device)
+
+  assert.equal(ack.version, '1.1.0', 'version keeps meaning the wire-protocol version')
+  assert.equal(ack.serverVersion, '2.2.0')
+  assert.ok(Array.isArray(ack.capabilities))
+  assert.ok(ack.capabilities.includes(CAPABILITIES.CHAT_ECHO))
+  assert.ok(ack.capabilities.includes(CAPABILITIES.UPLOAD))
+  assert.equal(ack.sessionId, 'conv-ack')
+  assert.equal(typeof ack.sessionEpoch, 'number')
+  assert.equal(ack.eventCursor, 0)
+  assert.equal(ack.collaboration, true)
+  assert.equal(ack.connectionMode, 'auto')
+  assert.deepEqual(ack.endpointList.map(endpoint => endpoint.kind), ['tailscale', 'lan', 'tunnel'])
+  assert.equal(ack.endpointList[0].url, 'http://100.88.1.2:8787')
+  client.close()
+})
+
+test('health and info expose version, collaboration, connection mode and kinds', async t => {
+  const { gateway, store, port } = await makeGateway({
+    lanUrls: ['http://192.168.1.9:8787'],
+    tunnelUrls: ['https://example.trycloudflare.com'],
+  })
+  t.after(() => gateway.close())
+  store.setPreference('collaboration', true)
+  store.setPreference('connectionMode', 'lan')
+  const health = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.equal(health.version, '2.2.0')
+  assert.equal(health.collaboration, true)
+  assert.equal(health.connectionMode, 'lan')
+  assert.deepEqual(health.endpoints, [{ url: 'http://192.168.1.9:8787', kind: 'lan' }])
+  // Existing fields are untouched.
+  assert.equal(health.ok, true)
+  assert.equal(typeof health.connections, 'number')
+
+  const info = await (await fetch(`http://127.0.0.1:${port}/openwhale/info`)).json()
+  assert.equal(info.version, '2.2.0')
+  assert.equal(info.connectionMode, 'lan')
+  assert.equal(Array.isArray(info.endpoints), true)
+  assert.equal(typeof info.endpoints[0].kind, 'string')
+})
+
+test('the binding page carries the 2.2.0 features the user has to see', async t => {
+  const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
+  t.after(() => gateway.close())
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
+  assert.match(html, /2\.2\.0/)
+  assert.match(html, /连接方式/)
+  assert.match(html, /Tailscale/)
+  assert.match(html, /局域网/)
+  assert.match(html, /公网隧道/)
+  assert.match(html, /发送到手机/)
+  assert.match(html, /openwhale\/app/, 'the page must offer the web client')
+  assert.match(html, /192\.168\.1\.9:8787\/openwhale\/app/, 'the web client URL uses a phone-reachable endpoint')
+})
+
+test('a page opened through the tunnel is read-only and says so', async t => {
+  const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
+  t.after(() => gateway.close())
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`, { headers: { 'x-forwarded-for': '203.0.113.9' } })).text()
+  assert.match(html, /请在本机浏览器/, 'a remote page must explain why the controls are disabled')
+  assert.equal(html.includes('id="send-file-btn"'), false, 'the remote page must not render the send-file control')
+})
+
+test('upload/start → chunk → end lands the file in the session workspace and chat/send can reference it', async t => {
+  const uploadDir = mkdtempSync(join(tmpdir(), 'openwhale-gw-upload-'))
+  t.after(() => rmSync(uploadDir, { recursive: true, force: true }))
+  const { gateway, port, harness } = await makeGateway({ uploadDir })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, {
+    capabilities: [CAPABILITIES.UPLOAD, CAPABILITIES.CHAT_ECHO],
+  })
+
+  const bytes = Buffer.from('图片字节'.repeat(500), 'utf8')
+  client.send({ t: 'upload/start', uploadId: 'up_1', name: 'photo.jpg', size: bytes.length, mime: 'image/jpeg' })
+  const ready = await client.waitFor(f => f.t === 'upload/ready')
+  assert.ok(ready, 'expected upload/ready')
+  assert.equal(ready.uploadId, 'up_1')
+  assert.equal(ready.chunkBytes, UPLOAD_CHUNK_BYTES)
+  assert.equal(ready.maxBytes, MAX_UPLOAD_BYTES)
+
+  // Backpressure: the client waits for progress before the next chunk.
+  client.send({ t: 'upload/chunk', uploadId: 'up_1', seq: 0, dataBase64: bytes.toString('base64') })
+  const progress = await client.waitFor(f => f.t === 'upload/progress')
+  assert.equal(progress.nextSeq, 1)
+  assert.equal(progress.received, bytes.length)
+
+  client.send({ t: 'upload/end', uploadId: 'up_1' })
+  const done = await client.waitFor(f => f.t === 'upload/done')
+  assert.ok(done, 'expected upload/done')
+  assert.equal(done.name, 'photo.jpg')
+  assert.equal(done.size, bytes.length)
+  assert.equal(done.path.startsWith(uploadDir), true)
+  assert.equal(done.path.endsWith('photo.jpg'), true)
+  assert.equal(readFileSync(done.path).equals(bytes), true)
+
+  // The chat message references the upload instead of inlining base64.
+  client.send({
+    t: 'chat/send',
+    rid: 'r1',
+    callId: 'c1',
+    msgId: 'm1',
+    text: '看看这张图',
+    files: [{ uploadId: 'up_1' }],
+  })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack' && f.msgId === 'm1'))
+  const started = Date.now()
+  while (harness.sent.length === 0 && Date.now() - started < 2000) await delay(10)
+  assert.equal(harness.sent.length, 1)
+  const attachment = harness.sent[0].attachments[0]
+  assert.equal(attachment.path, done.path, 'the assistant receives the real on-disk path')
+  assert.equal(attachment.fileId, done.fileId)
+  const echo = await client.waitFor(f => f.t === 'chat/echo' && f.msgId === 'm1')
+  assert.equal(echo.files[0].fileId, done.fileId)
+  client.close()
+})
+
+test('a legacy inline attachment gets a file card and can be fetched in chunks', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.CHAT_ECHO] })
+
+  const bytes = Buffer.from('内联附件的内容', 'utf8')
+  client.send({
+    t: 'chat/send',
+    rid: 'r1',
+    callId: 'c1',
+    msgId: 'm1',
+    text: '看这个',
+    files: [{ name: '备注.txt', mime: 'text/plain', dataBase64: bytes.toString('base64') }],
+  })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack'))
+  const echo = await client.waitFor(f => f.t === 'chat/echo' && f.msgId === 'm1')
+  assert.ok(echo, 'the echo must carry the attachment metadata')
+  assert.equal(echo.files.length, 1)
+  assert.equal(echo.files[0].name, '备注.txt')
+  assert.equal(echo.files[0].size, bytes.length)
+  assert.match(echo.files[0].fileId, /^f_/, 'a legacy attachment needs a fileId for the download card')
+  await delay(30)
+  assert.equal(harness.sent[0].attachments[0].path.endsWith('备注.txt'), true)
+
+  // The phone can pull it back with the normal chunked file/fetch path.
+  client.send({ t: 'file/fetch', rid: 'r2', fileId: echo.files[0].fileId })
+  const meta = await client.waitFor(f => f.t === 'file/meta')
+  assert.equal(meta.name, '备注.txt')
+  assert.equal(meta.size, bytes.length)
+  const end = await client.waitFor(f => f.t === 'file/end')
+  assert.ok(end, 'expected file/end')
+  const chunks = client.frames.filter(f => f.t === 'file/chunk')
+  assert.equal(Buffer.concat(chunks.map(chunk => Buffer.from(chunk.dataBase64, 'base64'))).equals(bytes), true)
+  client.close()
+})
+
+test('an unknown uploadId reference is refused without waking the assistant', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.UPLOAD] })
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '看这个', files: [{ uploadId: 'nope' }] })
+  const error = await client.waitFor(f => f.t === 'error')
+  assert.equal(error.code, 'upload-not-found')
+  await delay(40)
+  assert.equal(harness.sent.length, 0)
+  client.close()
+})
+
+test('POST /openwhale/send-file offers a local file to every phone', async t => {
+  const cwdDir = mkdtempSync(join(tmpdir(), 'openwhale-gw-cwd-'))
+  const outside = mkdtempSync(join(tmpdir(), 'openwhale-gw-outside-'))
+  t.after(() => rmSync(cwdDir, { recursive: true, force: true }))
+  t.after(() => rmSync(outside, { recursive: true, force: true }))
+  const filePath = join(cwdDir, '报告.pdf')
+  writeFileSync(filePath, 'PDF-BYTES')
+  const outsidePath = join(outside, 'secret.txt')
+  writeFileSync(outsidePath, 'top secret')
+
+  const { gateway, port } = await makeGateway({ cwd: () => cwdDir })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.FILE_OFFER] })
+
+  const refused = await fetch(`http://127.0.0.1:${port}/openwhale/send-file`, {
+    method: 'POST',
+    body: JSON.stringify({ path: outsidePath }),
+  })
+  assert.equal(refused.status, 400, 'a path outside the session workspace must be refused')
+
+  const offered = await fetch(`http://127.0.0.1:${port}/openwhale/send-file`, {
+    method: 'POST',
+    body: JSON.stringify({ path: filePath }),
+  })
+  assert.equal(offered.status, 200)
+  const body = await offered.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.name, '报告.pdf')
+  assert.equal(body.size, 'PDF-BYTES'.length)
+  assert.match(body.url, /^\/openwhale\/download\?token=/)
+  assert.equal(body.mime, 'application/pdf')
+
+  const card = await client.waitFor(f => f.t === 'file/offered')
+  assert.ok(card, 'the phone must receive a file card')
+  assert.equal(card.name, '报告.pdf')
+  assert.equal(card.url, body.url)
+  assert.equal(typeof card.seq, 'number')
+
+  // The one-shot URL really serves the bytes.
+  const download = await fetch(`http://127.0.0.1:${port}${body.url}`)
+  assert.equal(download.status, 200)
+  assert.equal(await download.text(), 'PDF-BYTES')
+  client.close()
+})
+
+test('the built-in web client is served under /openwhale/app from either layout', async t => {
+  const webRoot = mkdtempSync(join(tmpdir(), 'openwhale-gw-web-'))
+  const dir = join(webRoot, 'webchat')
+  mkdirSync(join(dir, 'lib'), { recursive: true })
+  writeFileSync(join(dir, 'index.html'), '<!doctype html><title>Open Whale Web</title>')
+  writeFileSync(join(dir, 'lib', 'chat.mjs'), 'export const ok = true')
+  t.after(() => rmSync(webRoot, { recursive: true, force: true }))
+
+  const { gateway, port } = await makeGateway({ webClientDir: dir })
+  t.after(() => gateway.close())
+
+  const index = await fetch(`http://127.0.0.1:${port}/openwhale/app`)
+  assert.equal(index.status, 200)
+  assert.equal(index.headers.get('content-type'), 'text/html; charset=utf-8')
+  assert.equal(index.headers.get('cache-control'), 'no-store')
+  assert.match(await index.text(), /Open Whale Web/)
+
+  const trailing = await fetch(`http://127.0.0.1:${port}/openwhale/app/`)
+  assert.equal(trailing.status, 200, 'the trailing-slash form must serve index.html too')
+
+  const asset = await fetch(`http://127.0.0.1:${port}/openwhale/app/lib/chat.mjs`)
+  assert.equal(asset.status, 200)
+  assert.equal(asset.headers.get('content-type'), 'text/javascript; charset=utf-8')
+
+  const missing = await fetch(`http://127.0.0.1:${port}/openwhale/app/nope.js`)
+  assert.equal(missing.status, 404)
+})
+
 
 

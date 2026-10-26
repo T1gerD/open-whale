@@ -7,14 +7,13 @@ import { FILE_CHUNK_BYTES, MAX_FILE_BYTES } from './frames.mts'
 import type { Transfer } from './reducer.mts'
 
 /**
- * 手机端单次下载允许在内存里拼装的字节上限。
+ * 手机端「内存拼装」下载的字节上限（v2.2.0 保留的兜底路径）。
  *
- * 为什么要有这个上限：expo-file-system 的新 API 的分块追加写入（FileHandle）在
- * SDK 57 上我们未能验证，因此当前实现是把分块按序拼接后一次写入 —— 代价是峰值内存
- * 等于文件大小。512 MB（协议上限）在手机上必然 OOM，所以下载大文件前先拦下来，
- * 并在 README 的“已知限制”里写明：真正流式落盘待真机验证后替换。
+ * v2.2.0 默认走流式落盘（services/transfers.ts 的 DownloadSink，边收边写文件），
+ * 所以这个上限只约束「设备不支持 FileHandle 时的内存兜底」，不再是主路径。
+ * 真正允许的文件大小由协议 `MAX_FILE_BYTES`（512 MB）决定。
  */
-export const MAX_ASSEMBLY_BYTES = 48 * 1024 * 1024
+export const MAX_ASSEMBLY_BYTES = 64 * 1024 * 1024
 
 export function canAssemble(size: number): boolean {
   return Number.isFinite(size) && size >= 0 && size <= Math.min(MAX_ASSEMBLY_BYTES, MAX_FILE_BYTES)
@@ -192,15 +191,22 @@ export function isAccumulatorComplete(acc: ChunkAccumulator): boolean {
   return acc.size === 0 ? acc.nextSeq > 0 : acc.bytes >= acc.size
 }
 
-/** 发送附件前的大小判断：协议里 `chat/send.files` 是整包 base64，大文件不该硬塞。 */
-export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+/**
+ * 老协议「内联 base64」附件的上限（兼容没有 upload-v1 能力的电脑端）。
+ *
+ * v2.2.0 的正常路径是分块上传（上限 64 MiB，见 core/upload.mts）。只有对端是
+ * v2.1.0 插件、不声明 `upload-v1` 时，才退回整包 base64；此时把上限压到 8 MiB，
+ * 避免一个帧把隧道打爆。
+ */
+export const INLINE_UPLOAD_BYTES = 8 * 1024 * 1024
 
+/** 兼容老名字：`uploadGuard` 现在专门指“内联 base64 路径”。 */
 export function uploadGuard(size: number): { ok: true } | { ok: false; message: string } {
   if (!Number.isFinite(size) || size < 0) return { ok: false, message: '无法读取这个文件的大小' }
-  if (size > MAX_UPLOAD_BYTES) {
+  if (size > INLINE_UPLOAD_BYTES) {
     return {
       ok: false,
-      message: `附件上限 ${formatBytes(MAX_UPLOAD_BYTES)}：请把文件放到电脑上（或用电脑端直接打开），手机端暂不支持大文件分块上传`,
+      message: `电脑端版本较旧，内联附件上限 ${formatBytes(INLINE_UPLOAD_BYTES)}：请升级电脑端插件以支持大文件分块上传`,
     }
   }
   return { ok: true }

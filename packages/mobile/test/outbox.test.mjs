@@ -12,6 +12,7 @@ import {
   markFailed,
   markInflight,
   markSent,
+  markUploaded,
   outboxSize,
   pendingCount,
   pruneOutbox,
@@ -122,4 +123,48 @@ test('the queue survives a JSON round-trip and garbage fails safe', () => {
   assert.equal(outboxSize(deserializeOutbox('not json')), 0)
   assert.equal(outboxSize(deserializeOutbox(null)), 0)
   assert.equal(outboxSize(deserializeOutbox('{"entries":[{"nope":1}]}')), 0)
+})
+
+test('entries are addressable by msgId as well as rid (chat/ack may only carry one)', () => {
+  let outbox = enqueue(createOutbox(), { ...entry('r1'), msgId: 'm1' })
+  outbox = markInflight(outbox, 'm1', 100)
+  assert.equal(getEntry(outbox, 'm1').state, 'inflight')
+  outbox = markSent(outbox, 'm1')
+  assert.equal(outboxSize(outbox), 0)
+})
+
+test('uploaded attachments are remembered so a retry does not upload twice', () => {
+  let outbox = enqueue(createOutbox(), {
+    ...entry('r1'),
+    files: [{ name: 'photo.jpg', mime: 'image/jpeg', size: 2048, uri: 'file:///tmp/photo.jpg' }],
+  })
+  outbox = markUploaded(outbox, 'r1', [{ index: 0, uploadId: 'upl_1', name: 'photo.jpg', size: 2048, mime: 'image/jpeg' }])
+  // 重复记录同一个 uploadId 不会产生两条
+  outbox = markUploaded(outbox, 'r1', [{ index: 0, uploadId: 'upl_1', name: 'photo.jpg', size: 2048, mime: 'image/jpeg' }])
+  assert.deepEqual(getEntry(outbox, 'r1').uploads, [
+    { index: 0, uploadId: 'upl_1', name: 'photo.jpg', size: 2048, mime: 'image/jpeg' },
+  ])
+  const restored = deserializeOutbox(serializeOutbox(outbox))
+  assert.equal(restored.entries[0].files[0].uri, 'file:///tmp/photo.jpg')
+  assert.equal(restored.entries[0].uploads[0].uploadId, 'upl_1')
+})
+
+test('legacy inline attachments and unknown states are normalised on restore', () => {
+  const raw = JSON.stringify({
+    entries: [
+      {
+        rid: 'r_old',
+        assistantId: 'cmp_1',
+        text: '老消息',
+        files: [{ name: 'a.txt', mime: 'text/plain', dataBase64: 'QUFB' }],
+        state: 'weird-state',
+        attempts: 'nope',
+      },
+    ],
+  })
+  const outbox = deserializeOutbox(raw)
+  assert.equal(outbox.entries.length, 1)
+  assert.equal(outbox.entries[0].state, 'pending')
+  assert.equal(outbox.entries[0].attempts, 0)
+  assert.equal(outbox.entries[0].files[0].dataBase64, 'QUFB')
 })

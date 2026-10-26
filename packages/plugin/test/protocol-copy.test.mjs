@@ -77,7 +77,7 @@ test('the generated copy never escapes the package', () => {
 })
 
 test('the plugin sources only import the protocol from inside the package', () => {
-  const sources = ['index.mjs', 'gateway.mjs', 'pairer.mjs', 'power.mjs', 'state.mjs', 'dsh-bridge.mjs']
+  const sources = ['index.mjs', 'gateway.mjs', 'pairer.mjs', 'power.mjs', 'state.mjs', 'dsh-bridge.mjs', 'upload.mjs', 'webchat.mjs']
   for (const file of sources) {
     const text = readNormalised(join(here, '..', 'src', file))
     const imports = [...text.matchAll(/from '([^']*protocol[^']*)'/g)].map(match => match[1])

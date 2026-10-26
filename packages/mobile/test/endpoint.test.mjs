@@ -1,23 +1,43 @@
-// endpoint 解析、WebSocket URL 推导与重连地址阶梯。
+// endpoint 解析、网络类型分类、连接候选排序、手动地址规范化。
+//
+// v2.2.0 起分类/排序委托给 `packages/protocol`（唯一权威），这里验证手机端
+// 叠加上去的语义：上次成功优先、显式连接方式过滤、USB 仅内部测试、手动输入规范化。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  CONNECTION_MODE,
+  DEFAULT_PORT,
+  connectionModeLabel,
+  endpointKind,
+  endpointKindLabel,
   endpointLabel,
   endpointLadder,
+  healthUrlFor,
+  httpUrlFor,
+  isEndpointPermitted,
+  isTailscaleEndpoint,
   looksLocal,
+  missingModeHint,
+  normalizeConnectionMode,
   normalizeEndpoint,
   normalizeEndpoints,
+  normalizeManualAddress,
   parseEndpoint,
   wsUrlFor,
   WS_PATH,
 } from '../src/core/endpoint.mts'
 
+const TAILSCALE = 'http://100.88.1.2:8787'
+const LAN = 'http://192.168.1.20:8787'
+const TUNNEL = 'https://quiet-whale.trycloudflare.com'
+const USB = 'http://127.0.0.1:8787'
+
 test('wsUrlFor upgrades the scheme and appends the gateway path', () => {
   assert.equal(WS_PATH, '/openwhale/ws')
-  assert.equal(wsUrlFor('https://quiet-whale.trycloudflare.com'), 'wss://quiet-whale.trycloudflare.com/openwhale/ws')
-  assert.equal(wsUrlFor('http://192.168.1.20:8787'), 'ws://192.168.1.20:8787/openwhale/ws')
+  assert.equal(wsUrlFor(TUNNEL), 'wss://quiet-whale.trycloudflare.com/openwhale/ws')
+  assert.equal(wsUrlFor(LAN), 'ws://192.168.1.20:8787/openwhale/ws')
   assert.equal(wsUrlFor('http://192.168.1.20:8787/'), 'ws://192.168.1.20:8787/openwhale/ws')
   assert.equal(wsUrlFor('http://[::1]:8787'), 'ws://[::1]:8787/openwhale/ws')
 })
@@ -60,40 +80,121 @@ test('normalizeEndpoints drops junk, trailing slashes and duplicates', () => {
   assert.equal(normalizeEndpoint('HTTPS://A.example/'), 'https://A.example')
 })
 
-test('the reconnect ladder puts the remembered endpoint first, then https', () => {
-  const endpoints = ['http://192.168.1.20:8787', 'https://tunnel.example.com']
-  // 局域网直连属于「高级连接方式」，默认关闭（见 core/connection-policy）：
-  // 不开这个开关时，阶梯里根本不会出现 192.168.* 的地址。
-  assert.deepEqual(endpointLadder(endpoints, 'http://192.168.1.20:8787'), ['https://tunnel.example.com'])
-
-  const lan = { allowLan: true }
-  assert.deepEqual(endpointLadder(endpoints, 'http://192.168.1.20:8787', lan), [
-    'http://192.168.1.20:8787',
-    'https://tunnel.example.com',
-  ])
-  // 刻意与 protocol 的 `pickEndpoint` 不同：那里要求 preferred 仍在列表里才用它，
-  // 而重连阶梯会先试一次“上次成功的地址”——电脑端这次没通告局域网地址，不代表它失效了。
-  // 失败后阶梯会继续走到下一个地址。
-  assert.deepEqual(endpointLadder(endpoints, 'https://dead.example.com', lan), [
-    'https://dead.example.com',
-    'https://tunnel.example.com',
-    'http://192.168.1.20:8787',
-  ])
-  // 阶梯不重复同一个地址（记住的地址如果也在通告列表里，只出现一次）
-  assert.deepEqual(endpointLadder(endpoints, 'https://tunnel.example.com', lan), [
-    'https://tunnel.example.com',
-    'http://192.168.1.20:8787',
-  ])
-  assert.deepEqual(endpointLadder([], undefined), [])
-  // 没有“上次成功地址”时与 protocol 的 pickEndpoint 一致：https 优先，其余按二维码顺序
-  assert.deepEqual(endpointLadder(endpoints, undefined, lan), ['https://tunnel.example.com', 'http://192.168.1.20:8787'])
+test('Tailscale is its own network kind, not a LAN address', () => {
+  // 这是 v2.1.0 的核心缺陷：100.64.0.0/10 不在私有网段判断里，被当成公网 https 之外的东西。
+  assert.equal(endpointKind('http://100.64.0.5:8787'), 'tailscale')
+  assert.equal(endpointKind('http://100.127.255.254:8787'), 'tailscale')
+  assert.equal(endpointKind('http://[fd7a:115c:a1e0::1]:8787'), 'tailscale')
+  assert.equal(endpointKind('https://desktop.tail1a2b3c.ts.net'), 'tailscale')
+  assert.equal(isTailscaleEndpoint('http://100.88.1.2:8787'), true)
+  assert.equal(isTailscaleEndpoint('http://192.168.1.2:8787'), false)
+  assert.equal(endpointKind(LAN), 'lan')
+  assert.equal(endpointKind('http://10.0.0.4:8787'), 'lan')
+  assert.equal(endpointKind(TUNNEL), 'tunnel')
+  assert.equal(endpointKind(USB), 'loopback')
+  assert.equal(endpointKind('http://8.8.8.8:8787'), 'unknown')
 })
 
-test('endpointLabel and looksLocal describe the network position for the UI', () => {
-  assert.equal(endpointLabel('https://a.trycloudflare.com'), '公网隧道')
-  assert.equal(endpointLabel('http://192.168.1.5:8787'), '局域网')
+test('auto ordering is Tailscale > LAN > tunnel (https no longer wins)', () => {
+  const endpoints = [TUNNEL, LAN, TAILSCALE, USB]
+  assert.deepEqual(endpointLadder(endpoints, undefined), [TAILSCALE, LAN, TUNNEL])
+  // 记住上次成功的地址：它先试一次，其余仍按协议顺序
+  assert.deepEqual(endpointLadder(endpoints, TUNNEL), [TUNNEL, TAILSCALE, LAN])
+  assert.deepEqual(endpointLadder(endpoints, LAN), [LAN, TAILSCALE, TUNNEL])
+})
+
+test('USB loopback is only allowed in internal test mode and always last', () => {
+  const endpoints = [USB, TAILSCALE]
+  assert.deepEqual(endpointLadder(endpoints, undefined), [TAILSCALE])
+  assert.deepEqual(endpointLadder(endpoints, USB, { allowUsb: true }), [USB, TAILSCALE])
+  // 关掉测试模式后，记住的 USB 地址也不能再被优先使用
+  assert.deepEqual(endpointLadder(endpoints, USB, { allowUsb: false }), [TAILSCALE])
+})
+
+test('explicit connection modes keep only their own kind of address', () => {
+  const endpoints = [TUNNEL, LAN, TAILSCALE]
+  assert.deepEqual(endpointLadder(endpoints, undefined, { mode: CONNECTION_MODE.LAN }), [LAN])
+  assert.deepEqual(endpointLadder(endpoints, undefined, { mode: CONNECTION_MODE.TAILSCALE }), [TAILSCALE])
+  assert.deepEqual(endpointLadder(endpoints, undefined, { mode: CONNECTION_MODE.TUNNEL }), [TUNNEL])
+  assert.deepEqual(endpointLadder([TUNNEL], undefined, { mode: CONNECTION_MODE.TAILSCALE }), [])
+  assert.equal(isEndpointPermitted(LAN, { mode: CONNECTION_MODE.TAILSCALE }), false)
+  assert.equal(isEndpointPermitted(TUNNEL, {}), true)
+  assert.equal(isEndpointPermitted(USB, {}), false)
+  assert.equal(isEndpointPermitted(USB, { allowUsb: true }), true)
+})
+
+test('missingModeHint explains what to do when an explicit mode has no address', () => {
+  assert.equal(missingModeHint(CONNECTION_MODE.AUTO, [TUNNEL]), undefined)
+  assert.equal(missingModeHint(CONNECTION_MODE.TAILSCALE, [TAILSCALE]), undefined)
+  const tailscale = missingModeHint(CONNECTION_MODE.TAILSCALE, [TUNNEL, LAN])
+  assert.match(tailscale, /Tailscale/)
+  assert.match(tailscale, /tailnet/)
+  const lan = missingModeHint(CONNECTION_MODE.LAN, [TUNNEL])
+  assert.match(lan, /Wi-Fi/)
+  const tunnel = missingModeHint(CONNECTION_MODE.TUNNEL, [LAN])
+  assert.match(tunnel, /重新生成二维码/)
+})
+
+test('endpoint labels tell the user which line is in use', () => {
+  assert.equal(endpointKindLabel('tailscale'), 'Tailscale')
+  assert.equal(endpointKindLabel('lan'), '局域网')
+  assert.equal(endpointKindLabel('tunnel'), '公网隧道')
+  assert.equal(endpointKindLabel('loopback'), 'USB 调试通道')
+  assert.equal(endpointKindLabel('mystery'), '未知网络')
+  assert.equal(endpointLabel(TUNNEL), '公网隧道')
+  assert.equal(endpointLabel(LAN), '局域网')
+  assert.equal(endpointLabel(TAILSCALE), 'Tailscale')
   assert.equal(endpointLabel('garbage'), '地址无效')
-  assert.equal(looksLocal('http://192.168.1.5:8787'), true)
-  assert.equal(looksLocal('http://10.0.0.4:8787'), true)
-  assert.equal(looksLocal('https://a.trycloudflare.com'), false)
+  assert.equal(connectionModeLabel('auto'), '自动')
+  assert.equal(connectionModeLabel('tailscale'), 'Tailscale')
+  assert.equal(connectionModeLabel('nope'), '自动')
+  assert.equal(normalizeConnectionMode('lan'), 'lan')
+  assert.equal(normalizeConnectionMode('bogus'), 'auto')
+  assert.equal(looksLocal(LAN), true)
+  assert.equal(looksLocal(TAILSCALE), false)
+  assert.equal(looksLocal(TUNNEL), false)
+})
+
+test('hand-typed addresses are normalised into a usable endpoint', () => {
+  const cases = [
+    ['192.168.1.5:8787', `http://192.168.1.5:8787`],
+    ['192.168.1.5', `http://192.168.1.5:${DEFAULT_PORT}`],
+    ['  192.168.1.5:8787/  ', 'http://192.168.1.5:8787'],
+    ['http://192.168.1.5:8787/', 'http://192.168.1.5:8787'],
+    ['https://desk.tail1a2b3c.ts.net', 'https://desk.tail1a2b3c.ts.net'],
+    ['ws://192.168.1.5:8787/openwhale/ws', 'http://192.168.1.5:8787'],
+    ['wss://desk.tail1a2b3c.ts.net/openwhale/ws', 'https://desk.tail1a2b3c.ts.net'],
+    ['192.168.1.5:8787/whale', 'http://192.168.1.5:8787/whale'],
+    ['[fd7a:115c:a1e0::1]:8787', 'http://[fd7a:115c:a1e0::1]:8787'],
+    ['fd7a:115c:a1e0::1', 'http://[fd7a:115c:a1e0::1]:8787'],
+  ]
+  for (const [input, expected] of cases) {
+    const result = normalizeManualAddress(input)
+    assert.equal(result.ok, true, `expected ok: ${input}`)
+    assert.equal(result.endpoint, expected, input)
+  }
+  // 分类结果与地址本身一致（UI 的「测试连接」会显示它）
+  const tailscale = normalizeManualAddress('100.88.1.2:8787')
+  assert.equal(tailscale.ok, true)
+  assert.equal(tailscale.kind, 'tailscale')
+  assert.equal(tailscale.label, 'Tailscale')
+})
+
+test('hand-typed addresses reject junk with actionable copy', () => {
+  for (const input of ['', '   ', 'not a host', 'http://', 'https://host:99999', 42, null]) {
+    const result = normalizeManualAddress(input)
+    assert.equal(result.ok, false, `expected reject: ${String(input)}`)
+    assert.ok(result.message.length > 0)
+  }
+  assert.match(normalizeManualAddress('').message, /请输入电脑地址/)
+})
+
+test('health preflight URL is derived from any endpoint shape', () => {
+  assert.equal(httpUrlFor('http://192.168.1.5:8787/'), 'http://192.168.1.5:8787')
+  assert.equal(httpUrlFor(TUNNEL), TUNNEL)
+  assert.equal(httpUrlFor('wss://desk.tail1a2b3c.ts.net/openwhale/ws'), 'https://desk.tail1a2b3c.ts.net/openwhale/ws')
+  assert.equal(httpUrlFor('ws://host:1/whale'), 'http://host:1/whale')
+  assert.equal(healthUrlFor('http://192.168.1.5:8787'), 'http://192.168.1.5:8787/openwhale/health')
+  assert.equal(healthUrlFor('https://a.example/whale/'), 'https://a.example/whale/openwhale/health')
+  assert.equal(healthUrlFor('garbage'), undefined)
 })

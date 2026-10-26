@@ -1,0 +1,8 @@
+{
+  "name": "@openwhale/webchat",
+  "version": "2.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Open Whale 网页版/PWA 客户端",
+  "license": "MIT"
+}

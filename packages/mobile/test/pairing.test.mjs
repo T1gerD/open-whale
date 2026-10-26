@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { PAIR_SECRET_TTL_MS } from '../../protocol/src/index.mjs'
+import { PAIR_SECRET_TTL_MS, PROTOCOL_VERSION } from '../../protocol/src/index.mjs'
 import {
   buildAssistantFromPairing,
   buildHelloFrame,
@@ -141,7 +141,7 @@ test('buildHelloFrame omits optional fields instead of sending nulls', () => {
   })
   assert.deepEqual(frame, {
     t: 'hello',
-    version: '1.0.0',
+    version: PROTOCOL_VERSION,
     deviceId: 'dev_abcdefghijklmnopqrst',
     deviceName: '我的手机',
     devicePublicKey: 'PUBKEY',
@@ -190,4 +190,122 @@ test('a fixed random source yields a stable device id', async () => {
   assert.equal(first, formatDeviceId(fixedRandom(16, 3)))
   assert.equal(first.startsWith('dev_'), true)
   assert.ok(PAIR_SECRET_TTL_MS > 0)
+})
+
+test('the QR connection mode becomes the assistant record preference', () => {
+  const validated = validatePairingQr(pairingPayload({ mode: 'tailscale' }), deps)
+  assert.equal(validated.ok, true)
+  const record = buildAssistantFromPairing({
+    payload: validated.payload,
+    endpoints: validated.endpoints,
+    deviceId: 'dev_abcdefghijklmnopqrst',
+    deviceName: '我的手机',
+  })
+  assert.equal(record.connectionMode, 'tailscale')
+  assert.equal(record.sessionCursor, 0)
+  // 老插件不传 mode：默认自动
+  const legacy = validatePairingQr(pairingPayload(), deps)
+  assert.equal(
+    buildAssistantFromPairing({
+      payload: legacy.payload,
+      endpoints: legacy.endpoints,
+      deviceId: 'dev_abcdefghijklmnopqrst',
+      deviceName: '我的手机',
+    }).connectionMode,
+    'auto',
+  )
+})
+
+test('hello carries capabilities, cursor and sessionId when known', () => {
+  const frame = buildHelloFrame({
+    deviceId: 'dev_abcdefghijklmnopqrst',
+    deviceName: '我的手机',
+    devicePublicKey: 'PUBKEY',
+    nonce: 'n1',
+    capabilities: ['chat-echo-v1', 'upload-v1', ''],
+    cursor: 42,
+    sessionId: 'sess_1',
+  })
+  assert.deepEqual(frame.capabilities, ['chat-echo-v1', 'upload-v1'])
+  assert.equal(frame.cursor, 42)
+  assert.equal(frame.sessionId, 'sess_1')
+  // cursor=0 / 空能力列表不发送，保持老端兼容
+  const bare = buildHelloFrame({
+    deviceId: 'dev_abcdefghijklmnopqrst',
+    deviceName: '手机',
+    devicePublicKey: 'PUBKEY',
+    nonce: 'n1',
+    capabilities: [],
+    cursor: 0,
+    sessionId: '',
+  })
+  assert.equal('capabilities' in bare, false)
+  assert.equal('cursor' in bare, false)
+  assert.equal('sessionId' in bare, false)
+})
+
+test('hello/ack exposes 2.2.0 session fields and classified endpoints', () => {
+  const outcome = interpretHelloAck(
+    {
+      t: 'hello/ack',
+      version: '1.1.0',
+      computerId: 'cmp_abc123',
+      computerFingerprint: 'aabb',
+      paired: true,
+      heartbeatMs: 25_000,
+      capabilities: ['chat-echo-v1', 'session-sync-v1', 'upload-v1'],
+      sessionId: 'sess_shared',
+      sessionEpoch: 3,
+      eventCursor: 42,
+      collaboration: true,
+      connectionMode: 'tailscale',
+      endpointList: [
+        { url: 'http://100.88.1.2:8787', kind: 'tailscale' },
+        { url: 'https://a.example', kind: 'tunnel' },
+      ],
+      endpoints: ['http://192.168.1.20:8787/'],
+    },
+    { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
+  )
+  assert.equal(outcome.ok, true)
+  assert.deepEqual(outcome.capabilities, ['chat-echo-v1', 'session-sync-v1', 'upload-v1'])
+  assert.equal(outcome.sessionId, 'sess_shared')
+  assert.equal(outcome.sessionEpoch, 3)
+  assert.equal(outcome.eventCursor, 42)
+  assert.equal(outcome.collaboration, true)
+  assert.equal(outcome.connectionMode, 'tailscale')
+  assert.deepEqual(outcome.endpoints, [
+    'http://100.88.1.2:8787',
+    'https://a.example',
+    'http://192.168.1.20:8787',
+  ])
+})
+
+test('an old hello/ack without 2.2.0 fields degrades to "no capabilities"', () => {
+  const outcome = interpretHelloAck(
+    { t: 'hello/ack', computerId: 'cmp_abc123', computerFingerprint: 'aabb', paired: true },
+    { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
+  )
+  assert.equal(outcome.ok, true)
+  assert.deepEqual(outcome.capabilities, [])
+  assert.equal(outcome.sessionId, undefined)
+  assert.equal(outcome.eventCursor, undefined)
+  assert.equal(outcome.collaboration, undefined)
+})
+
+test('the displayed server version is the plugin version, not the protocol version', () => {
+  // 真实插件：version='1.1.0'（协议版本）、serverVersion='2.2.0'（插件版本）
+  const withPluginVersion = interpretHelloAck(
+    { t: 'hello/ack', version: '1.1.0', serverVersion: '2.2.0', computerId: 'cmp_abc123', computerFingerprint: 'aabb', paired: true },
+    { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
+  )
+  assert.equal(withPluginVersion.ok, true)
+  assert.equal(withPluginVersion.patch.serverVersion, '2.2.0')
+
+  // 老插件没有 serverVersion：回退到协议版本，至少不显示 undefined
+  const legacy = interpretHelloAck(
+    { t: 'hello/ack', version: '1.0.0', computerId: 'cmp_abc123', computerFingerprint: 'aabb', paired: true },
+    { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
+  )
+  assert.equal(legacy.patch.serverVersion, '1.0.0')
 })

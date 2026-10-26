@@ -16,12 +16,12 @@ import { mkdir } from 'node:fs/promises'
 import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
 
-import { DEFAULT_PORT } from './protocol.mjs'
+import { CONNECTION_MODES, DEFAULT_PORT, WEB_CLIENT_PATH } from './protocol.mjs'
 import { DshBridge } from './dsh-bridge.mjs'
-import { Gateway } from './gateway.mjs'
+import { Gateway, PLUGIN_VERSION, connectionModeLabel } from './gateway.mjs'
 import { PowerManager, sendWakeOnLan } from './power.mjs'
 import { StateStore } from './state.mjs'
-import { pairingAvailability, renderPairingQr } from './pairer.mjs'
+import { renderPairingQr } from './pairer.mjs'
 
 export const name = 'openwhale'
 
@@ -73,6 +73,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   shutdownDelaySeconds: 30,
   autoApproveTools: false,
   collaboration: false,
+  connectionMode: 'auto',
   tunnelMode: 'off',
   cloudflaredPath: '',
 })
@@ -102,6 +103,7 @@ async function buildConfigSchema() {
       shutdownDelaySeconds: z.number().default(30).description('远程关机的宽限秒数，期间可取消'),
       autoApproveTools: z.boolean().default(false).description('手机会话是否自动批准所有工具调用（默认关闭，走 DSH 原有审批策略）'),
       collaboration: z.boolean().default(false).description('多人协作：多台手机共用同一个对话并互相可见（默认关闭，各设备各自独立）'),
+      connectionMode: z.string().default('auto').description('连接方式偏好：auto（Tailscale→局域网→隧道）| lan | tailscale | tunnel'),
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
     })
@@ -140,7 +142,7 @@ export const Config = await buildConfigSchema()
 function volatilize(schema) {
   const dict = schema?.dict ?? {}
   const patches = {}
-  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'collaboration', 'tunnelMode']) {
+  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'collaboration', 'connectionMode', 'tunnelMode']) {
     if (dict[key]?.volatile) patches[key] = dict[key].volatile()
   }
   return patches
@@ -164,6 +166,7 @@ export async function apply(ctx, config) {
     shutdownDelaySeconds: config.shutdownDelaySeconds ?? 30,
     autoApproveTools: config.autoApproveTools === true,
     collaboration: config.collaboration === true,
+    connectionMode: config.connectionMode ?? 'auto',
     tunnelMode: config.tunnelMode ?? 'off',
     cloudflaredPath: config.cloudflaredPath ?? '',
   }
@@ -213,6 +216,12 @@ export async function apply(ctx, config) {
 
   // 每次调用都重新读 preference：改协作开关不必重启插件。
   const collaborationOn = () => store.getPreference('collaboration', settings.collaboration) === true
+  // 连接方式偏好：首次启动用配置值播种，之后由配对页/手机端修改并持久化。
+  if (!CONNECTION_MODES.includes(/** @type {any} */ (store.getPreference('connectionMode')))) {
+    store.setPreference('connectionMode', CONNECTION_MODES.includes(/** @type {any} */ (settings.connectionMode))
+      ? settings.connectionMode
+      : 'auto')
+  }
 
   const bridge = new DshBridge({
     ctx,
@@ -243,8 +252,12 @@ export async function apply(ctx, config) {
     store,
     bridge: {
       send: input => bridge.send(input),
-      cancel: callId => bridge.cancel(callId),
+      cancel: (callId, deviceId) => bridge.cancel(callId, deviceId),
       fileFor: fileId => bridge.fileFor(fileId),
+      forgetDevice: deviceId => bridge.forgetDevice(deviceId),
+      // 认证成功即登记会话归属：没发过言的设备也要能收到广播和在线成员。
+      attachDevice: deviceId => bridge.attachDevice(deviceId),
+      resetSessions: () => bridge.resetSessionMapping(),
       renameAssistant: async ({ label }) => {
         store.setComputerName(label)
       },
@@ -260,7 +273,14 @@ export async function apply(ctx, config) {
     lanUrls,
     tunnelUrls: () => tunnelUrls,
     log,
-    uploadDir: join(dataDir, 'uploads'),
+    // 会话身份：协作模式所有设备共享同一个对话，否则每台手机一个。
+    sessionIdFor: deviceId => (collaborationOn() ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
+    collaboration: collaborationOn,
+    // 附件落盘与电脑→手机发文件的根目录，必须是该会话的工作目录，
+    // 否则 DSH 的文件沙箱读不到（「手机发的图片模型看不到」的根因）。
+    cwd: () => bridge.workingDirectory(),
+    // uploads go to <cwd>/.openwhale/uploads; the old dataDir/uploads is kept
+    // only as a migration no-op for previously stored files.
   })
   gateway.heartbeatMs = settings.heartbeatMs
 
@@ -279,6 +299,9 @@ export async function apply(ctx, config) {
     collaboration: '/openwhale/collaboration',
     deviceRename: '/openwhale/device-rename',
     download: '/openwhale/download',
+    // v2.2.0：连接方式偏好 + 电脑→手机发文件（写操作仅本机）。
+    connectionMode: '/openwhale/connection-mode',
+    sendFile: '/openwhale/send-file',
   }
   let usingWebServer = false
   const webServer = ctx.get('webServer')
@@ -290,6 +313,13 @@ export async function apply(ctx, config) {
         handler: (req, res) => gateway.handleRequest(req, res),
       }), `openwhale: route ${path}`)
     }
+    // The built-in web/PWA client is a whole directory, so it needs a prefix
+    // route (exact routes cannot cover `/openwhale/app/lib/*`).
+    ctx.effect(() => webServer.register({
+      kind: 'prefix',
+      path: WEB_CLIENT_PATH,
+      handler: (req, res) => gateway.handleRequest(req, res),
+    }), `openwhale: route ${WEB_CLIENT_PATH}/*`)
     ctx.effect(() => webServer.registerUpgrade({
       path: '/openwhale/ws',
       handler: (req, socket, head) => gateway.attachUpgradeHandler(req, socket, head),
@@ -327,47 +357,34 @@ export async function apply(ctx, config) {
       name: 'openwhale',
       description: '显示 Open Whale 绑定二维码 / 查看已绑定手机',
       handler: async invocation => {
-        const availability = pairingAvailability(store)
-        if (!availability.available) {
+        const payload = gateway.pairingPayload()
+        if (!payload.ok) {
           const labels = store.devices.map(d => d.label ?? d.deviceName).join('、')
-          return { kind: 'success', text: `Open Whale 已绑定手机：${labels}\n如需重新绑定，请先在手机端「解除绑定」。` }
+          if (payload.reason === 'too-many-devices') {
+            return { kind: 'success', text: `Open Whale 已绑定手机：${labels}\n如需重新绑定，请先在电脑端配对页移除不用的设备。` }
+          }
+          return { kind: 'error', text: `Open Whale：${payload.message}` }
         }
-        const endpoints = [...tunnelUrls, ...lanUrls()]
-        if (endpoints.length === 0) {
-          return { kind: 'error', text: 'Open Whale：还没有可用地址。请启用局域网监听，或把 tunnelMode 设为 quick。' }
-        }
-        const payload = {
-          v: 1,
-          p: 'openwhale',
-          host: store.computerName,
-          id: store.computerId,
-          fp: store.fingerprint,
-          pk: store.publicKeySpkiBase64Url,
-          secret: store.activePairing?.secret ?? store.issuePairingSecret().secret,
-          expires: store.activePairing?.expires ?? new Date(Date.now() + 600_000).toISOString(),
-          endpoints,
-          port: settings.port,
-          lan: lanUrls()[0],
-          name: store.computerName,
-          version: '1.0.0',
-        }
-        const qr = await renderPairingQr(payload)
-        return {
-          kind: 'success',
-          text: [
-            '用手机上的 Open Whale 应用扫描下面的二维码完成绑定：',
-            '',
-            qr.terminal,
-            '',
-            `电脑名称：${store.computerName}`,
-            `公钥指纹：${store.fingerprint.slice(0, 32).toUpperCase().match(/.{1,4}/g)?.join(' ') ?? ''}`,
-            `可用地址：${endpoints.join('、')}`,
-            `二维码有效期至：${new Date(payload.expires).toLocaleString('zh-CN')}`,
-            '',
-            '二维码含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。',
-            `也可以在浏览器打开：${endpoints[0]}/openwhale`,
-          ].join('\n'),
-        }
+        const qr = await renderPairingQr(payload.payload)
+        const report = gateway.connectionModeReport()
+        const webUrl = report.web
+        const text = [
+          '用手机上的 Open Whale 应用扫描下面的二维码完成绑定：',
+          '',
+          qr.terminal,
+          '',
+          `电脑名称：${store.computerName}（插件 v${PLUGIN_VERSION}）`,
+          `公钥指纹：${store.fingerprint.slice(0, 32).toUpperCase().match(/.{1,4}/g)?.join(' ') ?? ''}`,
+          `连接方式：${connectionModeLabel(report.mode)}`,
+          `可用地址：${payload.payload.endpoints.join('、')}`,
+          `二维码有效期至：${new Date(payload.payload.expires).toLocaleString('zh-CN')}`,
+          '',
+          '二维码含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。',
+          `也可以在浏览器打开：http://127.0.0.1:${gateway.port || settings.port}/openwhale`,
+          ...(webUrl ? [`手机浏览器（网页版，无需装 App）：${webUrl}`] : []),
+          ...(report.detected?.tailscale?.length ? [`Tailscale 地址：${report.detected.tailscale.join('、')}`] : []),
+        ].join('\n')
+        return { kind: 'success', text }
       },
     }), 'openwhale: command')
   }

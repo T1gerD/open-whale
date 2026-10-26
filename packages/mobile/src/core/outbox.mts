@@ -8,19 +8,40 @@
 
 export type OutboxState = 'pending' | 'inflight' | 'sent' | 'failed'
 
+/** 待发送附件：新路径带 uri（分块上传），老路径带 dataBase64（内联兼容）。 */
 export interface OutboxFile {
   name: string
   mime: string
-  dataBase64: string
+  size?: number
+  /** 本地文件 URI（expo-document-picker / expo-image-picker）；分块上传用。 */
+  uri?: string
+  /** 老协议内联附件（仅小文件）。 */
+  dataBase64?: string
+}
+
+/** 已上传完成、可以放进 chat/send.files 的引用。 */
+export interface OutboxUploadRef {
+  /** 对应 OutboxEntry.files 里的下标（同一条消息可能有两个同名附件）。 */
+  index: number
+  uploadId: string
+  name: string
+  size: number
+  mime?: string
 }
 
 export interface OutboxEntry {
-  /** 幂等键：与 chat/send 的 rid/callId 相同。 */
+  /** 幂等键：与 chat/send 的 rid/callId 相同（v2.2.0 同时作为 msgId 发出去）。 */
   rid: string
   assistantId: string
   callId: string
   text: string
+  /** 电脑端幂等键；老实现缺省时回落到 rid。 */
+  msgId?: string
+  /** 协作模式下发送者昵称（电脑端据此在别的设备上显示是谁发的）。 */
+  speaker?: string
   files?: OutboxFile[]
+  /** 已经上传完成的附件（重发时直接引用 uploadId，不重复上传）。 */
+  uploads?: OutboxUploadRef[]
   createdAt: number
   attempts: number
   state: OutboxState
@@ -63,9 +84,10 @@ export function enqueue(outbox: Outbox, entry: Omit<OutboxEntry, 'attempts' | 's
       ),
     }
   }
+  const created: OutboxEntry = { ...entry, attempts: 0, state: 'pending' }
   return {
     ...outbox,
-    entries: [...outbox.entries, { ...entry, attempts: 0, state: 'pending' }].slice(-outbox.limit),
+    entries: [...outbox.entries, created].slice(-outbox.limit),
   }
 }
 
@@ -79,12 +101,34 @@ export function markInflight(outbox: Outbox, rid: string, now: number): Outbox {
 }
 
 /** 收到 chat/ack：这条消息已经被电脑端接管，从队列里移除（历史在消息表里）。 */
-export function markSent(outbox: Outbox, rid: string): Outbox {
-  return { ...outbox, entries: outbox.entries.filter(entry => entry.rid !== rid) }
+export function markSent(outbox: Outbox, key: string): Outbox {
+  return { ...outbox, entries: outbox.entries.filter(entry => !matches(entry, key)) }
 }
 
-export function markFailed(outbox: Outbox, rid: string, error: string, retryAfter?: number): Outbox {
-  return patch(outbox, rid, entry => ({ ...entry, state: 'failed', error, retryAfter }))
+/**
+ * 记录已经上传完成的附件引用：重发时直接带 uploadId，不重复上传。
+ * 这也是「一张图只上传一次」的保证（上传成功后消息可能还要等网络/重试）。
+ */
+export function markUploaded(outbox: Outbox, rid: string, uploads: OutboxUploadRef[]): Outbox {
+  return patch(outbox, rid, entry => ({
+    ...entry,
+    uploads: dedupeUploads([...(entry.uploads ?? []), ...uploads]),
+  }))
+}
+
+function dedupeUploads(list: OutboxUploadRef[]): OutboxUploadRef[] {
+  const seen = new Set<string>()
+  const out: OutboxUploadRef[] = []
+  for (const item of list) {
+    if (!item || typeof item.uploadId !== 'string' || seen.has(item.uploadId)) continue
+    seen.add(item.uploadId)
+    out.push({ ...item, index: typeof item.index === 'number' ? item.index : 0 })
+  }
+  return out
+}
+
+export function markFailed(outbox: Outbox, key: string, error: string, retryAfter?: number): Outbox {
+  return patch(outbox, key, entry => ({ ...entry, state: 'failed', error, retryAfter }))
 }
 
 /**
@@ -137,8 +181,8 @@ export function exhaustedEntries(outbox: Outbox, maxAttempts: number = DEFAULT_M
  * 而 `resendableEntries` 会用 `attempts < maxAttempts` 过滤，
  * 于是"重试"按钮对已经放弃的条目**完全无效**——点了也不发。
  */
-export function retryEntry(outbox: Outbox, rid: string): Outbox {
-  return patch(outbox, rid, entry => ({
+export function retryEntry(outbox: Outbox, key: string): Outbox {
+  return patch(outbox, key, entry => ({
     ...entry,
     state: 'pending',
     attempts: 0,
@@ -147,12 +191,12 @@ export function retryEntry(outbox: Outbox, rid: string): Outbox {
   }))
 }
 
-export function removeEntry(outbox: Outbox, rid: string): Outbox {
-  return { ...outbox, entries: outbox.entries.filter(entry => entry.rid !== rid) }
+export function removeEntry(outbox: Outbox, key: string): Outbox {
+  return { ...outbox, entries: outbox.entries.filter(entry => !matches(entry, key)) }
 }
 
-export function getEntry(outbox: Outbox, rid: string): OutboxEntry | undefined {
-  return outbox.entries.find(entry => entry.rid === rid)
+export function getEntry(outbox: Outbox, key: string): OutboxEntry | undefined {
+  return outbox.entries.find(entry => matches(entry, key))
 }
 
 export function outboxSize(outbox: Outbox): number {
@@ -189,7 +233,7 @@ export function deserializeOutbox(text: string | null | undefined, limit?: numbe
   try {
     const parsed = JSON.parse(text) as Partial<Outbox>
     if (!parsed || !Array.isArray(parsed.entries)) return createOutbox(limit)
-    const entries = parsed.entries.filter(isEntry)
+    const entries = parsed.entries.filter(isEntry).map(normalizeEntry)
     return { entries, limit: limit ?? parsed.limit ?? DEFAULT_OUTBOX_LIMIT }
   } catch {
     // 队列损坏不该让 App 起不来：丢掉它，用户最多丢一条待发消息。
@@ -197,18 +241,46 @@ export function deserializeOutbox(text: string | null | undefined, limit?: numbe
   }
 }
 
-function isEntry(value: unknown): value is OutboxEntry {
+function isEntry(value: unknown): value is Partial<OutboxEntry> & { rid: string; text: string; assistantId: string } {
   if (!value || typeof value !== 'object') return false
   const entry = value as Partial<OutboxEntry>
   return typeof entry.rid === 'string' && typeof entry.text === 'string' && typeof entry.assistantId === 'string'
 }
 
-function patch(outbox: Outbox, rid: string, update: (entry: OutboxEntry) => OutboxEntry): Outbox {
+const OUTBOX_STATES: readonly OutboxState[] = ['pending', 'inflight', 'sent', 'failed']
+
+/** 反序列化时把脏字段收敛成合法值（历史队列可能来自老版本/被截断）。 */
+function normalizeEntry(entry: Partial<OutboxEntry> & { rid: string; text: string; assistantId: string }): OutboxEntry {
+  return {
+    rid: entry.rid,
+    assistantId: entry.assistantId,
+    callId: typeof entry.callId === 'string' ? entry.callId : entry.rid,
+    text: entry.text,
+    msgId: typeof entry.msgId === 'string' ? entry.msgId : undefined,
+    speaker: typeof entry.speaker === 'string' ? entry.speaker : undefined,
+    files: Array.isArray(entry.files) ? entry.files : undefined,
+    uploads: Array.isArray(entry.uploads) ? entry.uploads : undefined,
+    createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now(),
+    attempts: typeof entry.attempts === 'number' && Number.isFinite(entry.attempts) ? entry.attempts : 0,
+    state: OUTBOX_STATES.includes(entry.state as OutboxState) ? (entry.state as OutboxState) : 'pending',
+    lastAttemptAt: typeof entry.lastAttemptAt === 'number' ? entry.lastAttemptAt : undefined,
+    retryAfter: typeof entry.retryAfter === 'number' ? entry.retryAfter : undefined,
+    error: typeof entry.error === 'string' ? entry.error : undefined,
+  }
+}
+
+function patch(outbox: Outbox, key: string, update: (entry: OutboxEntry) => OutboxEntry): Outbox {
   let touched = false
   const entries = outbox.entries.map(entry => {
-    if (entry.rid !== rid) return entry
+    if (!matches(entry, key)) return entry
     touched = true
     return update(entry)
   })
   return touched ? { ...outbox, entries } : outbox
+}
+
+/** 队列条目按 rid 或 msgId 寻址（chat/ack 可能只带其中一个）。 */
+function matches(entry: OutboxEntry, key: string): boolean {
+  if (!key) return false
+  return entry.rid === key || entry.msgId === key
 }

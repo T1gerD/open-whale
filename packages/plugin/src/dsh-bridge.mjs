@@ -5,17 +5,25 @@
 //     so the phone keeps one continuous chat and never collides with the
 //     conversations the user has open on the desktop.
 //  2. Turn DSH's event stream into the small vocabulary the phone speaks
-//     (delta / done / tool / typing / error), and collect files it may fetch.
+//     (message / done / tool / typing / error), and collect files it may fetch.
 //  3. Inject the personal-assistant voice as a *scoped* prompt section on those
 //     conversations only.
 //
 // It deliberately talks to DSH through the injected context instead of importing
 // harness internals, so the same file can be exercised in tests with a fake ctx.
+//
+// v2.2.0 fixes two reported defects here:
+//  · 助手回复重复拼接：一条 `assistant/message` 只归约一次（按 DSH 的 messageId
+//    去重），而不是按会话里的设备循环累加；`assistant/attempt` 与 message 对
+//    同一 (turn, step) 只算一次。
+//  · 多端不同步：事件带 `sessionId`，由网关广播给会话内所有设备；设备在 hello
+//    认证后即 `attachDevice()`，不必先发言才能收到推送。
 import { createHash } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { IdempotencyCache } from './protocol.mjs'
 import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from './voice.mjs'
 
 /** Tools whose results are files rather than text. */
@@ -23,9 +31,17 @@ const FILE_TOOL_HINTS = ['write', 'image', 'docx', 'xlsx', 'pptx', 'pdf', 'expor
 
 /**
  * @typedef {object} BridgeEvent
- * @property {'delta'|'done'|'tool'|'typing'|'error'} kind
- * @property {string} deviceId
+ * One event for the gateway to fan out. `sessionId` is the conversation the
+ * event belongs to; the gateway broadcasts chat-level frames to every device in
+ * that conversation (v2.2.0 multi-device sync) and only the bridge knows which
+ * conversation DSH just spoke in.
+ * @property {'message'|'delta'|'done'|'tool'|'typing'|'error'} kind
+ * @property {string} sessionId
+ * @property {string} deviceId   The device whose turn produced the event.
  * @property {string} callId
+ * @property {string} [messageId] Stable DSH assistant message id (`kind:'message'`).
+ * @property {number} [index]    Position of the message inside the turn.
+ * @property {string} [text]
  */
 
 /**
@@ -65,13 +81,19 @@ export class DshBridge {
     this.bySession = new Map()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
-    /** callId → { deviceId, text, toolCalls, startedAt } */
+    /** `${deviceId}\u0000${callId}` → 进行中的回合 */
     this.calls = new Map()
+    /** 已受理过的 (deviceId, callId)：网关幂等表之后的第二道防线。 */
+    this.seenCalls = new IdempotencyCache()
+    /** sessionId → 已投递给 DSH、还没等到 turn/start 的回合队列 */
+    this.pendingCalls = new Map()
+    /** `${sessionId}:${turn}` → 该轮次属于哪个手机消息 */
+    this.turnCalls = new Map()
     this.disposed = false
     this.subscriptions = []
   }
 
-  /** Subscribe once to the session event feed and route it per device. */
+  /** Subscribe once to the session event feed. */
   start() {
     const off = this.ctx.on('session/event', (session, event) => {
       try {
@@ -98,6 +120,9 @@ export class DshBridge {
     this.bySession.clear()
     this.calls.clear()
     this.files.clear()
+    this.seenCalls.clear()
+    this.pendingCalls.clear()
+    this.turnCalls.clear()
     await Promise.all(disposals)
   }
 
@@ -107,15 +132,61 @@ export class DshBridge {
   }
 
   /**
+   * 登记一台设备的会话归属，**不必等它先发消息**。
+   *
+   * v2.1.0 只在 `send()` 里创建 entries，于是刚配对、还没说过话的手机收不到
+   * 同会话的任何推送（多端不同步投诉的一半原因）。网关在 hello 认证成功后
+   * 就调用这里，让广播与在线成员列表立刻完整。
+   * @param {string} deviceId
+   */
+  attachDevice(deviceId) {
+    const sessionId = this.sessionIdFor(deviceId)
+    const entry = this.entries.get(deviceId) ?? { sessionId, agent: null, handle: null }
+    entry.sessionId = sessionId
+    this.entries.set(deviceId, entry)
+    this.bySession.set(sessionId, entry)
+  }
+
+  /** 手机会话的实际工作目录（上传落盘、相对路径都以它为基准）。 */
+  workingDirectory() {
+    return this.#cwd()
+  }
+
+  /**
+   * 协作模式切换后重建 device → session 映射。
+   *
+   * 旧的会话 agent 会被释放（会话历史已持久化，下次用到时 `resume()` 恢复），
+   * 否则两台手机在共享/独立会话之间切换时会一直挂在旧会话上，消息投递到错误
+   * 的地方。调用方随后对每台已认证设备重新 `attachDevice()`。
+   */
+  async resetSessionMapping() {
+    const handles = [...new Set([...this.entries.values()].map(entry => entry.handle).filter(Boolean))]
+    this.entries.clear()
+    this.bySession.clear()
+    this.calls.clear()
+    this.pendingCalls.clear()
+    this.turnCalls.clear()
+    await Promise.all(handles.map(handle => handle.dispose?.().catch?.(() => {})))
+  }
+
+  /**
    * Deliver one phone message into the device's conversation.
    * @param {object} input
    * @param {string} input.deviceId
    * @param {string} input.callId
    * @param {string} input.text
-   * @param {Array<{name: string, mime?: string, dataBase64: string, path?: string}>} input.attachments
+   * @param {Array<{name: string, mime?: string, size?: number, dataBase64?: string, path?: string, fileId?: string}>} input.attachments
+   * @param {string} [input.speaker] 协作模式下的发言人显示名。
    */
   async send(input) {
     if (this.disposed) throw new Error('bridge 已关闭')
+    const callKey = `${input.deviceId}\u0000${input.callId}`
+    // 第二道防线：网关已经做了 (deviceId, msgId) 幂等，但网关重启/竞态下仍可能
+    // 把同一帧再送一次；重复投递会让 DSH 多跑一轮、AI 多回一条。
+    if (this.seenCalls.has(callKey) || this.calls.has(callKey)) {
+      this.log(`bridge: 忽略重复投递 device=${input.deviceId} callId=${input.callId}`)
+      return
+    }
     bridgeDiagnostic(`bridge: send 开始 device=${input.deviceId} callId=${input.callId} 文本长度=${input.text?.length ?? 0} 附件=${input.attachments?.length ?? 0}`)
 
     const entry = await this.#ensureAgent(input.deviceId)
@@ -130,15 +201,23 @@ export class DshBridge {
       text = `[${input.speaker}] ${text}`
     }
 
-    this.calls.set(input.callId, {
+    const call = {
+      callKey,
       deviceId: input.deviceId,
       callId: input.callId,
+      sessionId: entry.sessionId,
       text: '',
+      messages: new Map(),
+      messageOrder: [],
+      seenSteps: new Set(),
       toolCalls: new Set(),
       startedAt: Date.now(),
-      assistantTexts: [],
-    })
-    this.emit({ kind: 'typing', deviceId: input.deviceId, callId: input.callId, active: true })
+      files: undefined,
+      turn: undefined,
+    }
+    this.calls.set(callKey, call)
+    this.#pending(entry.sessionId).push(call)
+    this.emit({ kind: 'typing', sessionId: entry.sessionId, deviceId: input.deviceId, callId: input.callId, active: true })
 
     const createUserMessage = this.createUserMessage ?? await loadCreateUserMessage()
     bridgeDiagnostic('bridge: createUserMessage 已就绪，准备 followup')
@@ -146,19 +225,30 @@ export class DshBridge {
       content: [{ type: 'text', text }],
       source: { kind: 'user' },
     }))
+    // 只有 followup 真正提交后才记住，这样投递失败时网关可以释放占位重试。
+    this.seenCalls.remember(callKey, true)
     bridgeDiagnostic(`bridge: followup 已提交 callId=${input.callId}`)
   }
 
   /** Abort the turn that owns this call, if it is still running. */
-  cancel(callId) {
-    const call = this.calls.get(callId)
+  cancel(callId, deviceId) {
+    const call = this.#findCall(callId, deviceId)
     if (!call) return
     const entry = this.entries.get(call.deviceId)
     try {
       entry?.agent?.cancel?.({ kind: 'user' }, { keepInbox: true })
-      this.emit({ kind: 'error', deviceId: call.deviceId, callId, message: '已停止', retryable: false })
+      this.emit({
+        kind: 'error',
+        sessionId: call.sessionId,
+        deviceId: call.deviceId,
+        callId,
+        message: '已停止',
+        retryable: false,
+      })
     } catch (error) {
       this.log(`bridge: cancel failed: ${/** @type {Error} */ (error).message}`)
+    } finally {
+      this.#retireCall(call)
     }
   }
 
@@ -178,6 +268,15 @@ export class DshBridge {
   async forgetDevice(deviceId) {
     const entry = this.entries.get(deviceId)
     this.entries.delete(deviceId)
+    for (const [sessionId, mapped] of this.bySession) {
+      if (mapped === entry) this.bySession.delete(sessionId)
+    }
+    for (const call of [...this.calls.values()]) {
+      if (call.deviceId === deviceId) this.#retireCall(call)
+    }
+    for (const [fileId, record] of this.files) {
+      if (record.deviceId === deviceId) this.files.delete(fileId)
+    }
     if (entry?.handle?.dispose) {
       try {
         await entry.handle.dispose()
@@ -195,13 +294,48 @@ export class DshBridge {
     if (input.text?.trim()) parts.push(input.text.trim())
     const attachments = input.attachments ?? []
     if (attachments.length > 0) {
-      const lines = attachments.map(attachment => {
-        const where = attachment.path ?? '(未落盘)'
-        return `- ${attachment.name}${attachment.mime ? ` (${attachment.mime})` : ''}：${where}`
-      })
-      parts.push(`用户通过手机发来了 ${attachments.length} 个附件，已保存在电脑上：\n${lines.join('\n')}\n请按需读取这些文件。`)
+      const cwd = this.#cwd()
+      const lines = attachments.map(attachment => this.#describeAttachment(attachment, cwd))
+      // 路径必须是相对 cwd 的：DSH 的文件沙箱以会话工作目录为根，绝对路径既
+      // 容易被权限策略拒绝，也不利于模型理解「这是你工作区里的文件」。
+      parts.push(
+        `用户通过手机发来了 ${attachments.length} 个附件，已保存到电脑上（路径相对本次对话的工作目录）：\n${lines.join('\n')}\n请按需读取这些文件；图片请用图像读取工具查看。`,
+      )
     }
     return parts.join('\n\n') || '（用户发送了一条空消息）'
+  }
+
+  /**
+   * @param {{name: string, mime?: string, path?: string}} attachment
+   * @param {string} cwd
+   * @returns {string}
+   */
+  #describeAttachment(attachment, cwd) {
+    const name = String(attachment.name ?? '文件')
+    const mime = attachment.mime ? `（${attachment.mime}）` : ''
+    const where = this.#displayPath(attachment.path, cwd)
+    // 图片单独点名：模型的 read 工具对图片与普通文件的处理方式不同，
+    // 不标注时经常出现「模型不知道这是张图」而只回一句概述。
+    const isImage = /^image\//i.test(String(attachment.mime ?? ''))
+      || /\.(png|jpe?g|gif|webp|bmp|heic|heif|svg)$/i.test(name)
+    if (isImage) {
+      return `- 图片：${name}${mime}，路径：${where}；这是图片文件，可用 read / 图像工具查看。`
+    }
+    return `- 文件：${name}${mime}，路径：${where}；可用 read 工具读取。`
+  }
+
+  /**
+   * @param {string|undefined} path
+   * @param {string} cwd
+   * @returns {string}
+   */
+  #displayPath(path, cwd) {
+    if (!path) return '(未落盘)'
+    try {
+      const rel = relative(cwd, path)
+      if (rel && !rel.startsWith('..') && !isAbsolute(rel)) return rel
+    } catch { /* 跨盘符等情况退回绝对路径 */ }
+    return path
   }
 
   /**
@@ -212,7 +346,7 @@ export class DshBridge {
     const existing = this.entries.get(deviceId)
     if (existing?.agent && this.ctx.agents.get(existing.sessionId)) return existing
 
-    const sessionId = this.sessionIdFor(deviceId)
+    const sessionId = existing?.sessionId ?? this.sessionIdFor(deviceId)
 
     // 协作模式：另一个设备已经为这个会话建过 agent，直接挂上去。
     // 没有这一步，两台手机同时发言会走到 create() 并撞名
@@ -356,98 +490,241 @@ export class DshBridge {
     return this.defaultCwd()
   }
 
+  // ---------------------------------------------------------------------------
+  // DSH session events → bridge events
+  // ---------------------------------------------------------------------------
+
   /**
-   * Route one durable session event to the phone that owns that session.
+   * Route one durable session event.
+   *
+   * v2.1.0 looped over every device in the session and dispatched the *same*
+   * event into a per-device mutating call, which pushed the same assistant text
+   * N times and produced `done.text === 'T\n\nT'`. v2.2.0 reduces the event
+   * exactly once and emits a single session-scoped event for the gateway to
+   * broadcast.
    * @param {any} session
    * @param {any} event
    */
   #onSessionEvent(session, event) {
-    // 一台电脑现在可以绑定多台手机；协作模式下它们还共用同一个会话，
-    // 因此回复要发给该会话下的**所有**设备，而不是只发给第一台。
-    const deviceIds = this.#devicesForSession(session)
-    if (deviceIds.length === 0) return
-    for (const deviceId of deviceIds) this.#dispatchSessionEvent(deviceId, event)
+    const sessionId = this.#sessionIdOf(session)
+    if (!sessionId) return
+    // 只有本插件拥有的会话才处理：桌面上的其它会话不能把内容推给手机。
+    if (this.#devicesForSession(session).length === 0) return
+
+    switch (event?.type) {
+      case 'turn/start':
+        return this.#onTurnStart(sessionId, event)
+      case 'assistant/message':
+        return this.#onAssistantMessage(sessionId, event)
+      case 'assistant/attempt':
+        return this.#onAssistantAttempt(sessionId, event)
+      case 'tool/call':
+        return this.#onToolCall(sessionId, event)
+      case 'tool/result':
+        return this.#onToolResult(sessionId, event)
+      case 'turn/end':
+        return this.#onTurnEnd(sessionId, event)
+      default:
+        return undefined
+    }
   }
 
-  /** @param {string} deviceId @param {any} event */
-  #dispatchSessionEvent(deviceId, event) {
-    const call = this.#currentCall(deviceId)
+  /** @param {string} sessionId @param {any} event */
+  #onTurnStart(sessionId, event) {
+    const queue = this.pendingCalls.get(sessionId)
+    const call = queue?.shift()
     if (!call) return
+    call.turn = event?.data?.turn
+    if (call.turn !== undefined) this.turnCalls.set(`${sessionId}:${call.turn}`, call)
+  }
 
-    switch (event.type) {
-      case 'assistant/message':
-      case 'assistant/attempt': {
-        const text = extractAssistantText(event.data)
-        if (!text) return
-        // DSH commits the complete assistant message for the step; the phone
-        // receives it as one delta. The transport stays streaming-shaped so a
-        // future token-level feed needs no client change.
-        const seq = call.assistantTexts.length
-        call.assistantTexts.push(text)
-        call.text = call.assistantTexts.join('\n\n')
-        this.emit({ kind: 'delta', deviceId, callId: call.callId, seq, text })
-        return
-      }
-      case 'tool/call': {
-        const { callId: toolCallId, name } = event.data ?? {}
-        if (!toolCallId) return
-        call.toolCalls.add(toolCallId)
-        this.emit({
-          kind: 'tool',
-          deviceId,
-          callId: call.callId,
-          phase: 'tool-start',
-          toolCallId,
-          tool: name,
-          summary: summarizeToolCall(name, event.data?.arguments),
-        })
-        return
-      }
-      case 'tool/result': {
-        const toolCallId = event.data?.callId ?? event.data?.toolCallId
-        this.#collectFiles(deviceId, call, event.data)
-        this.emit({
-          kind: 'tool',
-          deviceId,
-          callId: call.callId,
-          phase: 'tool-end',
-          toolCallId,
-          tool: event.data?.name,
-          ok: event.data?.ok !== false,
-        })
-        return
-      }
-      case 'turn/end': {
-        const reason = event.data?.reason
-        if (reason?.kind === 'error') {
-          this.emit({
-            kind: 'error',
-            deviceId,
-            callId: call.callId,
-            message: describeFailure(reason.error),
-            retryable: true,
-          })
-          this.calls.delete(call.callId)
-          return
-        }
-        this.emit({
-          kind: 'done',
-          deviceId,
-          callId: call.callId,
-          text: call.text || '（没有产生回复内容）',
-          durationMs: Date.now() - call.startedAt,
-        })
-        this.calls.delete(call.callId)
-        return
-      }
-      default:
-        return
+  /** @param {string} sessionId @param {any} event */
+  #onAssistantMessage(sessionId, event) {
+    const data = event?.data ?? {}
+    const call = this.#callForTurn(sessionId, data)
+    if (!call) return
+    const text = extractAssistantText(data)
+    if (!text) return
+    const messageId = String(data?.message?.id ?? `msg_${data?.turn ?? 0}_${data?.step ?? 0}`)
+    // 同一条已提交消息被重放时只算一次（断线重连/重复监听都会发生）。
+    if (call.messages.has(messageId)) return
+    this.#recordAssistantText(call, { sessionId, messageId, text })
+    if (data.step !== undefined) call.seenSteps.add(`${data.turn}:${data.step}`)
+  }
+
+  /** @param {string} sessionId @param {any} event */
+  #onAssistantAttempt(sessionId, event) {
+    const data = event?.data ?? {}
+    const call = this.#callForTurn(sessionId, data)
+    if (!call) return
+    const stepKey = `${data?.turn}:${data?.step}`
+    // 同一 (turn, step) 的 attempt 与 message 只能出一个气泡。
+    if (call.seenSteps.has(stepKey)) return
+    const text = extractAssistantText(data) || extractAttemptStreamText(data?.stream)
+    if (!text) {
+      // 本版 DSH 的 attempt 只有 stream 没有 message，没有可用文本：标记该 step
+      // 已归约，等后面的 assistant/message 出正文。
+      call.seenSteps.add(stepKey)
+      return
     }
+    const messageId = String(data?.message?.id ?? `attempt_${data?.turn ?? 0}_${data?.step ?? 0}`)
+    if (call.messages.has(messageId)) return
+    this.#recordAssistantText(call, { sessionId, messageId, text })
+    call.seenSteps.add(stepKey)
+  }
+
+  /**
+   * @param {any} call
+   * @param {{sessionId: string, messageId: string, text: string}} input
+   */
+  #recordAssistantText(call, input) {
+    const index = call.messageOrder.length
+    call.messages.set(input.messageId, { index, text: input.text })
+    call.messageOrder.push(input.messageId)
+    call.text = call.messageOrder.map(id => call.messages.get(id).text).join('\n\n')
+    this.emit({
+      kind: 'message',
+      sessionId: input.sessionId,
+      deviceId: call.deviceId,
+      callId: call.callId,
+      messageId: input.messageId,
+      index,
+      text: input.text,
+    })
+  }
+
+  /** @param {string} sessionId @param {any} event */
+  #onToolCall(sessionId, event) {
+    const data = event?.data ?? {}
+    const call = this.#callForTurn(sessionId, data)
+    if (!call) return
+    const toolCallId = data?.callId
+    if (!toolCallId) return
+    call.toolCalls.add(toolCallId)
+    this.emit({
+      kind: 'tool',
+      sessionId,
+      deviceId: call.deviceId,
+      callId: call.callId,
+      phase: 'tool-start',
+      toolCallId,
+      tool: data?.name,
+      summary: summarizeToolCall(data?.name, data?.arguments),
+    })
+  }
+
+  /** @param {string} sessionId @param {any} event */
+  #onToolResult(sessionId, event) {
+    const data = event?.data ?? {}
+    const call = this.#callForTurn(sessionId, data)
+    if (!call) return
+    this.#collectFiles(call, data)
+    this.emit({
+      kind: 'tool',
+      sessionId,
+      deviceId: call.deviceId,
+      callId: call.callId,
+      phase: 'tool-end',
+      toolCallId: data?.callId ?? data?.toolCallId ?? data?.message?.toolCallId,
+      tool: data?.name ?? data?.message?.name,
+      ok: data?.message?.isError !== true && data?.ok !== false,
+    })
+  }
+
+  /** @param {string} sessionId @param {any} event */
+  #onTurnEnd(sessionId, event) {
+    const data = event?.data ?? {}
+    const mapped = data?.turn !== undefined ? this.turnCalls.get(`${sessionId}:${data.turn}`) : undefined
+    const call = mapped ?? this.#callForTurn(sessionId, data)
+    if (!call) return
+    const reason = data?.reason
+    if (reason?.kind === 'error') {
+      this.emit({
+        kind: 'error',
+        sessionId,
+        deviceId: call.deviceId,
+        callId: call.callId,
+        message: describeFailure(reason.error),
+        retryable: true,
+      })
+      this.#retireCall(call)
+      return
+    }
+    // done.text 只由去重后的消息拼接，绝不再把同一段文本追加多次。
+    // files 必须是**元信息对象**（手机端 reducer 的 normalizeFileRef 只认带 fileId
+    // 的对象，裸 fileId 字符串会被整条丢弃，助手产出的文件就不会出现在聊天里）。
+    this.emit({
+      kind: 'done',
+      sessionId,
+      deviceId: call.deviceId,
+      callId: call.callId,
+      text: call.text || '（没有产生回复内容）',
+      durationMs: Date.now() - call.startedAt,
+      files: this.#fileRefs(call.files),
+    })
+    this.#retireCall(call)
+  }
+
+  /**
+   * Which call an event belongs to. DSH commits `turn` on every surface event;
+   * `turn/start` binds a turn to the phone message that started it. The fallback
+   * keeps a single-device session working even when a turn/start was missed
+   * (e.g. the agent was resumed mid-turn).
+   * @param {string} sessionId
+   * @param {any} data
+   */
+  #callForTurn(sessionId, data) {
+    if (data?.turn !== undefined) {
+      const mapped = this.turnCalls.get(`${sessionId}:${data.turn}`)
+      if (mapped) return mapped
+    }
+    let latest
+    for (const call of this.calls.values()) {
+      if (call.sessionId !== sessionId) continue
+      if (!latest || call.startedAt >= latest.startedAt) latest = call
+    }
+    return latest
+  }
+
+  /** @param {string} sessionId @returns {any[]} */
+  #pending(sessionId) {
+    let queue = this.pendingCalls.get(sessionId)
+    if (!queue) {
+      queue = []
+      this.pendingCalls.set(sessionId, queue)
+    }
+    return queue
+  }
+
+  /** @param {string} callId @param {string} [deviceId] */
+  #findCall(callId, deviceId) {
+    for (const call of this.calls.values()) {
+      if (call.callId !== callId) continue
+      if (deviceId && call.deviceId !== deviceId) continue
+      return call
+    }
+    return undefined
+  }
+
+  /** Drop every trace of a finished call so it cannot be matched again. @param {any} call */
+  #retireCall(call) {
+    this.calls.delete(call.callKey)
+    const queue = this.pendingCalls.get(call.sessionId)
+    if (queue) {
+      const index = queue.indexOf(call)
+      if (index >= 0) queue.splice(index, 1)
+    }
+    if (call.turn !== undefined) this.turnCalls.delete(`${call.sessionId}:${call.turn}`)
+  }
+
+  /** @param {any} session */
+  #sessionIdOf(session) {
+    return session?.id ?? session?.header?.id ?? ''
   }
 
   /** @param {any} session */
   #devicesForSession(session) {
-    const id = session?.id ?? session?.header?.id
+    const id = this.#sessionIdOf(session)
     if (!id) return []
     const devices = []
     for (const [deviceId, entry] of this.entries) {
@@ -456,27 +733,30 @@ export class DshBridge {
     return devices
   }
 
-  /** The most recent call still awaiting completion for a device. */
-  #currentCall(deviceId) {
-    // 优先取本设备发起的轮次；协作模式下再放开到「同一会话的任何轮次」，
-    // 否则只有发消息的那台手机能看到回复，围观的人全是空白。
-    let latest
-    const sessionId = this.entries.get(deviceId)?.sessionId
-    for (const call of this.calls.values()) {
-      const sameSession = sessionId !== undefined && this.entries.get(call.deviceId)?.sessionId === sessionId
-      if (call.deviceId !== deviceId && !sameSession) continue
-      if (!latest || call.startedAt >= latest.startedAt) latest = call
-    }
-    return latest
+  /**
+   * fileId 列表 → 手机端渲染文件卡片所需的元信息数组。
+   * @param {string[] | undefined} fileIds
+   * @returns {Array<{fileId: string, name: string, size: number, mime?: string}> | undefined}
+   */
+  #fileRefs(fileIds) {
+    if (!Array.isArray(fileIds) || fileIds.length === 0) return undefined
+    return fileIds.map(fileId => {
+      const record = this.files.get(fileId)
+      return {
+        fileId,
+        name: record?.name ?? fileId,
+        size: typeof record?.size === 'number' ? record.size : 0,
+        ...(record?.mime ? { mime: record.mime } : {}),
+      }
+    })
   }
 
   /**
    * Register any files referenced by a tool result so the phone can fetch them.
-   * @param {string} deviceId
    * @param {any} call
    * @param {any} data
    */
-  #collectFiles(deviceId, call, data) {
+  #collectFiles(call, data) {
     const blocks = data?.message?.content ?? data?.content ?? []
     if (!Array.isArray(blocks)) return
     for (const block of blocks) {
@@ -488,7 +768,7 @@ export class DshBridge {
         mime: block.mime,
         size: block.size,
         path,
-        deviceId,
+        deviceId: call.deviceId,
       })
       call.files = call.files ?? []
       if (!call.files.includes(fileId)) call.files.push(fileId)
@@ -639,6 +919,28 @@ export function extractAssistantText(data) {
   return blocks
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text)
+    .join('')
+}
+
+/**
+ * Best-effort text extraction from an `assistant/attempt` stream.
+ *
+ * In the DSH build we target, an attempt carries only stream records and no
+ * committed message, so this usually returns `''`; it exists so a future build
+ * that puts text chunks in the stream still reaches the phone exactly once.
+ * @param {any} stream
+ * @returns {string}
+ */
+export function extractAttemptStreamText(stream) {
+  if (!Array.isArray(stream)) return ''
+  return stream
+    .map(record => {
+      if (typeof record === 'string') return record
+      if (typeof record?.text === 'string') return record.text
+      if (typeof record?.chunk === 'string') return record.chunk
+      if (typeof record?.delta?.text === 'string') return record.delta.text
+      return ''
+    })
     .join('')
 }
 

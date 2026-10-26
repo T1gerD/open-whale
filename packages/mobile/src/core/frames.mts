@@ -19,6 +19,12 @@ export const CLIENT_FRAME = {
   DEVICE_RENAME: 'device/rename',
   DEVICE_FORGET: 'device/forget',
   POWER: 'power/request',
+  SESSION_SYNC: 'session/sync',
+  UPLOAD_START: 'upload/start',
+  UPLOAD_CHUNK: 'upload/chunk',
+  UPLOAD_END: 'upload/end',
+  UPLOAD_CANCEL: 'upload/cancel',
+  COLLAB_SET: 'collab/set',
 } as const
 
 export const SERVER_FRAME = {
@@ -38,10 +44,67 @@ export const SERVER_FRAME = {
   FILE_ERROR: 'file/error',
   ASSISTANTS: 'assistants',
   POWER_STATE: 'power/state',
+  CHAT_ECHO: 'chat/echo',
+  CHAT_MESSAGE: 'chat/message',
+  SESSION_STATE: 'session/state',
+  SESSION_EVENTS: 'session/events',
+  PARTICIPANTS: 'session/participants',
+  COLLAB_STATE: 'collab/state',
+  UPLOAD_READY: 'upload/ready',
+  UPLOAD_PROGRESS: 'upload/progress',
+  UPLOAD_DONE: 'upload/done',
+  UPLOAD_ERROR: 'upload/error',
+  FILE_OFFERED: 'file/offered',
 } as const
 
+/**
+ * 能力协商字符串，镜像 protocol 的 `CAPABILITIES`。
+ *
+ * hello / hello/ack 用它声明「我认识哪些新帧」。旧版本没有这个字段 = 没有任何能力，
+ * 双方靠它决定发不发新帧，而不是比较版本号（协议兼容矩阵见 PROTOCOL-V2.md §8）。
+ */
+export const CAPABILITIES = {
+  CHAT_ECHO: 'chat-echo-v1',
+  CHAT_MESSAGE: 'chat-message-v1',
+  SESSION_SYNC: 'session-sync-v1',
+  PARTICIPANTS: 'participants-v1',
+  UPLOAD: 'upload-v1',
+  COLLAB: 'collab-v1',
+  FILE_OFFER: 'file-offer-v1',
+  ENDPOINT_KINDS: 'endpoint-kinds-v1',
+} as const
+
+/** 本 build 理解的全部能力（hello 时整包声明）。 */
+export const ALL_CAPABILITIES: readonly string[] = Object.freeze(Object.values(CAPABILITIES))
+
+/** 连接方式，镜像 protocol 的 `CONNECTION_MODE`（UI 四选一，持久化到助理记录）。 */
+export const CONNECTION_MODE = {
+  AUTO: 'auto',
+  LAN: 'lan',
+  TAILSCALE: 'tailscale',
+  TUNNEL: 'tunnel',
+} as const
+
+/** 全部连接方式，顺序即 UI 里的展示顺序。 */
+export const CONNECTION_MODES: readonly string[] = Object.freeze(Object.values(CONNECTION_MODE))
+
+/** 地址的网络类型，镜像 protocol 的 `ENDPOINT_KIND`。 */
+export const ENDPOINT_KIND = {
+  LAN: 'lan',
+  TAILSCALE: 'tailscale',
+  TUNNEL: 'tunnel',
+  LOOPBACK: 'loopback',
+  UNKNOWN: 'unknown',
+} as const
+
+/** 插件默认端口，镜像 protocol 的 `DEFAULT_PORT`（手动输入 host 时补全用）。 */
+export const DEFAULT_PORT = 8787
+
+/** 上传空闲清理时间，镜像 protocol 的 `UPLOAD_IDLE_TIMEOUT_MS`。 */
+export const UPLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
+
 /** 协议版本，镜像 `PROTOCOL_VERSION`（由 frames 测试核对）。 */
-export const PROTOCOL_VERSION = '1.0.0'
+export const PROTOCOL_VERSION = '1.1.0'
 
 /** 心跳默认值，镜像 `DEFAULT_HEARTBEAT_MS`。 */
 export const DEFAULT_HEARTBEAT_MS = 25_000
@@ -49,8 +112,17 @@ export const DEFAULT_HEARTBEAT_MS = 25_000
 /** 单帧助理回答上限，镜像 `MAX_ASSISTANT_CHARS`。 */
 export const MAX_ASSISTANT_CHARS = 24_000
 
-/** 文件分块大小，镜像 `FILE_CHUNK_BYTES`。 */
+/** 文件分块大小（下载），镜像 `FILE_CHUNK_BYTES`。 */
 export const FILE_CHUNK_BYTES = 256 * 1024
+
+/** 上传分块大小，镜像 `UPLOAD_CHUNK_BYTES`。 */
+export const UPLOAD_CHUNK_BYTES = 512 * 1024
+
+/** 单个上传附件上限，镜像 `MAX_UPLOAD_BYTES`。 */
+export const MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
+/** 每条消息最多附件数，镜像 `MAX_UPLOAD_ATTACHMENTS`。 */
+export const MAX_UPLOAD_ATTACHMENTS = 8
 
 /** 单个文件上限，镜像 `MAX_FILE_BYTES`。 */
 export const MAX_FILE_BYTES = 512 * 1024 * 1024

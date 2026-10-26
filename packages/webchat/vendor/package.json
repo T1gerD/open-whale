@@ -1,0 +1,5 @@
+{
+  "//": "仅用于让 Node 测试把 vite 外的 vendor UMD 文件按 CommonJS 加载（仓库根 package.json 是 type=module）；浏览器不读这个文件。",
+  "type": "commonjs",
+  "private": true
+}

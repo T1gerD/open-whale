@@ -15,18 +15,33 @@
 // green). A deliberate canary proved the current check reports red as red.
 import { spawnSync } from 'node:child_process'
 import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative as relativePathFn, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const only = process.argv[2] ?? ''
 
+/**
+ * Directories that must never be walked into.
+ *
+ * `node_modules` is the important one: once dependencies are installed, the pnpm
+ * workspace links `@openwhale/protocol` (and friends) INTO `packages/mobile/node_modules`,
+ * and those copies carry their own `*.test.mjs`. Collecting them reports a phantom
+ * suite path, and a workspace-linked suite runs twice. The repository's own tests
+ * live under `packages/<pkg>/test/**` only.
+ */
+const SKIP_DIRS = new Set(['node_modules', '.git', '.test-logs', 'dist', 'android', 'ios', '.expo'])
+
 function collect(dir) {
   const found = []
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry)
-    if (statSync(full).isDirectory()) found.push(...collect(full))
-    else if (entry.endsWith('.test.mjs')) found.push(full)
+    if (statSync(full).isDirectory()) {
+      if (SKIP_DIRS.has(entry) || entry.startsWith('.')) continue
+      found.push(...collect(full))
+    } else if (entry.endsWith('.test.mjs')) {
+      found.push(full)
+    }
   }
   // Underscore-prefixed files are scratch fixtures, not part of the suite.
   return found.filter(file => !file.split(/[\\/]/).pop().startsWith('_'))
@@ -36,14 +51,14 @@ let files = collect(join(root, 'packages')).sort()
 if (only) {
   // Compare on POSIX separators so a filter written as `packages/plugin` works on
   // Windows, where the collected paths use backslashes.
-  files = files.filter(file => file.replaceAll('\\', '/').includes(only))
+  files = files.filter(file => relativePathFn(root, file).replaceAll('\\', '/').includes(only))
 }
 if (files.length === 0) {
   console.error('no *.test.mjs files found')
   process.exit(1)
 }
 
-const logDir = join(root, '.test-logs')
+const logDir = join(root, '.test-logs', String(process.pid))
 rmSync(logDir, { recursive: true, force: true })
 mkdirSync(logDir, { recursive: true })
 
@@ -55,10 +70,10 @@ const failing = []
 let index = 0
 
 for (const file of files) {
-  const relative = file.slice(root.length + 1).replaceAll('\\', '/')
-  const base = relative.split('/').pop()
+  const relativePath = relativePathFn(root, file).split(sep).join('/')
+  const base = relativePath.split('/').pop()
   const logPath = join(logDir, `${String(index++).padStart(2, '0')}-${base}.log`)
-  process.stdout.write(`\n=== ${relative}\n`)
+  process.stdout.write(`\n=== ${relativePath}\n`)
 
   const fd = openSync(logPath, 'w')
   let result
@@ -75,16 +90,16 @@ for (const file of files) {
 
   const summary = SUMMARY.exec(output)
   if (!summary) {
-    failing.push(`${relative}: no test summary in output (exit ${result.status ?? 'null'})`)
-    process.stdout.write(`--- FAILED: ${relative} — no test summary printed\n`)
+    failing.push(`${relativePath}: no test summary in output (exit ${result.status ?? 'null'})`)
+    process.stdout.write(`--- FAILED: ${relativePath} — no test summary printed\n`)
     continue
   }
   const [, fileTests, filePass, fileFail] = summary.map(Number)
   tests += fileTests
   passed += filePass
   if (fileFail > 0) {
-    failing.push(`${relative}: ${fileFail} failing test(s)`)
-    process.stdout.write(`--- FAILED: ${relative} — ${fileFail} failing test(s)\n`)
+    failing.push(`${relativePath}: ${fileFail} failing test(s)`)
+    process.stdout.write(`--- FAILED: ${relativePath} — ${fileFail} failing test(s)\n`)
   } else {
     // A lingering child (open sockets keep it alive) is killed explicitly; its
     // summary is already authoritative for pass/fail.

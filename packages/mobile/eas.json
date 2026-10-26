@@ -1,0 +1,66 @@
+// EAS Build 配置（eas.json 按 JSON5 解析，因此允许 // 注释）。
+//
+// 用法（Windows 上即可，构建在 Expo 云端 macOS 机器上执行）：
+//   pnpm dlx eas-cli@latest login
+//   cd packages/mobile
+//   pnpm dlx eas-cli@latest build -p ios --profile production   # .ipa → TestFlight
+//   pnpm dlx eas-cli@latest build -p ios --profile simulator    # 模拟器 .app（不需要 Apple 账号）
+//   pnpm dlx eas-cli@latest submit -p ios --profile production  # 上传 App Store Connect
+//
+// 账号成本（详见 docs/iOS-HarmonyOS.md）：
+//   * `simulator` / `development`（开发客户端、内部分发到已注册的模拟器）**不需要**
+//     Apple Developer Program 付费账号，只需要免费 Expo 账号；
+//   * `preview`（ad hoc 真机）和 `production`（TestFlight / App Store）需要付费
+//     Apple Developer Program（约 $99/年），并且 ad hoc 还要每台设备 UDID；
+//   * Windows 机器**不能**本地构建 iOS（Expo 官方只支持 macOS/Linux 本地构建），
+//     所以这里全部走云端；仓库里的 .github/workflows/ios.yml 只做模拟器冒烟。
+{
+  "cli": {
+    // 与 research 里核实的 eas-cli 25.x 对齐；太老的 CLI 不认 ios.buildNumber。
+    "version": ">= 25.0.0",
+    // 版本号以本地 app.json / package.json 为准（本仓库由 Lead 统一改版本号），
+    // 不让云端自动递增，避免 EAS 里出现 2.2.0 之外的版本源。
+    "appVersionSource": "local",
+    // monorepo：eas 必须在 packages/mobile 目录内执行（见 docs/iOS-HarmonyOS.md）。
+    "requireCommit": false
+  },
+  "build": {
+    // 开发客户端：本机 Expo Dev Client 调试原生模块（需要模拟器或已注册真机）。
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      }
+    },
+    // 预览：ad hoc 内部分发到已注册真机；需要付费 Apple 账号 + 收集 UDID。
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "ios": {
+        "simulator": false
+      }
+    },
+    // 模拟器专用：不需要 Apple 账号，产物是 .app，可在 macOS 的 Simulator 里装。
+    "simulator": {
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      }
+    },
+    // 正式：TestFlight / App Store；autoIncrement 让 buildNumber 每次 +1。
+    "production": {
+      "autoIncrement": true,
+      "channel": "production"
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        // App Store Connect 里的 App Apple ID（十位数字）；首次上传前在 ASC 创建应用后填这里，
+        // 或改用 `eas submit` 的交互式选择。
+        "ascAppId": "0000000000"
+      }
+    }
+  }
+}

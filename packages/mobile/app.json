@@ -2,16 +2,15 @@
   "expo": {
     "name": "Open Whale",
     "slug": "open-whale",
-    "version": "2.1.0",
+    "version": "2.2.0",
     "orientation": "portrait",
     "scheme": "openwhale",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "primaryColor": "#5b8cff",
     "android": {
       "package": "dev.openwhale.app",
-      "versionCode": 8,
-      "edgeToEdgeEnabled": true,
+      "versionCode": 9,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
@@ -20,7 +19,20 @@
     },
     "ios": {
       "bundleIdentifier": "dev.openwhale.app",
-      "supportsTablet": true
+      "buildNumber": "1",
+      "supportsTablet": false,
+      "config": {
+        "usesNonExemptEncryption": false
+      },
+      "infoPlist": {
+        "NSCameraUsageDescription": "Open Whale 需要使用相机扫描电脑上的绑定二维码。",
+        "NSPhotoLibraryUsageDescription": "Open Whale 需要访问相册，用来识别你截图里的绑定二维码。",
+        "NSPhotoLibraryAddUsageDescription": "Open Whale 需要把聊天里收到的图片保存到你的相册。",
+        "NSLocalNetworkUsageDescription": "Open Whale 需要访问局域网，以便连接同一 Wi-Fi 下的电脑。",
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
     },
     "plugins": [
       "expo-router",
@@ -30,6 +42,12 @@
           "cameraPermission": "Open Whale 需要相机来扫描电脑上的绑定二维码。",
           "recordAudioAndroid": false,
           "barcodeScannerEnabled": true
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Open Whale 需要访问相册，用来识别二维码截图完成电脑绑定。"
         }
       ],
       "expo-sqlite",

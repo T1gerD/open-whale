@@ -1,9 +1,15 @@
 name: release
 
-# Builds the two distributables and publishes them as a GitHub Release:
+# Builds the distributables and publishes them as a GitHub Release:
 #   * dsh-openwhale-<version>.tgz — the computer plugin (installed with
-#     `dsh plugin --profile <p> add <tarball>`)
-#   * open-whale-<version>.apk    — the Android app
+#     `dsh plugin --profile <p> add <tarball>`); `dsh-openwhale.tgz` is a stable
+#     alias so the plugin-market entry can link `releases/latest/download/…`
+#   * open-whale-<version>.apk    — the Android app; `open-whale.apk` is the stable alias
+#   * SHA256SUMS.txt              — checksums for every asset
+#
+# Since 2.2.0 the plugin tarball also carries the web/PWA client
+# (`webchat/`, served at `/openwhale/app`), which is what makes the same build
+# usable from HarmonyOS and iOS browsers without an app store.
 #
 # The APK is built here rather than in the repository author's environment because
 # that machine has no JDK and no Android SDK. GitHub's runners do, and this also
@@ -136,6 +142,8 @@ jobs:
           APK="$(find packages/mobile/android/app/build/outputs/apk/release -name '*.apk' | head -n1)"
           if [ -z "$APK" ]; then echo "no APK produced"; exit 1; fi
           cp "$APK" "release/open-whale-${{ steps.meta.outputs.version }}.apk"
+          # Stable name for `releases/latest/download/open-whale.apk` links.
+          cp "$APK" "release/open-whale.apk"
           ls -lh release/
 
       - name: Checksums
@@ -149,6 +157,22 @@ jobs:
           name: open-whale-${{ steps.meta.outputs.version }}
           path: release/*
           if-no-files-found: error
+
+      # Optional: publish `dsh-openwhale` to npm when the repository carries an
+      # NPM_TOKEN secret. The plugin-market catalog picks the package up from the
+      # registry automatically (its `repository` field points back at this repo),
+      # and npm installs skip the build-approval step for users.
+      - name: Publish to npm (only when NPM_TOKEN is configured)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not configured for this repository — skipping npm publish."
+            exit 0
+          fi
+          node scripts/build-plugin-package.mjs --npm-dir
+          npm publish release/npm-package --access public --registry=https://registry.npmjs.org/
 
       # Publish when there is a tag to publish: either this run was triggered by a tag
       # push, or a tag was named in the manual inputs.

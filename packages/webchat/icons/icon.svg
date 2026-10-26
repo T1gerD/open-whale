@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Open Whale">
+  <defs>
+    <linearGradient id="ow-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#142644" />
+      <stop offset="1" stop-color="#070d19" />
+    </linearGradient>
+    <radialGradient id="ow-glow" cx="0.78" cy="0.18" r="0.85">
+      <stop offset="0" stop-color="#5b8cff" stop-opacity="0.62" />
+      <stop offset="1" stop-color="#5b8cff" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="ow-teal" cx="0.12" cy="0.92" r="0.6">
+      <stop offset="0" stop-color="#37d3b6" stop-opacity="0.24" />
+      <stop offset="1" stop-color="#37d3b6" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#ow-bg)" />
+  <rect width="512" height="512" rx="112" fill="url(#ow-glow)" />
+  <rect width="512" height="512" rx="112" fill="url(#ow-teal)" />
+  <path
+    d="M72 306 C104 306 104 274 136 274 C168 274 168 306 200 306 C232 306 232 274 264 274 C296 274 296 306 328 306 C360 306 360 274 392 274 C408 274 416 284 424 290"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="16"
+    stroke-linecap="round"
+  />
+  <path
+    d="M72 242 C104 242 104 210 136 210 C168 210 168 242 200 242 C232 242 232 210 264 210 C296 210 296 242 328 242 C360 242 360 210 392 210 C408 210 416 220 424 226"
+    fill="none"
+    stroke="#e9eefb"
+    stroke-opacity="0.55"
+    stroke-width="13"
+    stroke-linecap="round"
+  />
+  <circle cx="366" cy="156" r="30" fill="#37d3b6" />
+</svg>

@@ -1,0 +1,160 @@
+name: ios
+
+# iOS 模拟器冒烟构建。
+#
+# 定位：**验证配置没有坏**，不是分发通道。
+#   * 不需要 Apple 开发者账号 / 证书 / provisioning：xcodebuild 用
+#     CODE_SIGNING_ALLOWED=NO 只编模拟器 Debug 产物；
+#   * 产物是未签名 .app（zip），只能装进 macOS 上的 iOS Simulator，不能装真机；
+#   * 真机 / TestFlight 走 EAS Build（见 docs/iOS-HarmonyOS.md）。
+#
+# 触发条件（macOS runner 按分钟计费，私有仓库成本约为 Linux 的 10 倍，故刻意收窄）：
+#   1. workflow_dispatch：手动，任意分支；
+#   2. pull_request：只改 packages/mobile/** 或本工作流时；
+#   3. push tag v*：发版时留一份可下载的模拟器包做回归。
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'packages/mobile/**'
+      - '.github/workflows/ios.yml'
+  push:
+    tags: ['v*']
+
+# 同一 ref 只保留最新一次，避免排队烧分钟。
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    name: iOS simulator (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        # 不写 version：action 从根 package.json 的 packageManager 读取（pnpm@9.15.0）。
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Show toolchain versions
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcode-select -p
+          node --version
+          pnpm --version
+
+      - name: Install workspace dependencies
+        # 与 .github/workflows/release.yml 一致：仓库没有提交 lockfile，
+        # 依赖装到仓库根，workspace link (@openwhale/protocol) 才能解析。
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Align Expo package versions
+        working-directory: packages/mobile
+        # 若 package.json 里有 "*" 版本，先对齐到当前 Expo SDK；网络抖动失败不阻断，
+        # 后面 prebuild / pod install 会用解析器的结果。
+        run: npx expo install --fix || true
+
+      - name: Prebuild iOS project
+        working-directory: packages/mobile
+        # --no-install：CocoaPods 在下一步单独跑，失败信息更清楚。
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods
+        working-directory: packages/mobile/ios
+        run: |
+          set -euo pipefail
+          pod install --repo-update
+
+      - name: Resolve Xcode workspace and scheme
+        id: xcode
+        working-directory: packages/mobile/ios
+        # 不硬编码 scheme：prebuild 生成的 scheme 名取决于 app name，升级 Expo SDK 后
+        # 可能变化；`xcodebuild -list -json` 是唯一可靠来源。
+        run: |
+          set -euo pipefail
+          WORKSPACE="$(ls -d *.xcworkspace | head -n 1)"
+          test -n "$WORKSPACE"
+          SCHEME="$(xcodebuild -list -json -workspace "$WORKSPACE" | node -e '
+            let raw = "";
+            process.stdin.on("data", chunk => { raw += chunk; });
+            process.stdin.on("end", () => {
+              const info = JSON.parse(raw);
+              const list = (info.workspace && info.workspace.schemes)
+                || (info.project && info.project.schemes)
+                || [];
+              const app = list.find(name => !/^(Pods|EXConstants|ExpoModulesPackage|React[-A-Z])/i.test(name));
+              process.stdout.write((app || list[0] || "").trim());
+            });
+          ')"
+          test -n "$SCHEME"
+          echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "workspace=$WORKSPACE scheme=$SCHEME"
+
+      - name: Build for iOS Simulator (no signing)
+        working-directory: packages/mobile/ios
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace "${{ steps.xcode.outputs.workspace }}" \
+            -scheme "${{ steps.xcode.outputs.scheme }}" \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Verify and package .app
+        working-directory: packages/mobile/ios
+        run: |
+          set -euo pipefail
+          APP_DIR="build/Build/Products/Debug-iphonesimulator"
+          APP_PATH="$(find "$APP_DIR" -maxdepth 1 -name '*.app' | head -n 1)"
+          test -n "$APP_PATH"
+          echo "built: $APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" ios-simulator-app.zip
+          ls -la ios-simulator-app.zip
+
+      - name: Upload simulator app
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-whale-ios-simulator-${{ github.sha }}
+          path: packages/mobile/ios/ios-simulator-app.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## iOS 模拟器冒烟"
+            echo ""
+            echo "- 触发：\`${{ github.event_name }}\` / \`${{ github.ref }}\`"
+            echo "- 产物：\`open-whale-ios-simulator-${{ github.sha }}\`（未签名 .app zip）"
+            echo "- 安装方式（只在 macOS）：解压后 \`xcrun simctl install booted <App>.app\`"
+            echo "- 说明：未签名模拟器包不能装真机；TestFlight 走 EAS Build（docs/iOS-HarmonyOS.md）"
+          } >> "$GITHUB_STEP_SUMMARY"

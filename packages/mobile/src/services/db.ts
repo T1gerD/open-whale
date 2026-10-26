@@ -16,7 +16,7 @@ import type { ChatMessage, Transfer } from '../core/reducer.mts'
 import { createOutbox, deserializeOutbox, serializeOutbox, type Outbox } from '../core/outbox.mts'
 
 const DB_NAME = 'openwhale.db'
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 export type Database = SQLite.SQLiteDatabase
 
@@ -39,6 +39,8 @@ async function open(): Promise<Database> {
 export async function migrate(db: Database): Promise<void> {
   await db.execAsync('PRAGMA journal_mode = WAL;')
   await db.execAsync('PRAGMA foreign_keys = ON;')
+  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;')
+  const version = row?.user_version ?? 0
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS assistants (
       id TEXT PRIMARY KEY NOT NULL,
@@ -56,7 +58,11 @@ export async function migrate(db: Database): Promise<void> {
       power_allowed TEXT NOT NULL DEFAULT '["shutdown","restart","cancel"]',
       server_version TEXT,
       wake_proxy_url TEXT,
-      wake_mac TEXT
+      wake_mac TEXT,
+      connection_mode TEXT,
+      session_id TEXT,
+      session_epoch INTEGER,
+      session_cursor INTEGER
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY NOT NULL,
@@ -81,8 +87,23 @@ export async function migrate(db: Database): Promise<void> {
       value TEXT
     );
   `)
-  const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version;')
-  if (!row || row.user_version < SCHEMA_VERSION) {
+  // 老库升级：v1 → v2 补齐多端同步需要的列。每一步都用 try/catch 兜住
+  // “列已存在”，保证重复执行与中断续跑都安全。
+  if (version < 2) {
+    for (const statement of [
+      'ALTER TABLE assistants ADD COLUMN connection_mode TEXT;',
+      'ALTER TABLE assistants ADD COLUMN session_id TEXT;',
+      'ALTER TABLE assistants ADD COLUMN session_epoch INTEGER;',
+      'ALTER TABLE assistants ADD COLUMN session_cursor INTEGER;',
+    ]) {
+      try {
+        await db.execAsync(statement)
+      } catch {
+        // 列已存在（新建库已经带列）：忽略。
+      }
+    }
+  }
+  if (version < SCHEMA_VERSION) {
     await db.execAsync(`PRAGMA user_version = ${SCHEMA_VERSION};`)
   }
 }
@@ -109,6 +130,10 @@ interface AssistantRow {
   server_version: string | null
   wake_proxy_url: string | null
   wake_mac: string | null
+  connection_mode: string | null
+  session_id: string | null
+  session_epoch: number | null
+  session_cursor: number | null
 }
 
 export async function listAssistants(): Promise<StoredAssistant[]> {
@@ -130,8 +155,9 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
   await db.runAsync(
     `INSERT INTO assistants (
        id, computer_id, name, fingerprint, endpoints, preferred_endpoint, lan, device_id, device_name,
-       paired_at, last_connected_at, online, power_allowed, server_version, wake_proxy_url, wake_mac
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       paired_at, last_connected_at, online, power_allowed, server_version, wake_proxy_url, wake_mac,
+       connection_mode, session_id, session_epoch, session_cursor
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        computer_id = excluded.computer_id,
        name = excluded.name,
@@ -146,7 +172,11 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
        power_allowed = excluded.power_allowed,
        server_version = excluded.server_version,
        wake_proxy_url = excluded.wake_proxy_url,
-       wake_mac = excluded.wake_mac;`,
+       wake_mac = excluded.wake_mac,
+       connection_mode = excluded.connection_mode,
+       session_id = excluded.session_id,
+       session_epoch = excluded.session_epoch,
+       session_cursor = excluded.session_cursor;`,
     [
       assistant.id,
       assistant.computerId,
@@ -164,6 +194,10 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
       assistant.serverVersion ?? null,
       assistant.wakeProxyUrl ?? null,
       assistant.wakeMac ?? null,
+      assistant.connectionMode ?? null,
+      assistant.sessionId ?? null,
+      assistant.sessionEpoch ?? null,
+      assistant.sessionCursor ?? 0,
     ],
   )
 }
@@ -225,6 +259,12 @@ export async function saveMessages(assistantId: string, messages: ChatMessage[])
       )
     }
   })
+}
+
+/** 本地删除一条消息（长按菜单里的“删除”；电脑端历史不受影响）。 */
+export async function deleteMessage(assistantId: string, id: string): Promise<void> {
+  const db = await database()
+  await db.runAsync('DELETE FROM messages WHERE assistant_id = ? AND id = ?;', [assistantId, id])
 }
 
 export async function loadTransfers(assistantId: string): Promise<Transfer[]> {
@@ -309,6 +349,10 @@ function rowToAssistant(row: AssistantRow): StoredAssistant {
     serverVersion: row.server_version ?? undefined,
     wakeProxyUrl: row.wake_proxy_url ?? undefined,
     wakeMac: row.wake_mac ?? undefined,
+    connectionMode: row.connection_mode ?? undefined,
+    sessionId: row.session_id ?? undefined,
+    sessionEpoch: row.session_epoch ?? undefined,
+    sessionCursor: row.session_cursor ?? 0,
   }
 }
 

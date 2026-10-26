@@ -412,6 +412,22 @@ test('a close handshake is echoed and the connection reports itself closed', asy
   assert.equal(server.closed, true)
 })
 
+test('a peer that drops the TCP connection closes the server side', async t => {
+  const client = await openClient(t)
+  const server = await client.waitForConnection()
+  const closed = new Promise(resolve => server.once('close', resolve))
+  // A killed app / lost network never sends a close frame: only FIN arrives.
+  // If this does not settle the connection, the gateway keeps a phantom session
+  // and the participant list shows a device that is gone forever.
+  client.socket.end()
+  const settled = await Promise.race([
+    closed.then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), 1500)),
+  ])
+  assert.equal(settled, true, 'the server must report the connection closed on FIN')
+  assert.equal(server.closed, true)
+})
+
 test('sending on a closed connection is a no-op, not a crash', async t => {
   const client = await openClient(t)
   await client.waitForConnection()

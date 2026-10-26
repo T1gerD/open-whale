@@ -255,6 +255,18 @@ export class WsConnection extends EventEmitter {
       this.#closeFromPeer(code === 1005 ? 1000 : code)
     })
     socket.on('close', () => this.#settle())
+    // A phone that is killed, loses the network, or is suspended never sends a
+    // close frame: the server only observes FIN ('end'). Without this handler the
+    // session would stay "online" forever, never be reaped, and the participant
+    // list would keep showing a device that is long gone.
+    socket.on('end', () => {
+      if (this.closed) return
+      this.closed = true
+      try {
+        socket.end()
+      } catch { /* already gone */ }
+      this.#settle()
+    })
     socket.on('error', error => {
       this.emit('error', error)
       this.#settle()

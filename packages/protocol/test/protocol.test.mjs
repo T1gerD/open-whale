@@ -3,12 +3,27 @@ import assert from 'node:assert/strict'
 
 import {
   ACTIVITY_KIND,
+  ALL_CAPABILITIES,
+  CAPABILITIES,
   CLIENT_FRAME,
+  CONNECTION_MODE,
+  ENDPOINT_KIND,
+  IdempotencyCache,
   PAIR_SECRET_TTL_MS,
   PROTOCOL_VERSION,
   SERVER_FRAME,
+  SessionEventLog,
+  classifyEndpoint,
   clampAssistantText,
+  dedupeKey,
+  encodeEndpointKinds,
+  endpointKindsForMode,
   formatFingerprint,
+  isTailscaleHost,
+  normalizeMessageId,
+  orderEndpointCandidates,
+  orderEndpoints,
+  parseEndpointKinds,
   parsePairingPayload,
   pickEndpoint,
   timingSafeEqual,
@@ -148,13 +163,174 @@ test('pickEndpoint prefers the remembered endpoint when it is still advertised',
   assert.equal(pickEndpoint(endpoints, 'http://192.168.1.5:8787'), 'http://192.168.1.5:8787')
 })
 
-test('pickEndpoint falls back to https first, then the first entry', () => {
+test('pickEndpoint prefers the remembered endpoint, then the fastest network kind', () => {
+  // 2.2.0: a LAN/Tailscale address must beat a public tunnel in auto mode.
   assert.equal(
-    pickEndpoint(['http://192.168.1.5:8787', 'https://a.trycloudflare.com'], 'https://dead.example'),
+    pickEndpoint(['https://a.trycloudflare.com', 'http://192.168.1.5:8787'], undefined),
+    'http://192.168.1.5:8787',
+  )
+  // The remembered endpoint still wins while it is still advertised.
+  assert.equal(
+    pickEndpoint(['https://a.trycloudflare.com', 'http://192.168.1.5:8787'], 'https://a.trycloudflare.com'),
     'https://a.trycloudflare.com',
   )
-  assert.equal(pickEndpoint(['http://192.168.1.5:8787'], undefined), 'http://192.168.1.5:8787')
+  // Tailscale outranks the LAN.
+  assert.equal(
+    pickEndpoint(['http://192.168.1.5:8787', 'http://100.102.90.23:8787'], undefined),
+    'http://100.102.90.23:8787',
+  )
+  assert.equal(pickEndpoint(['https://a.trycloudflare.com'], undefined), 'https://a.trycloudflare.com')
   assert.equal(pickEndpoint([], undefined), undefined)
+})
+
+// ---------------------------------------------------------------------------
+// 2.2.0 — capabilities, endpoint kinds, idempotency, event log
+// ---------------------------------------------------------------------------
+
+test('every capability is namespaced and unique', () => {
+  assert.ok(ALL_CAPABILITIES.length >= 6)
+  assert.equal(new Set(ALL_CAPABILITIES).size, ALL_CAPABILITIES.length)
+  for (const capability of ALL_CAPABILITIES) assert.match(capability, /^[a-z0-9-]+-v1$/)
+  assert.equal(CAPABILITIES.UPLOAD, 'upload-v1')
+})
+
+test('Tailscale addresses are recognised in all three forms', () => {
+  assert.equal(isTailscaleHost('100.102.90.23'), true)
+  assert.equal(isTailscaleHost('100.64.0.1'), true)
+  assert.equal(isTailscaleHost('100.127.255.254'), true)
+  assert.equal(isTailscaleHost('100.63.255.255'), false)
+  assert.equal(isTailscaleHost('100.128.0.1'), false)
+  assert.equal(isTailscaleHost('fd7a:115c:a1e0::1'), true)
+  assert.equal(isTailscaleHost('fd7a:115c:a1e0:ab12::42'), true)
+  assert.equal(isTailscaleHost('my-laptop.tail1234.ts.net'), true)
+  assert.equal(isTailscaleHost('192.168.1.4'), false)
+})
+
+test('classifyEndpoint separates Tailscale from LAN and tunnel', () => {
+  assert.equal(classifyEndpoint('http://100.102.90.23:8787'), ENDPOINT_KIND.TAILSCALE)
+  assert.equal(classifyEndpoint('http://192.168.1.20:8787'), ENDPOINT_KIND.LAN)
+  assert.equal(classifyEndpoint('http://10.0.0.8:8787'), ENDPOINT_KIND.LAN)
+  assert.equal(classifyEndpoint('http://172.20.1.2:8787'), ENDPOINT_KIND.LAN)
+  assert.equal(classifyEndpoint('https://quiet-whale.trycloudflare.com'), ENDPOINT_KIND.TUNNEL)
+  assert.equal(classifyEndpoint('wss://example.com/openwhale/ws'), ENDPOINT_KIND.TUNNEL)
+  assert.equal(classifyEndpoint('http://127.0.0.1:8787'), ENDPOINT_KIND.LOOPBACK)
+  assert.equal(classifyEndpoint('http://[fd7a:115c:a1e0::1]:8787'), ENDPOINT_KIND.TAILSCALE)
+  assert.equal(classifyEndpoint('not a url'), ENDPOINT_KIND.UNKNOWN)
+})
+
+test('auto mode orders Tailscale, then LAN, then the public tunnel', () => {
+  const endpoints = [
+    'https://quiet-whale.trycloudflare.com',
+    'http://192.168.1.20:8787',
+    'http://100.102.90.23:8787',
+  ]
+  assert.deepEqual(orderEndpoints(endpoints), [
+    'http://100.102.90.23:8787',
+    'http://192.168.1.20:8787',
+    'https://quiet-whale.trycloudflare.com',
+  ])
+  // mode filters beat the ordering: "tailscale only" never tries the tunnel.
+  assert.deepEqual(orderEndpoints(endpoints, { mode: CONNECTION_MODE.TAILSCALE }), ['http://100.102.90.23:8787'])
+  assert.deepEqual(orderEndpoints(endpoints, { mode: CONNECTION_MODE.LAN }), ['http://192.168.1.20:8787'])
+  assert.deepEqual(orderEndpoints(endpoints, { mode: CONNECTION_MODE.TUNNEL }), [
+    'https://quiet-whale.trycloudflare.com',
+  ])
+  // preferred wins even against a better-ranked kind, but only if the mode allows it.
+  assert.equal(orderEndpoints(endpoints, { preferred: 'http://192.168.1.20:8787' })[0], 'http://192.168.1.20:8787')
+  assert.deepEqual(orderEndpoints(endpoints, { mode: CONNECTION_MODE.TUNNEL, preferred: 'http://100.102.90.23:8787' }), [
+    'https://quiet-whale.trycloudflare.com',
+  ])
+  // loopback (USB debugging) is only included when explicitly allowed.
+  assert.deepEqual(orderEndpoints(['http://127.0.0.1:8787'], {}), [])
+  assert.deepEqual(orderEndpoints(['http://127.0.0.1:8787'], { allowLoopback: true }), ['http://127.0.0.1:8787'])
+})
+
+test('orderEndpointCandidates reports the kind it used for each URL', () => {
+  const ordered = orderEndpointCandidates([
+    'https://a.trycloudflare.com',
+    'http://100.102.90.23:8787',
+  ])
+  assert.deepEqual(ordered, [
+    { url: 'http://100.102.90.23:8787', kind: 'tailscale' },
+    { url: 'https://a.trycloudflare.com', kind: 'tunnel' },
+  ])
+  assert.deepEqual(endpointKindsForMode(CONNECTION_MODE.AUTO), ['tailscale', 'lan', 'tunnel', 'unknown'])
+})
+
+test('pairing QR endpoint kind codes round-trip', () => {
+  const endpoints = ['http://100.102.90.23:8787', 'http://192.168.1.20:8787', 'https://a.trycloudflare.com']
+  const codes = encodeEndpointKinds(endpoints)
+  assert.deepEqual(codes, ['t', 'l', 'c'])
+  assert.deepEqual(parseEndpointKinds(endpoints, codes), ['tailscale', 'lan', 'tunnel'])
+  // A QR from an older plugin has no epk: classify from the URL instead.
+  assert.deepEqual(parseEndpointKinds(endpoints, undefined), ['tailscale', 'lan', 'tunnel'])
+  // Garbage codes fall back to URL classification rather than throwing.
+  assert.deepEqual(parseEndpointKinds(['http://192.168.1.20:8787'], ['?']), ['lan'])
+})
+
+test('parsePairingPayload validates the additive 2.2.0 fields', () => {
+  const ok = parsePairingPayload(
+    payload({ epk: ['c', 'l'], web: 'http://192.168.1.20:8787/openwhale/app', mode: 'auto' }),
+  )
+  assert.equal(ok.ok, true)
+  const badEpk = parsePairingPayload(payload({ epk: ['c', 42] }))
+  assert.equal(badEpk.ok, false)
+  const badWeb = parsePairingPayload(payload({ web: 42 }))
+  assert.equal(badWeb.ok, false)
+  const badMode = parsePairingPayload(payload({ mode: 'bluetooth' }))
+  assert.equal(badMode.ok, false)
+})
+
+test('IdempotencyCache remembers within the TTL and forgets after it', () => {
+  let now = 1_000
+  const cache = new IdempotencyCache({ ttlMs: 100, maxEntries: 3, now: () => now })
+  const key = dedupeKey('dev_1', 'msg_1')
+  assert.equal(cache.get(key), undefined)
+  cache.remember(key, { callId: 'c1' })
+  assert.deepEqual(cache.get(key), { callId: 'c1' })
+  now += 99
+  assert.deepEqual(cache.get(key), { callId: 'c1' })
+  now += 2
+  assert.equal(cache.get(key), undefined)
+  // bounded: more entries than maxEntries evicts the oldest.
+  for (let i = 0; i < 5; i++) cache.remember(`k${i}`, i)
+  assert.equal(cache.get('k0'), undefined)
+  assert.equal(cache.get('k4'), 4)
+})
+
+test('normalizeMessageId rejects empty and over-long ids', () => {
+  assert.equal(normalizeMessageId('msg_1'), 'msg_1')
+  assert.equal(normalizeMessageId('  msg_2  '), 'msg_2')
+  assert.equal(normalizeMessageId('', 'fallback'), 'fallback')
+  assert.equal(normalizeMessageId(undefined, 'fallback'), 'fallback')
+  assert.equal(normalizeMessageId('x'.repeat(201), 'fallback'), 'fallback')
+})
+
+test('SessionEventLog replays after a cursor and rebuilds a snapshot', () => {
+  const log = new SessionEventLog({ limit: 10, snapshotLimit: 10 })
+  assert.equal(log.head, 0)
+  log.append({ t: SERVER_FRAME.CHAT_ECHO, msgId: 'm1', text: '第一句', at: '2026-01-01T00:00:00.000Z' })
+  const msg = log.append({ t: SERVER_FRAME.CHAT_MESSAGE, callId: 'c1', messageId: 'a1', text: '收到' })
+  log.append({ t: SERVER_FRAME.CHAT_MESSAGE, callId: 'c1', messageId: 'a2', text: '还有' })
+  log.append({ t: SERVER_FRAME.CHAT_DONE, callId: 'c1', text: '收到\n\n还有', at: '2026-01-01T00:00:01.000Z' })
+  assert.equal(log.head, 4)
+  assert.equal(msg.seq, 2)
+  const replay = log.eventsSince(1)
+  assert.ok(replay && replay.length === 3)
+  assert.equal(replay[0].callId, 'c1')
+  assert.deepEqual(log.eventsSince(4), [])
+  // A cursor older than the retained window cannot be replayed: snapshot instead.
+  const tiny = new SessionEventLog({ limit: 1 })
+  tiny.append({ t: SERVER_FRAME.CHAT_ECHO, msgId: 'm9', text: 'x' })
+  tiny.append({ t: SERVER_FRAME.CHAT_ECHO, msgId: 'm10', text: 'y' })
+  assert.equal(tiny.eventsSince(0), undefined)
+  // …but a cursor inside the window still replays.
+  assert.equal(tiny.eventsSince(1)?.length, 1)
+  const snapshot = log.snapshot()
+  assert.equal(snapshot.length, 2)
+  assert.equal(snapshot[0].id, 'usr_m1')
+  assert.equal(snapshot[1].id, 'msg_c1')
+  assert.equal(snapshot[1].text, '收到\n\n还有')
 })
 
 test('clampAssistantText leaves short answers untouched', () => {

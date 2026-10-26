@@ -1,7 +1,11 @@
 # Dependencies — the plugin and protocol ship with zero runtime dependencies on
 # purpose, and the mobile app's dependencies are installed by `pnpm install`.
+# `package-lock.json` is listed because npm is only ever used ad-hoc (typecheck,
+# publishing a staged directory); this repository is a pnpm workspace and its lock
+# file is pnpm-lock.yaml.
 node_modules/
 .pnpm-store/
+package-lock.json
 
 # Test runner scratch output (one log per suite when run through
 # scripts/run-tests.mjs).

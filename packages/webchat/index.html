@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="auto">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      插件把本客户端挂在固定路径 /openwhale/app 下（协议常量 WEB_CLIENT_PATH）。
+      二维码里的 web 地址通常不带结尾斜杠（/openwhale/app），此时浏览器会把
+      `styles.css` 解析成 /openwhale/styles.css。用绝对 base 统一成目录语义，
+      其余资源仍全部使用相对路径，这样插件静态路由可以原样提供整个目录。
+    -->
+    <base href="/openwhale/app/" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#eef2fa" media="(prefers-color-scheme: light)" />
+    <meta
+      name="description"
+      content="Open Whale 网页版：在手机浏览器（鸿蒙 NEXT / iOS Safari / 任意浏览器）里使用电脑上的 DeepSeek Harness 助理。"
+    />
+    <title>Open Whale</title>
+
+    <!-- PWA：可添加到主屏幕。离线壳由 sw.js 缓存，聊天内容不入缓存。 -->
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Open Whale" />
+    <meta name="format-detection" content="telephone=no" />
+
+    <link rel="stylesheet" href="styles.css" />
+    <!-- Ed25519 用本地 vendor 副本（Unlicense），不走 CDN：离线/内网也能握手。 -->
+    <script src="vendor/tweetnacl.min.js"></script>
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <div class="app" id="app">
+      <!-- 启动占位：解析绑定参数 / 恢复本地身份期间显示 -->
+      <div class="boot" id="boot-screen">
+        <div class="boot-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" focusable="false">
+            <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+              <path d="M7 30c5 0 5-6 10-6s5 6 10 6 5-6 10-6 2 3 4 4" />
+              <path d="M7 22c5 0 5-6 10-6s5 6 10 6 5-6 10-6 2 3 4 4" opacity=".55" />
+            </g>
+            <circle cx="36" cy="13" r="3.2" fill="currentColor" />
+          </svg>
+        </div>
+        <p class="boot-text" id="boot-text">正在打开…</p>
+      </div>
+
+      <!-- ================= 绑定页面 ================= -->
+      <section class="bind-screen" id="bind-screen" hidden>
+        <div class="bind-hero">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" focusable="false">
+              <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+                <path d="M9 40c7 0 7-8 14-8s7 8 14 8 7-8 14-8 3 4 5 5" />
+                <path d="M9 29c7 0 7-8 14-8s7 8 14 8 7-8 14-8 3 4 5 5" opacity=".5" />
+              </g>
+              <circle cx="48" cy="16" r="4" fill="currentColor" />
+            </svg>
+          </div>
+          <h1 class="bind-title">连接你的电脑</h1>
+          <p class="bind-lede">
+            在电脑上打开 Open Whale 插件页，扫描「网页版」二维码；或者把绑定链接 / JSON 粘贴到下面。
+          </p>
+        </div>
+
+        <div class="bind-card" id="bind-card">
+          <div class="bind-recognized" id="bind-recognized" hidden>
+            <p class="bind-eyebrow">已识别绑定信息</p>
+            <dl class="kv" id="bind-summary"></dl>
+            <div class="bind-actions">
+              <button class="btn btn-primary btn-block" type="button" id="bind-confirm">连接这台电脑</button>
+              <button class="btn btn-ghost btn-block" type="button" id="bind-cancel">换一个绑定链接</button>
+            </div>
+          </div>
+
+          <div class="bind-form" id="bind-form">
+            <label class="field-label" for="bind-input">绑定链接或 JSON</label>
+            <textarea
+              id="bind-input"
+              class="textarea bind-textarea"
+              rows="3"
+              spellcheck="false"
+              autocapitalize="off"
+              autocomplete="off"
+              placeholder='粘贴类似 http://192.168.1.5:8787/openwhale/app#p=… 的链接，或 {"v":1,"p":"openwhale",…}'
+            ></textarea>
+            <div class="bind-form-actions">
+              <button class="btn btn-primary" type="button" id="bind-connect">连接</button>
+              <button class="btn btn-secondary" type="button" id="bind-scan-image">
+                <svg viewBox="0 0 20 20" class="icon" aria-hidden="true" focusable="false">
+                  <path d="M3 7V4.5A1.5 1.5 0 0 1 4.5 3H7M13 3h2.5A1.5 1.5 0 0 1 17 4.5V7M17 13v2.5a1.5 1.5 0 0 1-1.5 1.5H13M7 17H4.5A1.5 1.5 0 0 1 3 15.5V13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+                  <rect x="6.5" y="6.5" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.6" />
+                </svg>
+                从相册识别二维码
+              </button>
+            </div>
+            <p class="bind-status" id="bind-status" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+
+        <details class="bind-help">
+          <summary>扫不到 / 连不上？</summary>
+          <ul>
+            <li>电脑端插件页一般是 <code>http://&lt;电脑IP&gt;:8787/openwhale</code>，页面上的第二个二维码就是网页版。</li>
+            <li>也可以直接用手机系统相机扫电脑上的网页版二维码，会自动打开这个页面并带上绑定信息。</li>
+            <li>iOS / 鸿蒙的相册识图需要允许本页读取图片；识别失败时换一张更清晰、二维码更大的截图。</li>
+            <li>局域网 / Tailscale 地址必须能从这台手机访问到；公网隧道较慢，优先用 Tailscale 或同一 Wi-Fi。</li>
+            <li>绑定二维码 10 分钟内有效，过期请在电脑上重新生成。</li>
+          </ul>
+        </details>
+
+        <footer class="bind-footer">
+          <span id="bind-version">Open Whale 网页版 v2.2.0</span>
+          <span class="dot-sep" aria-hidden="true">·</span>
+          <span>协议 1.1.0</span>
+        </footer>
+      </section>
+
+      <!-- ================= 聊天页面 ================= -->
+      <section class="chat-screen" id="chat-screen" hidden>
+        <header class="chat-header">
+          <div class="chat-who">
+            <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+            <div class="chat-who-text">
+              <h1 id="computer-name" title="电脑名称">电脑</h1>
+              <p class="chat-meta" id="connection-detail">未连接</p>
+            </div>
+          </div>
+          <div class="chat-header-actions">
+            <div class="participants" id="participants" aria-label="会话参与者"></div>
+            <button class="icon-btn" type="button" id="menu-btn" aria-label="打开菜单" aria-haspopup="dialog">
+              <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
+                <circle cx="5" cy="12" r="1.7" fill="currentColor" />
+                <circle cx="12" cy="12" r="1.7" fill="currentColor" />
+                <circle cx="19" cy="12" r="1.7" fill="currentColor" />
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="status-banner" id="status-banner" hidden>
+          <p class="status-banner-text" id="status-banner-text"></p>
+          <div class="status-banner-actions" id="status-banner-actions"></div>
+        </div>
+
+        <div class="message-area" id="message-area">
+          <div class="message-list" id="message-list" role="log" aria-live="polite" aria-relevant="additions text"></div>
+        </div>
+        <button class="jump-latest" id="jump-latest" type="button" hidden>回到最新</button>
+
+        <div class="composer-wrap" id="composer-wrap">
+          <div class="attachment-tray" id="attachment-tray" hidden></div>
+          <div class="upload-progress" id="upload-progress" hidden>
+            <div class="upload-progress-text" id="upload-progress-text">正在上传…</div>
+            <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="upload-progress-bar">
+              <div class="progress-fill" id="upload-progress-fill"></div>
+            </div>
+          </div>
+          <form class="composer" id="composer" autocomplete="off">
+            <button class="icon-btn composer-attach" type="button" id="attach-btn" aria-label="添加文件">
+              <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
+                <path d="M8.5 12.5l6.7-6.7a3 3 0 0 1 4.2 4.2l-8 8a5 5 0 0 1-7.1-7.1l7.4-7.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button class="icon-btn composer-attach" type="button" id="image-btn" aria-label="发送图片">
+              <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
+                <rect x="3.5" y="4.5" width="17" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.7" />
+                <circle cx="9" cy="10" r="1.6" fill="currentColor" />
+                <path d="M5 17l4.3-4.2a2 2 0 0 1 2.8 0L17 17.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+              </svg>
+            </button>
+            <textarea
+              id="composer-input"
+              class="composer-input"
+              rows="1"
+              placeholder="给助理发消息…"
+              enterkeyhint="send"
+              aria-label="消息内容"
+            ></textarea>
+            <button class="send-btn" type="submit" id="send-btn" aria-label="发送">
+              <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
+                <path d="M4.5 12l15-7-4.3 15-3.9-6.1L4.5 12z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" />
+                <path d="M11.3 13.9L19.5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+              </svg>
+            </button>
+            <button class="stop-btn" type="button" id="stop-btn" aria-label="停止生成" hidden>
+              <span class="stop-square" aria-hidden="true"></span>
+              停止
+            </button>
+          </form>
+          <p class="composer-hint" id="composer-hint">消息只在你的电脑和这台设备之间传输</p>
+        </div>
+      </section>
+
+      <!-- ================= 通用弹层 ================= -->
+      <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
+      <div class="sheet" id="settings-sheet" role="dialog" aria-modal="true" aria-label="设置" hidden></div>
+      <div class="dialog" id="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" hidden>
+        <h2 class="dialog-title" id="dialog-title"></h2>
+        <p class="dialog-body" id="dialog-body"></p>
+        <div class="dialog-actions">
+          <button class="btn btn-ghost" type="button" id="dialog-cancel"></button>
+          <button class="btn btn-primary" type="button" id="dialog-confirm"></button>
+        </div>
+      </div>
+
+      <div class="install-hint" id="install-hint" role="status" hidden>
+        <span class="install-hint-text" id="install-hint-text"></span>
+        <button class="install-hint-action" type="button" id="install-hint-action" hidden>安装</button>
+        <button class="install-hint-close" type="button" id="install-hint-close" aria-label="关闭提示">×</button>
+      </div>
+
+      <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+      <input type="file" id="qr-file" accept="image/*" hidden />
+      <input type="file" id="attach-file" multiple hidden />
+      <input type="file" id="image-file" accept="image/*" multiple hidden />
+    </div>
+
+    <noscript>
+      <p style="padding: 24px; font-family: system-ui; color: #e8eefc; background: #0b1220">
+        网页版需要 JavaScript：请换一个支持 ES Module 的现代浏览器（鸿蒙浏览器、Safari 16+、Chrome 90+）。
+      </p>
+    </noscript>
+  </body>
+</html>

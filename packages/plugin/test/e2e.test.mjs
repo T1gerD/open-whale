@@ -19,6 +19,7 @@ import { join } from 'node:path'
 import { connect } from 'node:net'
 
 import {
+  CAPABILITIES,
   CLIENT_FRAME,
   SERVER_FRAME,
   formatFingerprint,
@@ -144,7 +145,7 @@ class FakePhone {
       },
       close: () => socket.destroy(),
       /** First-time binding: present the QR secret. */
-      async pair() {
+      async pair(extra = {}) {
         client.send({
           t: CLIENT_FRAME.HELLO,
           version: '1.0.0',
@@ -153,11 +154,12 @@ class FakePhone {
           devicePublicKey,
           nonce: randomUUID(),
           pairSecret: paired?.secret,
+          ...extra,
         })
         return client.waitFor(f => f.t === SERVER_FRAME.HELLO_ACK)
       },
       /** Normal app start: prove the stored device key, no QR involved. */
-      async reconnect() {
+      async reconnect(extra = {}) {
         const nonce = randomUUID()
         client.send({
           t: CLIENT_FRAME.HELLO,
@@ -167,6 +169,7 @@ class FakePhone {
           devicePublicKey,
           nonce,
           signature: sign(null, Buffer.from(helloSignatureMessage(nonce)), privateKey).toString('base64url'),
+          ...extra,
         })
         return client.waitFor(f => f.t === SERVER_FRAME.HELLO_ACK)
       },
@@ -234,6 +237,13 @@ async function startComputer(options = {}) {
     lanUrls: () => [`http://192.168.1.50:${options.port ?? 8787}`],
     uploadDir,
     log: () => {},
+    // Mirror the production wiring: the conversation id comes from the persisted
+    // collaboration preference, and a device joins its conversation at hello.
+    sessionIdFor: deviceId => (store.getPreference('collaboration', false) === true
+      ? store.sharedSessionId()
+      : store.sessionIdFor(deviceId)),
+    collaboration: () => store.getPreference('collaboration', false) === true,
+    cwd: () => dir,
   })
   const port = await gateway.listen(0, '127.0.0.1')
 
@@ -565,3 +575,103 @@ test('the health endpoint is enough to debug a failed connection', async t => {
 })
 
 
+
+test('two phones in one collaborative conversation stay in sync and a retry never duplicates', async t => {
+  const computer = await startComputer()
+  t.after(() => computer.close())
+  const phoneA = new FakePhone()
+  phoneA.deviceName = '手机A'
+  const phoneB = new FakePhone()
+  phoneB.deviceName = '手机B'
+  const caps = [
+    CAPABILITIES.CHAT_ECHO,
+    CAPABILITIES.CHAT_MESSAGE,
+    CAPABILITIES.SESSION_SYNC,
+    CAPABILITIES.PARTICIPANTS,
+    CAPABILITIES.COLLAB,
+  ]
+
+  // 1. Both phones pair through their own single-use QR.
+  const displayedA = await (await fetch(`http://127.0.0.1:${computer.port}/openwhale/pairing.json`)).json()
+  phoneA.scan(displayedA.payload)
+  const a = await phoneA.connect(computer.port)
+  assert.ok(await a.pair({ capabilities: caps }))
+
+  const displayedB = await (await fetch(`http://127.0.0.1:${computer.port}/openwhale/pairing.json`)).json()
+  phoneB.scan(displayedB.payload)
+  const b = await phoneB.connect(computer.port)
+  const ackB = await b.pair({ capabilities: caps })
+  assert.equal(ackB.capabilities.includes(CAPABILITIES.CHAT_ECHO), true)
+
+  // 2. Turn collaboration on (the same path the local page / phone toggle uses).
+  await computer.gateway.setCollaboration(true)
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.COLLAB_STATE && f.on === true))
+  assert.ok(await b.waitFor(f => f.t === SERVER_FRAME.COLLAB_STATE && f.on === true))
+  const sharedSession = computer.store.sharedSessionId()
+
+  // 3. A sends one message with an idempotency key.
+  const callId = randomUUID()
+  a.send({ t: CLIENT_FRAME.CHAT, rid: callId, callId, msgId: 'msg_e2e_1', text: '大家好' })
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_ACK && f.msgId === 'msg_e2e_1'))
+
+  // Both devices receive the same user message echo — the sender included, so the
+  // client dedupes by msgId instead of relying on "did I send this?".
+  const echoForB = await b.waitFor(f => f.t === SERVER_FRAME.CHAT_ECHO && f.msgId === 'msg_e2e_1')
+  assert.ok(echoForB, 'the other phone must see the message')
+  assert.equal(echoForB.deviceId, phoneA.deviceId)
+  assert.equal(echoForB.speaker, '手机A')
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_ECHO && f.msgId === 'msg_e2e_1'))
+
+  const startedAt = Date.now()
+  while (computer.received.length === 0 && Date.now() - startedAt < 2000) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.equal(computer.received.length, 1, 'the message reaches the assistant exactly once')
+  assert.equal(computer.received[0].callId, callId)
+
+  // 4. The outbox retries because its ack was lost: the server must answer with a
+  //    duplicate ack and must NOT wake the assistant again.
+  a.send({ t: CLIENT_FRAME.CHAT, rid: callId, callId, msgId: 'msg_e2e_1', text: '大家好' })
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_ACK && f.duplicate === true))
+  await new Promise(resolve => setTimeout(resolve, 120))
+  assert.equal(computer.received.length, 1, 'a retried message must not be delivered twice')
+
+  // 5. The assistant answer is broadcast to every device in the conversation.
+  computer.gateway.pushEvent({
+    kind: 'message',
+    sessionId: sharedSession,
+    deviceId: phoneA.deviceId,
+    callId,
+    messageId: 'am_e2e_1',
+    index: 0,
+    text: '收到，大家好。',
+  })
+  computer.gateway.pushEvent({
+    kind: 'done',
+    sessionId: sharedSession,
+    deviceId: phoneA.deviceId,
+    callId,
+    text: '收到，大家好。',
+  })
+  const messageForB = await b.waitFor(f => f.t === SERVER_FRAME.CHAT_MESSAGE && f.messageId === 'am_e2e_1')
+  assert.ok(messageForB, 'the other phone must see the streamed assistant message')
+  const doneForB = await b.waitFor(f => f.t === SERVER_FRAME.CHAT_DONE && f.callId === callId)
+  assert.ok(doneForB, 'the other phone must see the authoritative done frame')
+  assert.equal(doneForB.text, '收到，大家好。')
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_MESSAGE && f.messageId === 'am_e2e_1'))
+
+  // 6. B reconnects and catches up from its cursor instead of getting a snapshot.
+  const doneSeq = doneForB.seq
+  b.close()
+  await new Promise(resolve => setTimeout(resolve, 60))
+  const reconnected = await phoneB.connect(computer.port)
+  const ack = await reconnected.reconnect({ capabilities: caps, cursor: doneSeq - 1 })
+  assert.ok(ack, 'the phone must reconnect without scanning again')
+  assert.equal(ack.sessionId, sharedSession)
+  const replay = await reconnected.waitFor(f => f.t === SERVER_FRAME.SESSION_EVENTS)
+  assert.ok(replay, 'a usable cursor must produce a replay, not a snapshot')
+  assert.equal(replay.sessionId, sharedSession)
+  assert.equal(replay.events.some(event => event.t === SERVER_FRAME.CHAT_DONE), true)
+  reconnected.close()
+  a.close()
+})

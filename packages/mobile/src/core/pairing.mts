@@ -19,6 +19,12 @@ export interface PairingPayload {
   secret: string
   expires: string
   endpoints: string[]
+  /** 与 endpoints 一一对应的单字母网络类型（l/t/c/u/x，2.2.0 新增）。 */
+  epk?: string[]
+  /** 网页版/PWA 客户端地址（鸿蒙/iOS/任意浏览器）。 */
+  web?: string
+  /** 生成这份载荷时电脑端使用的连接方式（auto/lan/tailscale/tunnel）。 */
+  mode?: string
   port?: string | number
   lan?: string
   name?: string
@@ -55,6 +61,17 @@ export interface AssistantRecord {
   serverVersion?: string
   /** 可选的唤醒代理地址（本地设置，不属于 wire protocol）。 */
   wakeProxyUrl?: string
+  /**
+   * 连接方式偏好（auto/lan/tailscale/tunnel），持久化在助理记录里。
+   * 二维码里带了 `mode` 时以它作为初始值，否则 auto。
+   */
+  connectionMode?: string
+  /** 当前会话 id（协作模式切换会变）；hello 时带上去做断点续传。 */
+  sessionId?: string
+  /** 会话纪元：每次切换 +1，切换回同一个 sessionId 也能被发现。 */
+  sessionEpoch?: number
+  /** 已应用到的会话事件序号（session/events 的 cursor）。 */
+  sessionCursor?: number
 }
 
 export interface PairingValidated {
@@ -113,13 +130,26 @@ export function buildAssistantFromPairing(
     powerAllowed: ['shutdown', 'restart', 'cancel'],
     serverVersion: input.payload.version,
     wakeProxyUrl: undefined,
+    // 二维码里带了电脑端生成时的连接方式就沿用它，否则自动。
+    connectionMode: normalizeConnectionModeInput(input.payload.mode),
+    sessionId: undefined,
+    sessionEpoch: undefined,
+    sessionCursor: 0,
   }
+}
+
+/** 二维码里的 mode 只接受四个合法值；其余（含老插件缺省）一律 auto。 */
+function normalizeConnectionModeInput(mode: unknown): string {
+  return mode === 'lan' || mode === 'tailscale' || mode === 'tunnel' ? mode : 'auto'
 }
 
 /** `hello/ack` 里我们真正要用的字段（其余字段宽容忽略）。 */
 export interface HelloAckLike {
   t?: string
+  /** 协议版本（2.2.0 仍是 '1.1.0'，由 protocol 的 PROTOCOL_VERSION 决定）。 */
   version?: string
+  /** 插件版本（例如 '2.2.0'）；只用于展示，缺失时回退 version。 */
+  serverVersion?: string
   computerId?: string
   computerName?: string
   computerFingerprint?: string
@@ -130,6 +160,20 @@ export interface HelloAckLike {
   heartbeatMs?: number
   serverTime?: string
   endpoints?: unknown
+  /** 电脑端声明的能力（2.2.0 新增）。 */
+  capabilities?: unknown
+  /** 当前会话 id；协作模式切换会变。 */
+  sessionId?: string
+  /** 会话纪元：每次切换 +1。 */
+  sessionEpoch?: number
+  /** 电脑端事件日志的最大 seq（0 = 没有日志，只能拿快照）。 */
+  eventCursor?: number
+  /** 协作模式当前是否开启。 */
+  collaboration?: boolean
+  /** 电脑端当前使用的连接方式（展示用）。 */
+  connectionMode?: string
+  /** 带网络类型的地址列表（2.2.0 新增）。 */
+  endpointList?: unknown
 }
 
 export type HelloAckOutcome =
@@ -140,6 +184,14 @@ export type HelloAckOutcome =
       serverTime?: string
       /** 电脑端本次通告的地址（可能与库里不同，需并集更新）。 */
       endpoints: string[]
+      /** 电脑端理解的能力（缺省 = 没有能力，按老协议降级）。 */
+      capabilities: string[]
+      /** 当前会话信息（会随协作模式切换）。 */
+      sessionId?: string
+      sessionEpoch?: number
+      eventCursor?: number
+      collaboration?: boolean
+      connectionMode?: string
       patch: Partial<AssistantRecord>
     }
   | { ok: false; code: 'bad-ack' | 'not-paired' | 'pairing-refused' | 'wrong-computer' | 'fingerprint-mismatch' | 'not-authenticated-ack'; message: string }
@@ -189,18 +241,39 @@ export function interpretHelloAck(
     return { ok: false, code: 'pairing-refused', message: '电脑端拒绝了本次绑定，请重新生成二维码后再扫' }
   }
   // 电脑端可能通告新的隧道/局域网地址；与库里做并集，保留用户上次成功的地址。
-  const endpoints = normalizeEndpoints(ack.endpoints)
+  // 2.2.0 的 `endpointList` 带网络类型，但地址本身就是唯一键，这里只取 url。
+  const endpointListUrls = Array.isArray(ack.endpointList)
+    ? ack.endpointList
+        .map(item => (item && typeof item === 'object' ? (item as { url?: unknown }).url : item))
+        .filter(url => typeof url === 'string')
+    : []
+  const endpoints = normalizeEndpoints([...endpointListUrls, ...(Array.isArray(ack.endpoints) ? ack.endpoints : [])])
   const heartbeatMs = clampHeartbeat(ack.heartbeatMs)
+  const capabilities = Array.isArray(ack.capabilities)
+    ? ack.capabilities.filter((item): item is string => typeof item === 'string')
+    : []
+  const sessionId = typeof ack.sessionId === 'string' && ack.sessionId !== '' ? ack.sessionId : undefined
+  const sessionEpoch = typeof ack.sessionEpoch === 'number' && Number.isFinite(ack.sessionEpoch) ? ack.sessionEpoch : undefined
+  const eventCursor = typeof ack.eventCursor === 'number' && Number.isFinite(ack.eventCursor) ? Math.max(0, Math.floor(ack.eventCursor)) : undefined
   return {
     ok: true,
     heartbeatMs,
     serverTime: typeof ack.serverTime === 'string' ? ack.serverTime : undefined,
     endpoints,
+    capabilities,
+    sessionId,
+    sessionEpoch,
+    eventCursor,
+    collaboration: typeof ack.collaboration === 'boolean' ? ack.collaboration : undefined,
+    connectionMode: typeof ack.connectionMode === 'string' ? ack.connectionMode : undefined,
     patch: {
       online: true,
       lastConnectedAt: new Date(now).toISOString(),
       fingerprint: typeof ack.computerFingerprint === 'string' ? ack.computerFingerprint : expected.fingerprint,
-      serverVersion: typeof ack.version === 'string' ? ack.version : undefined,
+      // 展示用版本号：ack.serverVersion 是插件版本（2.2.0），ack.version 是协议版本（1.1.0）。
+      serverVersion:
+        (typeof ack.serverVersion === 'string' && ack.serverVersion) ||
+        (typeof ack.version === 'string' ? ack.version : undefined),
       ...(endpoints.length > 0 ? { endpoints } : {}),
     },
   }
@@ -225,6 +298,12 @@ export interface HelloInput {
   /** 已知设备时对 `helloSignatureMessage()` 的签名（base64url）。 */
   signature?: string
   protocolVersion?: string
+  /** 本 build 理解的能力（2.2.0）；不传就不带该字段，电脑端按老端处理。 */
+  capabilities?: string[]
+  /** 已应用到的会话事件序号（断点续传）；0/缺省表示要快照。 */
+  cursor?: number
+  /** 客户端认为自己在的会话 id（用于发现协作模式切换）。 */
+  sessionId?: string
 }
 
 export interface HelloFrame {
@@ -236,6 +315,9 @@ export interface HelloFrame {
   nonce: string
   pairSecret?: string
   signature?: string
+  capabilities?: string[]
+  cursor?: number
+  sessionId?: string
 }
 
 /**
@@ -259,6 +341,13 @@ export function buildHelloFrame(input: HelloInput): HelloFrame {
   }
   if (input.pairSecret) frame.pairSecret = input.pairSecret
   if (input.signature) frame.signature = input.signature
+  // 能力/游标/会话只在有值时带：老电脑端不认识它们也没关系（协议只增不改）。
+  const capabilities = Array.isArray(input.capabilities) ? input.capabilities.filter(item => typeof item === 'string' && item !== '') : []
+  if (capabilities.length > 0) frame.capabilities = capabilities
+  if (typeof input.cursor === 'number' && Number.isFinite(input.cursor) && input.cursor > 0) {
+    frame.cursor = Math.max(0, Math.floor(input.cursor))
+  }
+  if (typeof input.sessionId === 'string' && input.sessionId !== '') frame.sessionId = input.sessionId
   return frame
 }
 

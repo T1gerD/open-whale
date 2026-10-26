@@ -1,6 +1,6 @@
 {
   "name": "@openwhale/protocol",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Open Whale wire protocol + shared helpers (computer plugin and mobile app both depend on this).",
   "type": "module",

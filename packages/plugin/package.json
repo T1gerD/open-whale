@@ -1,7 +1,6 @@
 {
   "name": "dsh-openwhale",
-  "version": "2.1.0",
-  "private": true,
+  "version": "2.2.0",
   "description": "Open Whale — connect your phone to this computer's DeepSeek Harness as a personal-assistant chat, over LAN or the internet.",
   "type": "module",
   "main": "src/index.mjs",
@@ -27,5 +26,25 @@
     "sync:protocol": "node scripts/sync-protocol.mjs",
     "test": "node ../../scripts/run-tests.mjs packages/plugin"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/T1gerD/open-whale.git",
+    "directory": "packages/plugin"
+  },
+  "homepage": "https://github.com/T1gerD/open-whale#readme",
+  "bugs": {
+    "url": "https://github.com/T1gerD/open-whale/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "openwhale",
+    "open-whale",
+    "remote",
+    "mobile",
+    "assistant",
+    "tailscale"
+  ]
 }
