@@ -68,6 +68,23 @@ export function parsePairingPayload(value, options = {}) {
 }
 
 /**
+ * 短二维码里的配对密钥：`/openwhale/app?s=<secret>`。
+ *
+ * 二维码因此只有 ~90 个字符（iOS 相机一扫就中），网页端再向同源的
+ * `/openwhale/pairing.json` 兑换完整载荷，并校验密钥一致。
+ * @param {string} search `window.location.search`（可带可不带 `?`）
+ * @returns {string | undefined}
+ */
+export function bindingSecretFromSearch(search) {
+  const text = String(search ?? '').trim()
+  if (text === '') return undefined
+  const params = new URLSearchParams(text.startsWith('?') ? text.slice(1) : text)
+  const secret = params.get('s')
+  if (typeof secret !== 'string' || secret.length < 16 || secret.length > 200) return undefined
+  return secret
+}
+
+/**
  * 从 URL fragment / query 里取出 `p=<base64url>` 并解码；也接受整个 hash 就是
  * base64url 的简写（插件页面万一直接拼了裸值）。
  * @param {string} hashOrQuery 形如 `#p=xxx`、`?p=xxx` 或 `xxx`

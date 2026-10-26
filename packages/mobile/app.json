@@ -2,7 +2,7 @@
   "expo": {
     "name": "Open Whale",
     "slug": "open-whale",
-    "version": "2.2.0",
+    "version": "2.2.1",
     "orientation": "portrait",
     "scheme": "openwhale",
     "userInterfaceStyle": "automatic",
@@ -10,7 +10,7 @@
     "primaryColor": "#5b8cff",
     "android": {
       "package": "dev.openwhale.app",
-      "versionCode": 9,
+      "versionCode": 10,
       "permissions": [
         "android.permission.INTERNET",
         "android.permission.ACCESS_NETWORK_STATE",
@@ -19,7 +19,7 @@
     },
     "ios": {
       "bundleIdentifier": "dev.openwhale.app",
-      "buildNumber": "1",
+      "buildNumber": "2",
       "supportsTablet": false,
       "config": {
         "usesNonExemptEncryption": false

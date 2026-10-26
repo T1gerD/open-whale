@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { toBase64Url, utf8Encode } from '../lib/bytes.mjs'
 import {
   bindingFromPayload,
+  bindingSecretFromSearch,
   buildWebBindingUrl,
   candidatesForBinding,
   decodePayloadParam,
@@ -176,4 +177,19 @@ test('deviceNameFromUserAgent 覆盖鸿蒙 / iOS / Android / 桌面', () => {
   assert.equal(deviceNameFromUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64)'), '网页版 · Windows')
   assert.equal(deviceNameFromUserAgent('Mozilla/5.0 (X11; Linux x86_64)'), '网页版 · Linux')
   assert.equal(deviceNameFromUserAgent(''), '网页版 · 浏览器')
+})
+
+test('短二维码的 ?s= 密钥能被识别，长度不合理的拒绝', () => {
+  assert.equal(bindingSecretFromSearch('?s=THM4RrIHd1kf5WgFfNW8sZGma-_gUaAO0nSCEeOT-6k'), 'THM4RrIHd1kf5WgFfNW8sZGma-_gUaAO0nSCEeOT-6k')
+  assert.equal(bindingSecretFromSearch('s=abcdefghijklmnop'), 'abcdefghijklmnop')
+  assert.equal(bindingSecretFromSearch(''), undefined)
+  assert.equal(bindingSecretFromSearch('?x=1'), undefined)
+  assert.equal(bindingSecretFromSearch('?s=short'), undefined)
+  assert.equal(bindingSecretFromSearch('?s=' + 'a'.repeat(201)), undefined)
+})
+
+test('WEBCHAT_VERSION 与 webchat 包的版本号一致', async () => {
+  const { WEBCHAT_VERSION } = await import('../lib/protocol.mjs')
+  const pkg = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(WEBCHAT_VERSION, pkg.version)
 })

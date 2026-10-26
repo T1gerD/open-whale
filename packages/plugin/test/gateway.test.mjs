@@ -13,7 +13,7 @@ import {
   helloAckProofMessage,
   helloSignatureMessage,
 } from '../src/protocol.mjs'
-import { Gateway, WS_PATH } from '../src/gateway.mjs'
+import { Gateway, PLUGIN_VERSION, WS_PATH } from '../src/gateway.mjs'
 import { StateStore } from '../src/state.mjs'
 
 /** A bridge that records calls and lets tests inject events. */
@@ -282,6 +282,35 @@ test('the binding page shows fingerprint and addresses', async t => {
   assert.match(html, /Open Whale/)
   assert.match(html, /192\.168\.1\.9:8787/)
   assert.ok(html.includes(store.fingerprint.slice(0, 4).toUpperCase()))
+})
+
+test('PLUGIN_VERSION matches the shipped package.json version', () => {
+  // v2.2.0 的发布踩过：发版只改了 package.json，gateway 里硬编码的 PLUGIN_VERSION
+  // 忘了改，health/hello-ack 仍报旧版本。这条测试把两者钉在一起。
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(PLUGIN_VERSION, pkg.version)
+})
+
+test('the binding page offers one short web QR per address, LAN first', async t => {
+  const { gateway, port } = await makeGateway({
+    lanUrls: ['http://192.168.1.9:8787', 'http://100.102.90.23:8787'],
+  })
+  t.after(() => gateway.close())
+  const pairing = await (await fetch(`http://127.0.0.1:${port}/openwhale/pairing.json`)).json()
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
+
+  // iOS 之前的失败：二维码只给了一个地址（通常是 Tailscale），且**没有**绑定参数。
+  // 现在每个地址一个二维码，链接里带一次性 secret，扫码即绑定。
+  const entries = html.split('<div class="web-entry">').length - 1
+  assert.equal(entries, 2, 'one web QR per reachable address')
+  const lanAt = html.indexOf('局域网（同一 Wi-Fi）')
+  const tsAt = html.indexOf('Tailscale（外网）')
+  assert.ok(lanAt >= 0 && tsAt >= 0, 'each entry is labelled with its network path')
+  assert.ok(lanAt < tsAt, 'LAN must be listed before Tailscale')
+  assert.ok(html.includes('192.168.1.9:8787/openwhale/app'), 'LAN address is shown')
+  assert.ok(html.includes('100.102.90.23:8787/openwhale/app'), 'Tailscale address is shown')
+  assert.equal(html.includes(pairing.payload.secret), false, 'the secret stays inside the QR, not in page text')
+  assert.equal(html.includes('#p='), false, 'no dense payload QR is needed for the web client any more')
 })
 
 test('qr routes refuse to mint a code when no endpoint exists', async t => {
@@ -1488,7 +1517,7 @@ test('connection-mode reports detected endpoint kinds and the QR follows it', as
   assert.deepEqual(pairing.payload.epk, ['t'])
   assert.equal(pairing.payload.mode, 'tailscale')
   assert.equal(pairing.payload.web, 'http://100.88.1.2:8787/openwhale/app')
-  assert.equal(pairing.payload.version, '2.2.0')
+  assert.equal(pairing.payload.version, PLUGIN_VERSION)
 })
 
 test('hello/ack advertises capabilities, the conversation and classified endpoints', async t => {
@@ -1504,7 +1533,7 @@ test('hello/ack advertises capabilities, the conversation and classified endpoin
   const { client, ack } = await pairDevice(port, device)
 
   assert.equal(ack.version, '1.1.0', 'version keeps meaning the wire-protocol version')
-  assert.equal(ack.serverVersion, '2.2.0')
+  assert.equal(ack.serverVersion, PLUGIN_VERSION)
   assert.ok(Array.isArray(ack.capabilities))
   assert.ok(ack.capabilities.includes(CAPABILITIES.CHAT_ECHO))
   assert.ok(ack.capabilities.includes(CAPABILITIES.UPLOAD))
@@ -1527,7 +1556,7 @@ test('health and info expose version, collaboration, connection mode and kinds',
   store.setPreference('collaboration', true)
   store.setPreference('connectionMode', 'lan')
   const health = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
-  assert.equal(health.version, '2.2.0')
+  assert.equal(health.version, PLUGIN_VERSION)
   assert.equal(health.collaboration, true)
   assert.equal(health.connectionMode, 'lan')
   assert.deepEqual(health.endpoints, [{ url: 'http://192.168.1.9:8787', kind: 'lan' }])
@@ -1536,7 +1565,7 @@ test('health and info expose version, collaboration, connection mode and kinds',
   assert.equal(typeof health.connections, 'number')
 
   const info = await (await fetch(`http://127.0.0.1:${port}/openwhale/info`)).json()
-  assert.equal(info.version, '2.2.0')
+  assert.equal(info.version, PLUGIN_VERSION)
   assert.equal(info.connectionMode, 'lan')
   assert.equal(Array.isArray(info.endpoints), true)
   assert.equal(typeof info.endpoints[0].kind, 'string')
@@ -1546,7 +1575,7 @@ test('the binding page carries the 2.2.0 features the user has to see', async t 
   const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
   t.after(() => gateway.close())
   const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
-  assert.match(html, /2\.2\.0/)
+  assert.match(html, /Open Whale 2\.2\.\d/)
   assert.match(html, /连接方式/)
   assert.match(html, /Tailscale/)
   assert.match(html, /局域网/)

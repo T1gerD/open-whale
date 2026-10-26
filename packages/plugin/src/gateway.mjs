@@ -70,7 +70,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '2.2.0'
+export const PLUGIN_VERSION = '2.2.1'
 
 /**
  * How many concurrent sessions one device may hold.
@@ -506,9 +506,16 @@ export class Gateway {
       const qr = payload.ok && local ? await renderPairingQr(payload.payload) : null
       const endpoints = this.#reachableEndpoints()
       const webUrl = this.#webClientUrl(endpoints)
-      const webQr = local && webUrl && this.webClient.available() ? await renderQrContent(webUrl) : null
+      // 网页版二维码必须**按地址分开生成**，并且**带上一次性的 #p= 绑定载荷**：
+      //  · 只给一个地址时（v2.2.0）用的是排序第一的地址——通常是 Tailscale 的
+      //    100.x，没装/没连 Tailscale 的 iPhone 根本打不开页面；
+      //  · 二维码里没有 #p= 时，页面只能停在「粘贴链接」这一步，扫码不能直接绑定。
+      // 局域网放最前（同一 Wi-Fi 最常见），其次 Tailscale，最后公网隧道。
+      const webEntries = local && payload.ok && this.webClient.available()
+        ? await this.#webBindingEntries(endpoints, payload.payload)
+        : []
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-      res.end(this.#pageHtml({ payload, qr, webQr, webUrl, endpoints, local }))
+      res.end(this.#pageHtml({ payload, qr, webEntries, webUrl, endpoints, local }))
       return true
     }
 
@@ -1751,6 +1758,57 @@ export class Gateway {
   }
 
   /**
+   * Web/PWA binding entries: one QR per reachable address, each carrying the
+   * one-time pairing payload in the URL fragment (`#p=...`).
+   *
+   * Why every address instead of one: v2.2.0 only rendered the first endpoint,
+   * which in `auto` mode is usually the Tailscale `100.x` address — an iPhone
+   * without Tailscale connected therefore could not open the page at all
+   * (reported as "iOS 扫第二个二维码打不开网页"). LAN is listed first because
+   * "same Wi-Fi" is the common case; Tailscale and the tunnel follow.
+   *
+   * @param {Array<{url: string, kind: string}>} endpoints
+   * @param {any} payload
+   * @returns {Promise<Array<{kind: string, label: string, url: string, qr: any}>>}
+   */
+  async #webBindingEntries(endpoints, payload) {
+    const order = { lan: 0, tailscale: 1, tunnel: 2, unknown: 3 }
+    const labels = { lan: '局域网（同一 Wi-Fi）', tailscale: 'Tailscale（外网）', tunnel: '公网隧道', unknown: '其它地址' }
+    const entries = []
+    const seen = new Set()
+    for (const endpoint of endpoints) {
+      if (!endpoint || typeof endpoint.url !== 'string' || endpoint.kind === 'loopback') continue
+      let url
+      try {
+        // Short, scannable URL: the web client redeems `?s=<pairing secret>`
+        // against the same-origin `/openwhale/pairing.json` and verifies that the
+        // secret matches before using the payload. Embedding the whole payload
+        // (`#p=`, ~850 chars) produced a QR that iOS Camera struggles to read and
+        // made the "just scan it" flow depend on a very dense code.
+        const parsed = new URL(WEB_CLIENT_PATH, endpoint.url)
+        parsed.searchParams.set('s', String(payload.secret))
+        url = parsed.toString()
+      } catch {
+        continue
+      }
+      if (seen.has(url)) continue
+      seen.add(url)
+      try {
+        entries.push({
+          kind: endpoint.kind,
+          label: labels[endpoint.kind] ?? endpoint.kind,
+          url,
+          qr: await renderQrContent(url),
+        })
+      } catch {
+        // A QR that cannot be generated must never take the whole page down.
+      }
+    }
+    entries.sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9))
+    return entries.slice(0, 3)
+  }
+
+  /**
    * The exact payload the QR encodes. Shared by the QR routes, the page and the
    * `/openwhale` command so they can never disagree.
    * @returns {{ok: true, payload: any} | {ok: false, reason: string, message: string}}
@@ -2063,10 +2121,10 @@ export class Gateway {
   // ---------------------------------------------------------------------------
 
   /**
-   * @param {{payload: any, qr: any, webQr: any, webUrl: string | undefined, endpoints: Array<{url: string, kind: string}>, local: boolean}} view
+   * @param {{payload: any, qr: any, webEntries: Array<{kind: string, label: string, url: string, qr: any}>, webUrl: string | undefined, endpoints: Array<{url: string, kind: string}>, local: boolean}} view
    */
   #pageHtml(view) {
-    const { payload, qr, webQr, webUrl, endpoints, local } = view
+    const { payload, qr, webEntries, webUrl, endpoints, local } = view
     const collaboration = this.collaboration()
     const mode = this.#mode()
     const report = this.connectionModeReport()
@@ -2140,12 +2198,19 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
     </div>
     <div class="card">
       <h2>网页版 / PWA</h2>
-      ${webUrl ? `
-        ${webQr ? `<div class="qr">${webQr.svg}</div>` : '<p class="hint">二维码只在本机浏览器显示。</p>'}
-        <p>手机浏览器打开：<br><code>${escapeHtml(webUrl)}</code></p>
+      ${webEntries.length > 0 ? `
+        <p class="hint">扫哪个用哪条线路：同一 Wi-Fi 选「局域网」；外网且手机装了 Tailscale 选「Tailscale」。扫码会自动打开网页版并完成绑定。</p>
+        ${webEntries.map(entry => `
+          <div class="web-entry">
+            <p><b>${escapeHtml(entry.label)}</b> <span class="tag">${escapeHtml(entry.url.replace(/[?#].*$/, ''))}</span></p>
+            <div class="qr">${entry.qr.svg}</div>
+          </div>`).join('')}
         <p class="hint">${this.webClient.available()
-          ? '鸿蒙 / iOS / 任意浏览器可用；添加到主屏幕即为 PWA。'
+          ? '鸿蒙 / iOS / 任意浏览器可用；添加到主屏幕即为 PWA。iPhone 第一次访问局域网地址会询问「本地网络」权限，请选「允许」。'
           : '网页版客户端还没有打包进插件（缺少 webchat 目录）。'}</p>
+      ` : webUrl ? `
+        <p>手机浏览器打开：<br><code>${escapeHtml(webUrl)}</code></p>
+        <p class="hint">二维码只在本机浏览器显示。</p>
       ` : '<p class="hint">还没有可用地址，无法生成网页版入口。</p>'}
     </div>
   </div>

@@ -18,7 +18,7 @@
 ## 1. 发布前门禁（必须全绿才打 tag）
 
 ```bash
-node scripts/run-tests.mjs                 # 43 文件 / 656 项（2.2.0 基线）
+node scripts/run-tests.mjs                 # 43 文件 / 656+ 项（2.2.1 基线）
 node packages/mobile/scripts/check-syntax.mjs
 node packages/plugin/scripts/sync-protocol.mjs --check
 node scripts/build-plugin-package.mjs --check
@@ -28,7 +28,7 @@ node scripts/build-plugin-package.mjs --check
 
 ```bash
 set DSH_HOME=C:\temp\ow-e2e
-dsh plugin --profile e2e add .\release\dsh-openwhale-2.2.0.tgz
+dsh plugin --profile e2e add .\release\dsh-openwhale-2.2.1.tgz
 dsh --profile e2e --no-open --port 3987
 node scripts/verify-install.mjs http://127.0.0.1:3987
 ```
@@ -39,20 +39,20 @@ Ed25519 绑定与 hello/ack 签名 / 能力协商 / 会话快照 / 幂等重发�
 ## 2. 打 tag 与发布（GitHub Actions 完成构建）
 
 ```bash
-git tag v2.2.0
+git tag v2.2.1
 git push origin main
-git push origin v2.2.0
+git push origin v2.2.1
 ```
 
 - `tests` 工作流：三平台（ubuntu / windows / macos）× Node 22/24 跑全部测试与协议副本检查。
 - `release` 工作流：在 tag 上构建
-  - `dsh-openwhale-2.2.0.tgz` + 固定名 `dsh-openwhale.tgz`（插件，含网页版）
-  - `open-whale-2.2.0.apk` + 固定名 `open-whale.apk`（debug keystore 签名的 arm64 包装配包）
+  - `dsh-openwhale-2.2.1.tgz` + 固定名 `dsh-openwhale.tgz`（插件，含网页版）
+  - `open-whale-2.2.1.apk` + 固定名 `open-whale.apk`（debug keystore 签名的 arm64 包装配包）
   - `SHA256SUMS.txt`，并创建 GitHub Release（release body 取 `CHANGELOG.md`）
 - `ios` 工作流：手动触发或 tag 时构建**未签名模拟器 .app**（真机/TestFlight 需要 Apple 账号走 EAS）。
 
 > 本机没有 JDK / Android SDK，**不要**尝试本地出 APK；CI 是唯一构建通道。
-> 如果 tag 需要重打：`git tag -f v2.2.0 && git push -f origin v2.2.0`。
+> 如果 tag 需要重打：`git tag -f v2.2.1 && git push -f origin v2.2.1`。
 
 ## 3. npm 发布
 

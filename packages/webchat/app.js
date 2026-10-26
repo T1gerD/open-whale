@@ -31,6 +31,7 @@ import {
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
+  bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
 } from './lib/pairing.mjs'
@@ -437,11 +438,33 @@ function showRecognizedPayload(payload, options = {}) {
 }
 
 /** 从 URL fragment 取绑定载荷（插件页面二维码 → 扫码打开本页）。 */
-function payloadFromLocation() {
+async function payloadFromLocation() {
   const hash = window.location.hash ?? ''
-  if (!hash || !hash.includes('p=')) return undefined
-  const parsed = parsePairingInput(hash)
-  return parsed.ok ? { payload: parsed.payload } : { error: parsed.error }
+  if (hash && hash.includes('p=')) {
+    const parsed = parsePairingInput(hash)
+    return parsed.ok ? { payload: parsed.payload } : { error: parsed.error }
+  }
+  // 短二维码：`/openwhale/app?s=<一次性配对密钥>`。页面与插件同源，直接向
+  // `/openwhale/pairing.json` 取当前载荷，并校验密钥一致才信任——这样二维码只有
+  // 90 来个字符（iOS 相机一扫就中），又不需要把整段载荷塞进二维码。
+  const secret = bindingSecretFromSearch(window.location.search)
+  if (!secret) return undefined
+  try {
+    const response = await fetch('/openwhale/pairing.json', { cache: 'no-store' })
+    const body = await response.json().catch(() => undefined)
+    const payload = body?.payload ?? body
+    if (!response.ok || !payload) {
+      return { error: '这台电脑暂时没有可用的绑定信息：请在电脑上刷新配对页后重新扫码。' }
+    }
+    if (String(payload.secret) !== secret) {
+      return { error: '这个二维码已过期或已被使用：请在电脑上刷新配对页后重新扫码。' }
+    }
+    // 密钥只用于这一次兑换，立即从地址栏去掉，避免刷新时重复使用。
+    history.replaceState(null, '', window.location.pathname)
+    return { payload }
+  } catch {
+    return { error: '无法读取绑定信息（网络或本地网络权限问题）：请在电脑上刷新配对页后重试。' }
+  }
 }
 
 /** 用户输入 / 扫码 / URL 都汇聚到这里。 */
@@ -1949,8 +1972,8 @@ function setupLifecycleEvents() {
       state.connection.reconnect()
     }
   })
-  window.addEventListener('hashchange', () => {
-    const result = payloadFromLocation()
+  window.addEventListener('hashchange', async () => {
+    const result = await payloadFromLocation()
     if (!result) return
     if (result.error) {
       showView('bind')
@@ -2002,7 +2025,7 @@ async function boot() {
     return
   }
 
-  const fromLocation = payloadFromLocation()
+  const fromLocation = await payloadFromLocation()
   if (fromLocation?.payload) {
     showView('bind')
     setBindStatus('已从二维码读取绑定信息，正在连接…', 'busy')

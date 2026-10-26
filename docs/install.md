@@ -202,6 +202,9 @@ node scripts/verify-install.mjs http://127.0.0.1:<端口>
 | 重启后手机能连上但收不到之前的消息 | 电脑端事件日志只保留最近 400 条、快照 60 条；超出窗口会推全量快照而不是补发。长时间离线属正常 |
 | 二维码扫了但提示已过期 | 10 分钟窗口过了，重新生成 |
 | 手机提示连不上 | 先确认同网段、防火墙放行；再看 `/openwhale/info` 的 endpoints 是否包含手机能访问的地址（`127.0.0.1` 只能本机用） |
+| **iPhone / 网页版扫「第二个二维码」打不开网页**（v2.2.0 已知问题，v2.2.1 已修） | v2.2.0 的网页版二维码只用了排序第一的地址（通常是 Tailscale `100.x`），且不带绑定参数。v2.2.1 起配对页会**按地址各给一个二维码**：同一 Wi-Fi 选「局域网」，外网且两端都登录 Tailscale 选「Tailscale」，只有隧道时选「公网隧道」。扫码即自动绑定（短链接 `?s=`，约 90 字符） |
+| iPhone 第一次打开局域网地址失败 | iOS 14+ 首次访问 `192.168.x` 会弹「本地网络」权限，选「允许」；如果误点了拒绝，到 设置 → 隐私与安全性 → 本地网络 里把浏览器打开 |
+| 手机能打开配对页但连不上电脑 | 检查 Windows 防火墙是否放行插件端口（默认 TCP 8787）：`netsh advfirewall firewall add rule name="Open Whale (TCP 8787)" dir=in action=allow protocol=TCP localport=8787`（管理员）。DSH 桌面程序通常已有入站放行规则，但换机器/重装后可能缺失 |
 | 手机能连上但收不到回复 | 先看 `$DSH_HOME/openwhale/openwhale.log`。常见原因是电脑上的 DSH 账号失效，或 profile 里没有配置默认模型（手机会话需要一个可用的 provider/model；插件会依次从默认模型服务、profile 的 `agent-default-model`、活跃会话、本插件 `agentOptions` 里找） |
 | 隧道地址变了 | 快速隧道的固有行为。手机端会轮换重连；若仍失败，重新生成二维码绑定，或改用组网方案 |
 | 关机/重启没反应 | 确认 `allowRemoteShutdown: true`；非交互会话可能缺少关机权限，见 [remote-power.md](remote-power.md) |

@@ -90,9 +90,9 @@ open-whale/
 
 | 文件 | 装到哪 | 怎么装 |
 |---|---|---|
-| `dsh-openwhale-2.2.0.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-2.2.0.tgz`，然后重启 DSH |
+| `dsh-openwhale-2.2.1.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-2.2.1.tgz`，然后重启 DSH |
 | `dsh-openwhale.tgz` | 电脑 | 同上（固定名字的别名，脚本里用方便） |
-| `open-whale-2.2.0.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
+| `open-whale-2.2.1.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
 | `open-whale.apk` | 安卓手机 | 同上（固定名字的别名） |
 
 插件也发布在 npm 上，可以按包名安装（升级时 `dsh plugin` 的 `update` 同样适用）：
@@ -107,7 +107,7 @@ keystore 签名，**适合个人自用安装**；要出正式签名的包见 [do
 自己打包插件：
 
 ```bash
-node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-2.2.0.tgz（含网页版）
+node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-2.2.1.tgz（含网页版）
 node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（npm publish 用）
 ```
 
@@ -120,7 +120,7 @@ node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（np
 从 Release 的 tarball 或 npm 安装：
 
 ```bash
-dsh plugin --profile desktop add ./dsh-openwhale-2.2.0.tgz
+dsh plugin --profile desktop add ./dsh-openwhale-2.2.1.tgz
 # 或者
 dsh plugin --profile desktop add dsh-openwhale
 ```
@@ -222,7 +222,7 @@ dsh plugin --profile desktop add ./packages/plugin
 
 ```bash
 cd open-whale
-node scripts/run-tests.mjs          # 全部：43 个测试文件 / 656 项测试（v2.2.0 基线）
+node scripts/run-tests.mjs          # 全部：43 个测试文件 / 656 项测试（v2.2.1 基线）
 node scripts/run-tests.mjs qr       # 只跑文件名含 "qr" 的
 node packages/mobile/scripts/check-syntax.mjs   # 手机端 TS 语法检查
 ```

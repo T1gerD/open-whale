@@ -1,7 +1,7 @@
 {
   "name": "open-whale",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "手机上的个人助理，远程使用电脑上的 DeepSeek Harness —— DSH 插件 + Expo 手机应用 + 鸿蒙/iOS 可用的网页版",
   "type": "module",
   "scripts": {

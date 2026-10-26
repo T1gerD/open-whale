@@ -1,6 +1,6 @@
 {
   "name": "@openwhale/mobile",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "description": "Open Whale 手机端：扫码绑定电脑上的 dsh-openwhale 插件，以个人助理聊天的方式远程使用 DSH。",
   "main": "expo-router/entry",
