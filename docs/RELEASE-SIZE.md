@@ -5,8 +5,10 @@
 > **v2.2.0 更新**：`packages/mobile/android/` 是 `.gitignore` 里的 prebuild 产物，手工改它
 > 不会被 CI 继承——v2.2.0 首次 CI 构建又回到了 126 MB。现在这些设置由
 > [`packages/mobile/plugins/withReleaseSize.js`](../packages/mobile/plugins/withReleaseSize.js)
-> 这个 config plugin 在 prebuild 阶段写入（gradle properties + release 的 `abiFilters` +
-> proguard keep 规则），**源码即事实来源**，本地与 CI 行为一致。下面保留 v2.1.0 的手工步骤
+> 这个 config plugin 在 prebuild 阶段写入（gradle properties 含 `reactNativeArchitectures=arm64-v8a`、
+> release 的 `abiFilters`、R8 开关与 keep 规则），**源码即事实来源**，本地与 CI 行为一致。
+> 注意只写 `abiFilters` 不够：实测 CI 产物仍带 4 个 ABI（lib 合计 101 MB），必须同时设置
+> `reactNativeArchitectures`。下面保留 v2.1.0 的手工步骤
 > 作为历史记录与对照。
 
 ## 最终配置

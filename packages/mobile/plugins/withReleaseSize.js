@@ -19,10 +19,15 @@ const { join } = require('node:path')
 /** 该插件对 app/build.gradle 的期望改动，导出以便测试断言。 */
 const RELEASE_ABI_FILTERS = 'arm64-v8a'
 
-/** 需要打开的 gradle properties（键 → 值）。 */
+/** 需要写入的 gradle properties（键 → 值）。 */
 const RELEASE_GRADLE_PROPERTIES = {
   'android.enableMinifyInReleaseBuilds': 'true',
   'android.enableShrinkResourcesInReleaseBuilds': 'true',
+  // 关键：RN/Expo 的 native 库按这个属性决定**打包哪些 ABI**。只写
+  // buildType.release.ndk.abiFilters 是不够的 —— 实测 CI 产物仍然带全部 4 个 ABI
+  // （lib 合计 101 MB）。这个属性同时决定编译与打包的 ABI 集合。
+  // 代价：debug 包也只剩 arm64，x86_64 模拟器需要时临时改回。
+  reactNativeArchitectures: 'arm64-v8a',
 }
 
 /**

@@ -56,9 +56,10 @@
 
 ### 优化
 
-- **安装包重新瘦身**：新增 `plugins/withReleaseSize.js` config plugin，把「只发布 arm64 +
-  R8/资源裁剪 + R8 keep 规则」写进 prebuild 生成工程。此前 `android/` 不进仓库，CI 重新
-  prebuild 会丢掉这些手工设置（首次 CI 构建的通用包 = 126 MB）；现在源码即事实来源。
+- **安装包重新瘦身**：新增 `plugins/withReleaseSize.js` config plugin，把「只发布 arm64
+  （`reactNativeArchitectures=arm64-v8a`）+ R8/资源裁剪 + R8 keep 规则」写进 prebuild 生成工程。
+  此前 `android/` 不进仓库，CI 重新 prebuild 会丢掉这些手工设置（首次 CI 构建的通用包 =
+  126 MB、lib 带 4 个 ABI 合计 101 MB）；现在源码即事实来源，CI 与本地一致。
 - 手机端分块上传/流式下载、连接竞速、会话事件日志都做了内存与背压上限，避免大文件/长会话
   把手机或电脑拖垮。
 
