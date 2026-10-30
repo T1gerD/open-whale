@@ -15,11 +15,14 @@
  * 1.3.0（v2.4.0「会话标签页」）新增 `session/watch` / `session/snapshot`
  * （`session-tabs-v1`），并让会话帧都带 `sessionId`：手机/网页可以同时让多个
  * 会话保持在线——就像 DSH 桌面的侧边栏。老客户端不认新帧会自动忽略，反之亦然。
+ *
+ * 3.0.0：全仓库版本号统一（产品、插件、网页版、协议都标 3.0.0），线上帧格式与
+ * 1.3.0 逐字节一致，只改了版本字符串。
  */
-export const PROTOCOL_VERSION = '1.3.0'
+export const PROTOCOL_VERSION = '3.0.0'
 
 /** 网页版客户端自身的版本号（与产品版本一致，显示在「关于」里）。 */
-export const WEBCHAT_VERSION = '2.4.1'
+export const WEBCHAT_VERSION = '3.0.0'
 
 /** 能力协商标记（hello / hello/ack 的 capabilities）。 */
 export const CAPABILITIES = Object.freeze({

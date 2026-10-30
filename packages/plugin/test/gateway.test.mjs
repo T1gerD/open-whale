@@ -1786,7 +1786,7 @@ test('hello/ack advertises capabilities, the conversation and classified endpoin
   const device = freshDevice()
   const { client, ack } = await pairDevice(port, device)
 
-  assert.equal(ack.version, '1.3.0', 'version keeps meaning the wire-protocol version')
+  assert.equal(ack.version, '3.0.0', 'version keeps meaning the wire-protocol version')
   assert.equal(ack.serverVersion, PLUGIN_VERSION)
   assert.ok(Array.isArray(ack.capabilities))
   assert.ok(ack.capabilities.includes(CAPABILITIES.CHAT_ECHO))
@@ -1830,7 +1830,7 @@ test('the binding page carries the v2.3.0 features the user has to see', async t
   const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
   t.after(() => gateway.close())
   const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
-  assert.match(html, /Open Whale 2\.4\.\d/)
+  assert.match(html, /Open Whale 3\.0\.\d/)
   assert.match(html, /连接方式/)
   assert.match(html, /Tailscale/)
   assert.match(html, /局域网/)

@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: c394debfe804540299074362db622ce23ffb843821800911ffad56d64b7b71ca
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: bfb5d40a8065f81fb5022d2e23598978457146a6475f3edfc231c637ebd1c0ca
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -44,8 +44,13 @@
  * to live activity for the sessions whose tabs are open, `session/snapshot`
  * fetches one tab's state without making it active, and every conversation frame
  * now carries its `sessionId` so a client can route it to the right tab.
+ *
+ * 3.0.0 is the release that unified every version string in this repository
+ * (packages, plugin, mobile app, webchat and this wire contract) on `3.0.0`.
+ * The wire format is byte-for-byte the 1.3.0 one — no frame was added, removed
+ * or changed — so a 2.4 client still connects; only the version label moved.
  */
-export const PROTOCOL_VERSION = '1.3.0'
+export const PROTOCOL_VERSION = '3.0.0'
 
 /**
  * Feature flags exchanged in `hello` / `hello/ack`.

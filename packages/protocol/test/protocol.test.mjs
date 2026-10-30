@@ -370,9 +370,9 @@ test('activity kinds are stable identifiers the app can switch on', () => {
 // v1.2.0 / 2.3.0: "remote control only" — collaboration out, sessions + approval in
 // ---------------------------------------------------------------------------
 
-test('2.3.0 keeps the protocol at 1.x so a 2.2 phone still connects', () => {
-  assert.equal(PROTOCOL_VERSION.split('.')[0], '1')
-  assert.equal(PROTOCOL_VERSION, '1.3.0')
+test('3.0.0 is the unified version label for protocol and packages', () => {
+  assert.equal(PROTOCOL_VERSION.split('.')[0], '3')
+  assert.equal(PROTOCOL_VERSION, '3.0.0')
 })
 
 test('collaboration capabilities are gone and the session ones are present', () => {

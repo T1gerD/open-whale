@@ -73,7 +73,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '2.4.1'
+export const PLUGIN_VERSION = '3.0.0'
 
 /**
  * How many concurrent sessions one device may hold.

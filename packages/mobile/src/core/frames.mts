@@ -131,7 +131,7 @@ export const DEFAULT_PORT = 8787
 export const UPLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
 
 /** 协议版本，镜像 `PROTOCOL_VERSION`（由 frames 测试核对）。 */
-export const PROTOCOL_VERSION = '1.3.0'
+export const PROTOCOL_VERSION = '3.0.0'
 
 /** 心跳默认值，镜像 `DEFAULT_HEARTBEAT_MS`。 */
 export const DEFAULT_HEARTBEAT_MS = 25_000

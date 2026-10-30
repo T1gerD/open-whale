@@ -82,7 +82,7 @@ test('buildHello 首次绑定带 pairSecret，重连带签名与 cursor/sessionI
   assert.equal(first.devicePublicKey, identity.publicKeySpkiB64)
   assert.equal(first.pairSecret, 'pair-secret')
   assert.equal(first.signature, undefined)
-  assert.match(first.version, /^1\./)
+  assert.match(first.version, /^3\.0\./)
   assert.ok(Array.isArray(first.capabilities) && first.capabilities.includes('chat-message-v1'))
 
   const nonce = newNonce()

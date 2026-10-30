@@ -36,8 +36,13 @@
  * to live activity for the sessions whose tabs are open, `session/snapshot`
  * fetches one tab's state without making it active, and every conversation frame
  * now carries its `sessionId` so a client can route it to the right tab.
+ *
+ * 3.0.0 is the release that unified every version string in this repository
+ * (packages, plugin, mobile app, webchat and this wire contract) on `3.0.0`.
+ * The wire format is byte-for-byte the 1.3.0 one — no frame was added, removed
+ * or changed — so a 2.4 client still connects; only the version label moved.
  */
-export const PROTOCOL_VERSION = '1.3.0'
+export const PROTOCOL_VERSION = '3.0.0'
 
 /**
  * Feature flags exchanged in `hello` / `hello/ack`.

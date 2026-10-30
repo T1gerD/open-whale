@@ -146,9 +146,9 @@ function normalizeConnectionModeInput(mode: unknown): string {
 /** `hello/ack` 里我们真正要用的字段（其余字段宽容忽略）。 */
 export interface HelloAckLike {
   t?: string
-  /** 协议版本（1.2.0，由 protocol 的 PROTOCOL_VERSION 决定）。 */
+  /** 协议版本（3.0.0 起与产品版本统一，由 protocol 的 PROTOCOL_VERSION 决定）。 */
   version?: string
-  /** 插件版本（例如 '2.3.0'）；只用于展示，缺失时回退 version。 */
+  /** 插件版本（例如 '3.0.0'）；只用于展示，缺失时回退 version。 */
   serverVersion?: string
   computerId?: string
   computerName?: string
@@ -266,7 +266,7 @@ export function interpretHelloAck(
       online: true,
       lastConnectedAt: new Date(now).toISOString(),
       fingerprint: typeof ack.computerFingerprint === 'string' ? ack.computerFingerprint : expected.fingerprint,
-      // 展示用版本号：ack.serverVersion 是插件版本（2.3.0），ack.version 是协议版本（1.2.0）。
+      // 展示用版本号：ack.serverVersion 是插件版本（3.0.0），ack.version 是协议版本（3.0.0）。
       serverVersion:
         (typeof ack.serverVersion === 'string' && ack.serverVersion) ||
         (typeof ack.version === 'string' ? ack.version : undefined),

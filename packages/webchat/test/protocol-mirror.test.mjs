@@ -55,8 +55,8 @@ test('lib/protocol.mjs 的常量与真实 protocol 逐项一致', () => {
   }
 })
 
-test('协议版本已跟到冻结的 1.3.0（v2.4.0 会话标签页）', () => {
-  assert.equal(mirror.PROTOCOL_VERSION, '1.3.0')
+test('协议版本已跟到冻结的 3.0.0（与 packages/protocol 一致）', () => {
+  assert.equal(mirror.PROTOCOL_VERSION, '3.0.0')
   assert.equal(mirror.PROTOCOL_VERSION, real.PROTOCOL_VERSION)
   assert.equal(mirror.CAPABILITIES.SESSIONS, 'sessions-v1')
   assert.equal(mirror.CAPABILITIES.APPROVAL, 'approval-v1')

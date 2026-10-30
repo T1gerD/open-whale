@@ -27,7 +27,7 @@ iOS Safari、任意手机浏览器都能用）。网页版由本插件自己提�
 从 Release 的 tarball 安装：
 
 ```bash
-dsh plugin --profile <你的profile> add ./dsh-openwhale-2.3.0.tgz
+dsh plugin --profile <你的profile> add ./dsh-openwhale-3.0.0.tgz
 ```
 
 （npm 上的 `dsh-openwhale` 尚未发布，暂不要按包名安装。）
@@ -39,7 +39,7 @@ dsh plugin --profile <你的profile> add ./dsh-openwhale-2.3.0.tgz
 
 - **协作模式整体删除**：共享会话、在线成员、消息昵称前缀、手机端昵称设置都没有了。
   一台手机始终只驱动它当前绑定的那个 DSH 会话。
-- **会话选择 / 新建**：`session/list` / `session/select` / `session/create`（协议 1.2.0）。
+- **会话选择 / 新建**：`session/list` / `session/select` / `session/create`（协议 3.0.0）。
 - **手机审批**：`approval/ask` / `approval/reply` / `approval/resolved`，超时自动交回桌面。
 - **二维码入口**：删掉聊天输入框「+」里的 `/openwhale` 命令，改为客户端插件页
   （`lib/client.js` + `dsh.client`，内嵌配对页 + 「在浏览器中打开」）。
