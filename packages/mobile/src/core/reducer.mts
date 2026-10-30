@@ -151,6 +151,8 @@ export interface ChatState {
   sessionId?: string
   /** 会话纪元：每次切换 +1。 */
   sessionEpoch?: number
+  /** 会话标题（电脑端在 session/state 里给；标签条优先用它）。 */
+  title?: string
   /** 已应用到的会话事件序号（断点续传游标）。 */
   sessionCursor: number
   /** 电脑端给的会话列表（session/list 的回复）。 */
@@ -181,9 +183,18 @@ export type ChatEffect =
 /** 服务端帧事件（字段与 protocol 一致；未知帧在服务层就被过滤掉了）。 */
 export type WireEvent =
   | { t: 'chat/ack'; rid?: string; msgId?: string; callId?: string; cancelled?: boolean; duplicate?: boolean; at?: number }
-  | { t: 'chat/delta'; callId: string; seq: number; text: string; at?: number }
+  | {
+      t: 'chat/delta'
+      /** 哪个会话的增量（1.3.0 标签路由；旧电脑端没有这个字段）。 */
+      sessionId?: string
+      callId: string
+      seq: number
+      text: string
+      at?: number
+    }
   | {
       t: 'chat/done'
+      sessionId?: string
       callId: string
       text: string
       truncated?: boolean
@@ -194,6 +205,7 @@ export type WireEvent =
     }
   | {
       t: 'chat/tool'
+      sessionId?: string
       callId: string
       phase: 'tool-start' | 'tool-end'
       toolCallId: string
@@ -203,11 +215,12 @@ export type WireEvent =
       seq?: number
       at?: number
     }
-  | { t: 'chat/typing'; callId: string; active?: boolean; at?: number }
-  | { t: 'chat/error'; callId?: string; message: string; retryable?: boolean; at?: number }
+  | { t: 'chat/typing'; sessionId?: string; callId: string; active?: boolean; at?: number }
+  | { t: 'chat/error'; sessionId?: string; callId?: string; message: string; retryable?: boolean; at?: number }
   | {
       /** 会话内任意设备发出的用户消息，广播给所有设备（含发送者）。 */
       t: 'chat/echo'
+      sessionId?: string
       msgId: string
       rid?: string
       callId?: string
@@ -221,6 +234,7 @@ export type WireEvent =
   | {
       /** 一条助手消息，按 messageId 全文替换（修「回复重复拼接」）。 */
       t: 'chat/message'
+      sessionId?: string
       callId: string
       messageId: string
       index?: number
@@ -231,6 +245,12 @@ export type WireEvent =
   | {
       t: 'session/state'
       sessionId?: string
+      /** `session/snapshot` 的回包会带同一条 rid（2.4.0）。 */
+      rid?: string
+      /** 这份快照是不是这台设备的当前绑定会话（2.4.0 后台标签快照是 false）。 */
+      active?: boolean
+      /** 会话标题（标签条显示它）。 */
+      title?: string
       sessionEpoch?: number
       head?: number
       snapshot?: { messages?: SnapshotMessage[]; activeCall?: { callId?: string; text?: string; typing?: boolean } | null }
@@ -268,6 +288,8 @@ export type WireEvent =
   | {
       /** 电脑端转发来的一条 DSH 权限请求。 */
       t: 'approval/ask'
+      /** 工具属于哪个会话（1.3.0：审批卡显示在自己的标签里）。 */
+      sessionId?: string
       approvalId: string
       toolName?: string
       reason?: string
@@ -279,6 +301,7 @@ export type WireEvent =
   | {
       /** 那条请求已经在手机/电脑/超时处被处理，卡片要撤掉。 */
       t: 'approval/resolved'
+      sessionId?: string
       approvalId: string
       outcome?: string
       source?: string
@@ -456,6 +479,7 @@ export function deserializeChatState(text: string, assistantId: string, now: num
       ...state,
       sessionId: parsed.sessionId,
       sessionEpoch: parsed.sessionEpoch,
+      title: parsed.title,
       sessionCursor: typeof parsed.sessionCursor === 'number' ? parsed.sessionCursor : 0,
       sessionList: parsed.sessionList,
       uploads: parsed.uploads && typeof parsed.uploads === 'object' ? parsed.uploads : {},
@@ -1221,13 +1245,15 @@ function applySessionSnapshot(
   const sessionEpoch = typeof event.sessionEpoch === 'number' && Number.isFinite(event.sessionEpoch)
     ? event.sessionEpoch
     : state.sessionEpoch
+  // 标题是标签条的显示依据：电脑端没给就沿用上一次的，不能把已有标题清空。
+  const title = typeof event.title === 'string' && event.title.trim() !== '' ? event.title.trim() : state.title
   const head = typeof event.head === 'number' && Number.isFinite(event.head) ? Math.max(0, Math.floor(event.head)) : state.sessionCursor
   const activeCall = snapshot.activeCall
   let typing: ChatState['typing'] = reset ? null : state.typing
   if (activeCall && activeCall.typing === true && typeof activeCall.callId === 'string') {
     typing = { callId: activeCall.callId, active: true }
   }
-  const rebuilt = rebuildIndexes({ ...state, sessionId, sessionEpoch, resetOnNextSnapshot: false }, messages)
+  const rebuilt = rebuildIndexes({ ...state, sessionId, sessionEpoch, title, resetOnNextSnapshot: false }, messages)
   // 进行中的回合：快照里带 activeCall 时把已生成的文本补成一条 streaming 消息，
   // 这样中途加入的设备也能看到“半个回答”，而不是等 done 才出现。
   let next: ChatState = rebuilt

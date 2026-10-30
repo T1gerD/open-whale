@@ -15,6 +15,7 @@ import {
   PROTOCOL_VERSION,
   SERVER_FRAME,
   SESSION_LIST_LIMIT,
+  SESSION_WATCH_LIMIT,
   SessionEventLog,
   classifyEndpoint,
   clampAssistantText,
@@ -371,21 +372,24 @@ test('activity kinds are stable identifiers the app can switch on', () => {
 
 test('2.3.0 keeps the protocol at 1.x so a 2.2 phone still connects', () => {
   assert.equal(PROTOCOL_VERSION.split('.')[0], '1')
-  assert.equal(PROTOCOL_VERSION, '1.2.0')
+  assert.equal(PROTOCOL_VERSION, '1.3.0')
 })
 
-test('collaboration capabilities are gone and the two new ones are present', () => {
+test('collaboration capabilities are gone and the session ones are present', () => {
   const caps = new Set(ALL_CAPABILITIES)
   assert.equal(caps.has('collab-v1'), false)
   assert.equal(caps.has('participants-v1'), false)
   assert.equal(CAPABILITIES.SESSIONS, 'sessions-v1')
   assert.equal(CAPABILITIES.APPROVAL, 'approval-v1')
+  assert.equal(CAPABILITIES.SESSION_TABS, 'session-tabs-v1')
 })
 
 test('the session picker and approval frames exist in the right direction', () => {
   assert.equal(CLIENT_FRAME.SESSION_LIST, 'session/list')
   assert.equal(CLIENT_FRAME.SESSION_SELECT, 'session/select')
   assert.equal(CLIENT_FRAME.SESSION_CREATE, 'session/create')
+  assert.equal(CLIENT_FRAME.SESSION_WATCH, 'session/watch')
+  assert.equal(CLIENT_FRAME.SESSION_SNAPSHOT, 'session/snapshot')
   assert.equal(CLIENT_FRAME.APPROVAL_REPLY, 'approval/reply')
   assert.equal(SERVER_FRAME.SESSIONS, 'sessions')
   assert.equal(SERVER_FRAME.SESSION_SELECTED, 'session/selected')
@@ -395,6 +399,11 @@ test('the session picker and approval frames exist in the right direction', () =
   assert.equal(Object.values(CLIENT_FRAME).includes('collab/set'), false)
   assert.equal(Object.values(SERVER_FRAME).includes('session/participants'), false)
   assert.equal(Object.values(SERVER_FRAME).includes('collab/state'), false)
+})
+
+test('a tab bed is bounded so one client cannot watch every session', () => {
+  assert.ok(Number.isInteger(SESSION_WATCH_LIMIT))
+  assert.ok(SESSION_WATCH_LIMIT > 0 && SESSION_WATCH_LIMIT <= 16)
 })
 
 test('only the two approval outcomes a phone may send are accepted', () => {

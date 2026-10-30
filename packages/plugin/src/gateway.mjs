@@ -49,6 +49,7 @@ import {
   PROTOCOL_VERSION,
   SERVER_FRAME,
   SESSION_SNAPSHOT_LIMIT,
+  SESSION_WATCH_LIMIT,
   SessionEventLog,
   UPLOAD_CHUNK_BYTES,
   WEB_CLIENT_PATH,
@@ -72,7 +73,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '2.3.0'
+export const PLUGIN_VERSION = '2.4.0'
 
 /**
  * How many concurrent sessions one device may hold.
@@ -256,6 +257,15 @@ export class Gateway {
     this.deviceSession = new Map(Object.entries(
       /** @type {Record<string, string>} */ (this.store.getPreference('deviceSession', {})) ?? {},
     ).filter(([, sessionId]) => typeof sessionId === 'string' && sessionId !== ''))
+    /**
+     * deviceId → 后台仍打开的会话（v1.3.0「会话标签」）。
+     *
+     * 手机可以像桌面侧边栏一样同时开几个会话：当前活跃的那个走 `deviceSession`，
+     * 其余标签走这里订阅事件。只存在内存里——重连后客户端会重新发一次
+     * `session/watch`，把它落盘反而会攒下一堆过期 id。
+     * @type {Map<string, Set<string>>}
+     */
+    this.deviceWatch = new Map()
     this.serverVersion = PLUGIN_VERSION
 
     /** @type {Set<Session>} */
@@ -322,17 +332,50 @@ export class Gateway {
   /**
    * 在线且绑定到某个会话的设备（桥用它决定审批能不能转发；没有手机时审批
    * 必须交回桌面 UI，绝不能冒领）。
+   *
+   * v1.3.0：**后台标签也算**。一台手机可能把会话 B 开在后台看着（watch），
+   * 此时 B 里的工具调用同样应该能转到这台手机，而不是因为「它不是当前标签」
+   * 就静默等桌面。
    * @param {string} sessionId
    * @returns {string[]}
    */
   devicesInSession(sessionId) {
     if (!sessionId) return []
-    const devices = []
+    const devices = new Set()
     for (const [deviceId, bound] of this.deviceSession) {
-      if (bound !== sessionId) continue
-      if (this.deviceOnline(deviceId)) devices.push(deviceId)
+      if (bound === sessionId) devices.add(deviceId)
     }
-    return devices
+    for (const [deviceId, watched] of this.deviceWatch) {
+      if (watched.has(sessionId)) devices.add(deviceId)
+    }
+    return [...devices].filter(deviceId => this.deviceOnline(deviceId))
+  }
+
+  /**
+   * 后台标签订阅（session/watch）。
+   * @param {string} deviceId
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
+  #watches(deviceId, sessionId) {
+    return this.deviceWatch.get(deviceId)?.has(sessionId) === true
+  }
+
+  /**
+   * 用手机发来的标签列表替换后台订阅。当前活跃会话不算在 watch 里（它天然
+   * 一直在收），所以这里把它过滤掉，避免同一帧被同一个 socket 收两遍。
+   * @param {string} deviceId
+   * @param {unknown} value
+   * @param {string} [activeSessionId]
+   * @returns {string[]} the accepted watch set
+   */
+  #setWatch(deviceId, value, activeSessionId) {
+    const ids = Array.isArray(value)
+      ? [...new Set(value.filter(id => typeof id === 'string' && id !== '' && id !== activeSessionId))].slice(0, SESSION_WATCH_LIMIT)
+      : []
+    if (ids.length === 0) this.deviceWatch.delete(deviceId)
+    else this.deviceWatch.set(deviceId, new Set(ids))
+    return ids
   }
 
   /**
@@ -745,6 +788,10 @@ export class Gateway {
         return this.#handleSessionSelect(session, frame)
       case 'session/create':
         return this.#handleSessionCreate(session, frame)
+      case 'session/watch':
+        return this.#handleSessionWatch(session, frame)
+      case 'session/snapshot':
+        return this.#handleSessionSnapshot(session, frame)
       case 'approval/reply':
         return this.#handleApprovalReply(session, frame)
       case 'upload/start':
@@ -1209,6 +1256,37 @@ export class Gateway {
   }
 
   /**
+   * `session/watch`：订阅后台标签页的事件（会话像桌面侧边栏一样常驻）。
+   * 只在这些会话上发事件，不会改变当前活跃会话；空数组表示全部退订。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  #handleSessionWatch(session, frame) {
+    if (!session.hasCap(CAPABILITIES.SESSION_TABS)) return undefined
+    const deviceId = /** @type {string} */ (session.deviceId)
+    const watched = this.#setWatch(deviceId, frame.sessionIds, session.sessionId ?? undefined)
+    this.log(`session: 设备 ${deviceId} 订阅后台标签 ${watched.length} 个`)
+    return undefined
+  }
+
+  /**
+   * `session/snapshot`：取某个标签页的状态，但**不切换**当前活跃会话。
+   * 客户端点击标签时先渲染本地缓存，再用这帧补齐电脑上的最新状态。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  async #handleSessionSnapshot(session, frame) {
+    if (!session.hasCap(CAPABILITIES.SESSION_TABS)) return undefined
+    const requested = String(frame.sessionId ?? '')
+    if (requested === '') return session.sendError('bad-frame', 'session/snapshot 缺少 sessionId')
+    // 只允许取自己绑定或订阅过的会话，避免手机枚举电脑上的任意会话内容。
+    const allowed = requested === session.sessionId || this.#watches(/** @type {string} */ (session.deviceId), requested)
+    if (!allowed) return session.sendError('not-allowed', '这个会话不在当前标签页里')
+    await this.#deliverSessionState(session, { sessionId: requested, rid: frame.rid })
+    return undefined
+  }
+
+  /**
    * 执行一次会话切换：成功则更新 deviceSession、递增 sessionEpoch，并让该设备
    * 的所有 socket 都跟着换会话（多窗口/竞速连接不能各看一个会话）。
    * @param {string} deviceId
@@ -1237,9 +1315,14 @@ export class Gateway {
     // 同一设备可能有多个 socket（竞速/多窗口），它们必须一起换会话。
     for (const sibling of this.sessionsForDevice(deviceId)) sibling.sessionId = opened.sessionId
     session.sessionId = opened.sessionId
-    // 旧会话如果没有别的设备在用，就释放它的 agent（历史已持久化）。
-    if (previous && previous !== opened.sessionId && this.devicesInSession(previous).length === 0) {
-      this.bridge.releaseSession?.(previous)?.catch?.(() => {})
+    // v1.3.0：切走**不释放**旧会话的 agent。手机现在可以同时开几个标签，
+    // 旧会话里的回合还在跑；把它杀掉会让「切走再切回来」变成一次静默失败。
+    // 旧标签改为后台订阅，这样它的流式输出和「正在回复」仍能推到手机上。
+    if (previous && previous !== opened.sessionId) {
+      const watched = this.deviceWatch.get(deviceId) ?? new Set()
+      watched.add(previous)
+      watched.delete(opened.sessionId)
+      this.deviceWatch.set(deviceId, new Set([...watched].slice(0, SESSION_WATCH_LIMIT)))
     }
     this.log(`session: 设备 ${deviceId} 切换到会话 ${opened.sessionId}（epoch=${this.sessionEpoch}）`)
     return {
@@ -1518,6 +1601,8 @@ export class Gateway {
    */
   #unbindDevice(deviceId) {
     const sessionId = this.deviceSession.get(deviceId)
+    const watched = this.deviceWatch.get(deviceId)
+    this.deviceWatch.delete(deviceId)
     this.deviceSession.delete(deviceId)
     try {
       this.store.setPreference('deviceSession', Object.fromEntries(this.deviceSession))
@@ -1526,8 +1611,13 @@ export class Gateway {
     }
     this.store.unbindDevice(deviceId)
     this.log(`pairing: device ${deviceId} unbound from desktop page`)
-    if (sessionId && this.devicesInSession(sessionId).length === 0) {
-      this.bridge.releaseSession?.(sessionId)?.catch?.(() => {})
+    // 解绑是把设备真正送走：它绑定和订阅过的会话，如果没别的设备在用，
+    // 就把 agent 释放掉（切换标签不会走到这里，那是 v1.3.0 刻意保留的）。
+    for (const id of new Set([sessionId, ...(watched ?? [])])) {
+      if (!id) continue
+      if (this.devicesInSession(id).length === 0) {
+        this.bridge.releaseSession?.(id)?.catch?.(() => {})
+      }
     }
   }
 
@@ -1744,11 +1834,16 @@ export class Gateway {
    */
   #broadcastToConversation(conversationId, frame, options = {}) {
     let delivered = 0
+    // v1.3.0：每个会话帧都带 sessionId，客户端据此把事件放进对应标签页；
+    // 后台标签（watched）也收，这样没切过去也能看到「正在回复」和未读数。
+    const tagged = frame.sessionId === conversationId ? frame : { ...frame, sessionId: conversationId }
     for (const session of this.sessions) {
-      if (!session.authenticated || session.sessionId !== conversationId) continue
+      if (!session.authenticated) continue
+      const bound = session.sessionId === conversationId
+      if (!bound && !this.#watches(session.deviceId, conversationId)) continue
       if (options.skipDeviceId && session.deviceId === options.skipDeviceId) continue
       if (options.requireCapability && !session.hasCap(options.requireCapability)) continue
-      if (session.send(frame)) delivered += 1
+      if (session.send(tagged)) delivered += 1
     }
     return delivered
   }
@@ -1763,9 +1858,12 @@ export class Gateway {
    */
   #broadcastWithFallback(conversationId, frame, capability, fallback) {
     let delivered = 0
+    const tagged = frame.sessionId === conversationId ? frame : { ...frame, sessionId: conversationId }
     for (const session of this.sessions) {
-      if (!session.authenticated || session.sessionId !== conversationId) continue
-      const payload = session.hasCap(capability) ? frame : fallback(session)
+      if (!session.authenticated) continue
+      const bound = session.sessionId === conversationId
+      if (!bound && !this.#watches(session.deviceId, conversationId)) continue
+      const payload = session.hasCap(capability) ? tagged : fallback(session)
       if (payload && session.send(payload)) delivered += 1
     }
     return delivered
@@ -1787,15 +1885,18 @@ export class Gateway {
   }
 
   /** @param {Session} session */
-  async #deliverSessionState(session) {
-    const conversationId = session.sessionId
+  async #deliverSessionState(session, options = {}) {
+    const conversationId = options.sessionId ?? session.sessionId
     if (!conversationId) return
     const log = this.#log(conversationId)
     const active = this.activeCalls.get(conversationId)
     const messages = await this.#snapshotMessages(conversationId, log)
     session.send({
       t: SERVER_FRAME.SESSION_STATE,
+      ...(options.rid ? { rid: options.rid } : {}),
       sessionId: conversationId,
+      ...(options.title ? { title: options.title } : {}),
+      ...(options.sessionId ? { active: options.sessionId === session.sessionId } : {}),
       sessionEpoch: this.sessionEpoch,
       head: log.head,
       snapshot: {

@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: 5de094cd20d1f4129fdf568679a4214bfd9effae4f210c20635f08ab2191164b
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: c394debfe804540299074362db622ce23ffb843821800911ffad56d64b7b71ca
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -38,8 +38,14 @@
  * (`approval-v1`). A collaboration-era client that still sends `collab/set`
  * simply gets nothing back — the frame is gone, which is exactly what "unknown
  * frames are ignored" already promised.
+ *
+ * 1.3.0 (2.4.0 "session tabs") makes a phone able to keep several DSH sessions
+ * open at once, the way the DSH desktop sidebar does: `session/watch` subscribes
+ * to live activity for the sessions whose tabs are open, `session/snapshot`
+ * fetches one tab's state without making it active, and every conversation frame
+ * now carries its `sessionId` so a client can route it to the right tab.
  */
-export const PROTOCOL_VERSION = '1.2.0'
+export const PROTOCOL_VERSION = '1.3.0'
 
 /**
  * Feature flags exchanged in `hello` / `hello/ack`.
@@ -65,6 +71,11 @@ export const CAPABILITIES = /** @type {const} */ ({
   SESSIONS: 'sessions-v1',
   /** `approval/ask` / `approval/reply`: the phone answers DSH permission prompts. */
   APPROVAL: 'approval-v1',
+  /**
+   * `session/watch` + `session/snapshot` + `sessionId` on conversation frames:
+   * several tabs stay live at once, like the desktop sidebar.
+   */
+  SESSION_TABS: 'session-tabs-v1',
 })
 
 /** Every capability this build understands. */
@@ -96,6 +107,13 @@ export const CLIENT_FRAME = /** @type {const} */ ({
   SESSION_SELECT: 'session/select',
   /** Create a brand new DSH session and bind this device to it. */
   SESSION_CREATE: 'session/create',
+  /**
+   * Keep these sessions' events flowing even while another tab is active. The
+   * active session keeps coming automatically; this is for the other open tabs.
+   */
+  SESSION_WATCH: 'session/watch',
+  /** Fetch one session's current state without making it the active binding. */
+  SESSION_SNAPSHOT: 'session/snapshot',
   /** Answer a pending `approval/ask` (`outcome` is `allowed-once` or `rejected`). */
   APPROVAL_REPLY: 'approval/reply',
 })
@@ -385,11 +403,11 @@ export function helloAckProofMessage(nonce, deviceId) {
  * One user message in the conversation, broadcast to every device in the session
  * (including the sender, which already has it locally and dedupes by `msgId`).
  * @property {'chat/echo'} t
+ * @property {string} sessionId    Which conversation this belongs to (v1.3.0 tab routing).
  * @property {string} msgId
  * @property {string} [rid]
  * @property {string} [callId]
  * @property {string} deviceId     Which device sent it.
- * @property {string} [speaker]    Display name shown in peers' bubbles.
  * @property {string} text
  * @property {Array<{fileId?: string, name: string, size: number, mime?: string}>} [files]
  * @property {string} at           ISO-8601 send time (computer clock).
@@ -401,6 +419,7 @@ export function helloAckProofMessage(nonce, deviceId) {
  * One assistant message. `messageId` is stable per assistant message in DSH, so a
  * replayed `assistant/attempt` can never append the same text twice.
  * @property {'chat/message'} t
+ * @property {string} sessionId    Which conversation this belongs to (v1.3.0 tab routing).
  * @property {string} callId
  * @property {string} messageId
  * @property {number} index        Order inside this turn (0-based).
@@ -411,9 +430,13 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @typedef {object} SessionSyncFrame
  * Full state of the conversation, pushed after `hello/ack` when the client has no
  * usable cursor (first connect, session switch) or in reply to `session/sync`.
+ * Since 1.3.0 it also answers `session/snapshot` for a background tab, which is
+ * why it carries the `rid` back (the snapshot must not be mistaken for a switch).
  * @property {'session/state'} t
+ * @property {string} [rid]        Echo of `session/snapshot` / `session/sync`, when requested.
  * @property {string} sessionId
  * @property {string} [title]      Human title of this DSH session (the picker shows it too).
+ * @property {boolean} [active]    True when this snapshot is the device's active tab.
  * @property {number} sessionEpoch
  * @property {number} head         Newest event `seq` included; client stores it as its cursor.
  * @property {{messages: Array<{id: string, kind: 'user'|'assistant', text: string, at: string,
@@ -470,11 +493,33 @@ export function helloAckProofMessage(nonce, deviceId) {
  */
 
 /**
+ * @typedef {object} SessionWatchFrame
+ * Desktop-sidebar behaviour on the phone: the tabs that are open but not active
+ * keep receiving their events (`chat/delta`, `chat/done`, `chat/typing`,
+ * `chat/message`, `approval/ask`, …), each tagged with its `sessionId`.
+ * The active session is always delivered and need not be listed. Sending the
+ * frame replaces the previous watch set; an empty list unsubscribes.
+ * @property {'session/watch'} t
+ * @property {string[]} sessionIds  Up to `SESSION_WATCH_LIMIT` background sessions.
+ */
+
+/**
+ * @typedef {object} SessionSnapshotRequestFrame
+ * Fetch one tab's current state (messages + in-flight turn) without changing
+ * which conversation this device is bound to. The reply is a normal
+ * `session/state` carrying the same `rid` and `active: false`.
+ * @property {'session/snapshot'} t
+ * @property {string} rid
+ * @property {string} sessionId
+ */
+
+/**
  * @typedef {object} ApprovalAskFrame
  * One DSH permission prompt, forwarded to the phone. The phone answers with
  * `approval/reply`; the computer also pushes `approval/resolved` when the prompt is
  * settled elsewhere (desktop, timeout, cancellation) so the UI can dismiss it.
  * @property {'approval/ask'} t
+ * @property {string} sessionId    Which conversation the tool belongs to.
  * @property {string} approvalId   Opaque id for this prompt (echoed in the reply).
  * @property {string} toolName     Tool that wants to run (e.g. `bash`, `write`).
  * @property {string} [reason]     Machine reason the computer logged.
@@ -493,6 +538,7 @@ export function helloAckProofMessage(nonce, deviceId) {
 /**
  * @typedef {object} ApprovalResolvedFrame
  * @property {'approval/resolved'} t
+ * @property {string} sessionId    Which conversation the tool belongs to.
  * @property {string} approvalId
  * @property {'allowed-once'|'rejected'|'cancelled'|'unavailable'} outcome
  * @property {string} [source]     `phone` | `desktop` | `timeout` | `cancelled`.
@@ -564,6 +610,7 @@ export function helloAckProofMessage(nonce, deviceId) {
  * bubble identified by `callId`; `seq` is strictly increasing per call so a
  * dropped/duplicated delta is detectable.
  * @property {'chat/delta'} t
+ * @property {string} sessionId
  * @property {string} callId
  * @property {number} seq
  * @property {string} text
@@ -572,6 +619,7 @@ export function helloAckProofMessage(nonce, deviceId) {
 /**
  * @typedef {object} ChatDoneFrame
  * @property {'chat/done'} t
+ * @property {string} sessionId
  * @property {string} callId
  * @property {string} text          Full assistant text, authoritative over deltas.
  * @property {number} [durationMs]
@@ -582,6 +630,7 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @typedef {object} ToolFrame
  * Activity line rendered as a small status row in the app, never as assistant prose.
  * @property {'chat/tool'} t
+ * @property {string} sessionId
  * @property {string} callId
  * @property {'tool-start'|'tool-end'} phase
  * @property {string} toolCallId
@@ -704,6 +753,13 @@ export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
+
+/**
+ * How many additional sessions one device may keep live (beyond its active one).
+ * A tab bar in practice holds a handful; the bound is what keeps one buggy client
+ * from subscribing to every session on the computer and melting the socket.
+ */
+export const SESSION_WATCH_LIMIT = 8
 
 /** Where the plugin serves the web/PWA client (HarmonyOS, iOS, any browser). */
 export const WEB_CLIENT_PATH = '/openwhale/app'

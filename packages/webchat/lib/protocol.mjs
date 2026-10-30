@@ -11,12 +11,15 @@
  * 协议 wire 版本。
  *
  * 1.2.0（v2.3.0「纯远程遥控器」）删掉协作，新增会话选择（`sessions-v1`）与
- * 审批转发（`approval-v1`）。老客户端不认新帧会自动忽略，反之亦然。
+ * 审批转发（`approval-v1`）。
+ * 1.3.0（v2.4.0「会话标签页」）新增 `session/watch` / `session/snapshot`
+ * （`session-tabs-v1`），并让会话帧都带 `sessionId`：手机/网页可以同时让多个
+ * 会话保持在线——就像 DSH 桌面的侧边栏。老客户端不认新帧会自动忽略，反之亦然。
  */
-export const PROTOCOL_VERSION = '1.2.0'
+export const PROTOCOL_VERSION = '1.3.0'
 
 /** 网页版客户端自身的版本号（与产品版本一致，显示在「关于」里）。 */
-export const WEBCHAT_VERSION = '2.3.0'
+export const WEBCHAT_VERSION = '2.4.0'
 
 /** 能力协商标记（hello / hello/ack 的 capabilities）。 */
 export const CAPABILITIES = Object.freeze({
@@ -30,6 +33,8 @@ export const CAPABILITIES = Object.freeze({
   SESSIONS: 'sessions-v1',
   /** 手机/网页可以回答电脑转发的权限请求。 */
   APPROVAL: 'approval-v1',
+  /** `session/watch` + `session/snapshot`：多个会话标签同时保持在线。 */
+  SESSION_TABS: 'session-tabs-v1',
 })
 
 /** 本客户端理解的全部能力，握手时全量声明。 */
@@ -59,6 +64,10 @@ export const CLIENT_FRAME = Object.freeze({
   SESSION_SELECT: 'session/select',
   /** 新建一个 DSH 会话并绑定到它。 */
   SESSION_CREATE: 'session/create',
+  /** 让这些（非当前激活的）会话继续把事件推过来（整体替换，最多 8 个）。 */
+  SESSION_WATCH: 'session/watch',
+  /** 只取某个会话的现状，不改变这台设备的绑定（回 session/state，带 rid、active:false）。 */
+  SESSION_SNAPSHOT: 'session/snapshot',
   /** 回答一条 `approval/ask`（outcome 为 allowed-once / rejected）。 */
   APPROVAL_REPLY: 'approval/reply',
 })
@@ -206,6 +215,12 @@ export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** `approval/reply` 唯一允许的两种结果；其它值电脑端按 `rejected` 处理。 */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
+
+/**
+ * 一台设备除当前会话外还能保持多少个后台会话（`session/watch` 上限）。
+ * 标签条实际就开几个，这个上限只是防止一个坏掉的客户端把电脑端所有会话都订阅一遍。
+ */
+export const SESSION_WATCH_LIMIT = 8
 
 /** 网页版客户端在插件上的路径。 */
 export const WEB_CLIENT_PATH = '/openwhale/app'

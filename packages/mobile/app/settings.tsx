@@ -38,7 +38,7 @@ import {
 import { font, radius, spacing, useTheme, useThemedStyles, type Theme } from '../src/ui/theme'
 
 /** 发版由 Lead 统一管理：这里与 app.json/package.json 的版本号保持一致。 */
-const APP_VERSION = '2.3.0'
+const APP_VERSION = '2.4.0'
 
 type AppearancePref = 'system' | 'light' | 'dark'
 type ConnectionMode = AssistantView['connectionMode']

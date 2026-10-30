@@ -6,7 +6,7 @@
 //
 // 帧名与字段一律以 `packages/protocol/src/index.mjs`（已冻结）为准。
 
-import { CAPABILITIES, CLIENT_FRAME, SESSION_LIST_LIMIT } from './frames.mts'
+import { CAPABILITIES, CLIENT_FRAME, SESSION_LIST_LIMIT, SESSION_WATCH_LIMIT } from './frames.mts'
 
 /** 电脑上的一个 DSH 会话，字段与 protocol 的 `SessionSummary` typedef 一致。 */
 export interface SessionSummary {
@@ -54,6 +54,17 @@ export interface SessionCreateFrame {
   rid: string
 }
 
+export interface SessionWatchFrame {
+  t: 'session/watch'
+  sessionIds: string[]
+}
+
+export interface SessionSnapshotFrame {
+  t: 'session/snapshot'
+  rid: string
+  sessionId: string
+}
+
 /** 拼 `session/list`。rid 由调用方生成并保留，用来对回包。 */
 export function buildSessionListFrame(rid: string): SessionListFrame {
   return { t: CLIENT_FRAME.SESSION_LIST, rid }
@@ -69,6 +80,36 @@ export function buildSessionSelectFrame(rid: string, sessionId: unknown): Sessio
 /** 拼 `session/create`（不带参数：工作目录由电脑端的设置决定）。 */
 export function buildSessionCreateFrame(rid: string): SessionCreateFrame {
   return { t: CLIENT_FRAME.SESSION_CREATE, rid }
+}
+
+/**
+ * 拼 `session/watch`（2.4.0）：把"除活跃会话以外、要一直收事件的标签"告诉电脑端。
+ *
+ * 帧语义是**整体替换**，所以调用方必须每次传全量，而不是增量。三个清洗步骤都很重要：
+ *  1. 去掉空串/重复（重复 id 会让电脑端订阅列表里出现两条）；
+ *  2. 截断到 `SESSION_WATCH_LIMIT`——超出的部分电脑端会直接忽略，与其让用户以为
+ *     "这个标签也在跑"不如在这里就截断，和电脑端的上限保持一致；
+ *  3. 空列表是合法的：它就是"取消全部后台订阅"。
+ */
+export function buildSessionWatchFrame(sessionIds: unknown): SessionWatchFrame {
+  const seen = new Set<string>()
+  const ids: string[] = []
+  for (const raw of Array.isArray(sessionIds) ? sessionIds : []) {
+    if (typeof raw !== 'string') continue
+    const id = raw.trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    ids.push(id)
+    if (ids.length >= SESSION_WATCH_LIMIT) break
+  }
+  return { t: CLIENT_FRAME.SESSION_WATCH, sessionIds: ids }
+}
+
+/** 拼 `session/snapshot`：只取某一个标签的状态，不改变 `chat/send` 的目标会话。 */
+export function buildSessionSnapshotFrame(rid: string, sessionId: unknown): SessionSnapshotFrame | undefined {
+  const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+  if (!id) return undefined
+  return { t: CLIENT_FRAME.SESSION_SNAPSHOT, rid, sessionId: id }
 }
 
 /**

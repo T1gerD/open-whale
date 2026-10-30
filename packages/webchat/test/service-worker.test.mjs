@@ -64,4 +64,6 @@ test('app.js 以 module worker + 禁用 HTTP 缓存的方式注册 sw.js', () =>
   const source = read('app.js')
   assert.match(source, /register\(url,\s*\{[^}]*type:\s*'module'[^}]*\}\)/s)
   assert.match(source, /updateViaCache:\s*'none'/)
+  // 注册地址带版本号：每次发布都会重新安装 SW，不依赖浏览器比较 module import。
+  assert.match(source, /searchParams\.set\('v',\s*`\$\{PROTOCOL_VERSION\}-\$\{WEBCHAT_VERSION\}`\)/)
 })

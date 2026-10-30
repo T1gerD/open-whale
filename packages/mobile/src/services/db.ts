@@ -16,7 +16,7 @@ import type { ChatMessage, Transfer } from '../core/reducer.mts'
 import { createOutbox, deserializeOutbox, serializeOutbox, type Outbox } from '../core/outbox.mts'
 
 const DB_NAME = 'openwhale.db'
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 export type Database = SQLite.SQLiteDatabase
 
@@ -62,11 +62,14 @@ export async function migrate(db: Database): Promise<void> {
       connection_mode TEXT,
       session_id TEXT,
       session_epoch INTEGER,
-      session_cursor INTEGER
+      session_cursor INTEGER,
+      tabs TEXT,
+      active_session_id TEXT
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY NOT NULL,
       assistant_id TEXT NOT NULL,
+      session_id TEXT,
       at INTEGER NOT NULL,
       payload TEXT NOT NULL
     );
@@ -103,14 +106,35 @@ export async function migrate(db: Database): Promise<void> {
       }
     }
   }
+  if (version < 3) {
+    // v3（2.4.0 会话标签页）：每个助理记住打开了哪些标签，消息按会话分开存。
+    // 老库里的历史消息 session_id 为 NULL，恢复时归给当前绑定的会话。
+    for (const statement of [
+      'ALTER TABLE assistants ADD COLUMN tabs TEXT;',
+      'ALTER TABLE assistants ADD COLUMN active_session_id TEXT;',
+      'ALTER TABLE messages ADD COLUMN session_id TEXT;',
+    ]) {
+      try {
+        await db.execAsync(statement)
+      } catch {
+        // 列已存在（新建库已经带列）：忽略。
+      }
+    }
+    // 索引必须等列补好之后才能建：老库在执行上面这组 ALTER 之前根本没有 session_id。
+    await db.execAsync('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (assistant_id, session_id, at);')
+  }
   if (version < SCHEMA_VERSION) {
     await db.execAsync(`PRAGMA user_version = ${SCHEMA_VERSION};`)
   }
 }
 
-/** 助理记录 + 唤醒设置（后者是本地扩展，不来自协议）。 */
+/** 助理记录 + 唤醒设置 + 标签页状态（后两者是本地扩展，不来自协议）。 */
 export interface StoredAssistant extends AssistantRecord {
   wakeMac?: string
+  /** 已打开的会话标签（打开顺序）。2.4.0 起持久化，重启后恢复。 */
+  tabs?: string[]
+  /** 当前显示的标签 id（同时也就是这台手机绑定的会话）。 */
+  activeSessionId?: string
 }
 
 interface AssistantRow {
@@ -134,6 +158,8 @@ interface AssistantRow {
   session_id: string | null
   session_epoch: number | null
   session_cursor: number | null
+  tabs: string | null
+  active_session_id: string | null
 }
 
 export async function listAssistants(): Promise<StoredAssistant[]> {
@@ -156,8 +182,8 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
     `INSERT INTO assistants (
        id, computer_id, name, fingerprint, endpoints, preferred_endpoint, lan, device_id, device_name,
        paired_at, last_connected_at, online, power_allowed, server_version, wake_proxy_url, wake_mac,
-       connection_mode, session_id, session_epoch, session_cursor
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       connection_mode, session_id, session_epoch, session_cursor, tabs, active_session_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        computer_id = excluded.computer_id,
        name = excluded.name,
@@ -176,7 +202,9 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
        connection_mode = excluded.connection_mode,
        session_id = excluded.session_id,
        session_epoch = excluded.session_epoch,
-       session_cursor = excluded.session_cursor;`,
+       session_cursor = excluded.session_cursor,
+       tabs = excluded.tabs,
+       active_session_id = excluded.active_session_id;`,
     [
       assistant.id,
       assistant.computerId,
@@ -198,6 +226,8 @@ export async function upsertAssistant(assistant: StoredAssistant): Promise<void>
       assistant.sessionId ?? null,
       assistant.sessionEpoch ?? null,
       assistant.sessionCursor ?? 0,
+      assistant.tabs ? JSON.stringify(assistant.tabs) : null,
+      assistant.activeSessionId ?? null,
     ],
   )
 }
@@ -226,36 +256,60 @@ export async function deleteAssistant(id: string): Promise<void> {
   })
 }
 
-export async function loadMessages(assistantId: string, limit = 400): Promise<ChatMessage[]> {
+/**
+ * 读取某个会话的历史消息。
+ *
+ * `sessionId` 为空 = 老版本行为（按助理取全部，启动迁移/调试用）。
+ * 指定会话时默认只取该会话自己的行；`includeLegacy` 额外带上
+ * `session_id IS NULL` 的行——v2.3.0 及更早的库没有会话列，那些行属于升级前
+ * 那个唯一会话，只应归给当前标签。
+ */
+export async function loadMessages(
+  assistantId: string,
+  sessionId?: string,
+  limit = 400,
+  includeLegacy = false,
+): Promise<ChatMessage[]> {
   const db = await database()
+  const all = !sessionId
+  const where = all
+    ? 'assistant_id = ?'
+    : includeLegacy
+      ? 'assistant_id = ? AND (session_id = ? OR session_id IS NULL)'
+      : 'assistant_id = ? AND session_id = ?'
+  const params: Array<string | number> = all ? [assistantId] : [assistantId, sessionId as string]
   // 取最近 N 条（子查询按时间倒序），再按时间正序交给 reducer。
   const rows = await db.getAllAsync<{ payload: string }>(
     `SELECT payload FROM (
-       SELECT payload, at FROM messages WHERE assistant_id = ? ORDER BY at DESC LIMIT ?
+       SELECT payload, at FROM messages WHERE ${where} ORDER BY at DESC LIMIT ?
      ) ORDER BY at ASC;`,
-    [assistantId, limit],
+    [...params, limit],
   )
   return rows.map(row => parseJson<ChatMessage>(row.payload)).filter(isPresent)
 }
 
-export async function saveMessage(assistantId: string, message: ChatMessage): Promise<void> {
+export async function saveMessage(assistantId: string, sessionId: string | undefined, message: ChatMessage): Promise<void> {
   const db = await database()
   await db.runAsync(
-    `INSERT INTO messages (id, assistant_id, at, payload) VALUES (?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET at = excluded.at, payload = excluded.payload;`,
-    [message.id, assistantId, message.at, JSON.stringify(message)],
+    `INSERT INTO messages (id, assistant_id, session_id, at, payload) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET at = excluded.at, payload = excluded.payload, session_id = excluded.session_id;`,
+    [message.id, assistantId, sessionId ?? null, message.at, JSON.stringify(message)],
   )
 }
 
-export async function saveMessages(assistantId: string, messages: ChatMessage[]): Promise<void> {
+export async function saveMessages(
+  assistantId: string,
+  sessionId: string | undefined,
+  messages: ChatMessage[],
+): Promise<void> {
   if (messages.length === 0) return
   const db = await database()
   await db.withTransactionAsync(async () => {
     for (const message of messages) {
       await db.runAsync(
-        `INSERT INTO messages (id, assistant_id, at, payload) VALUES (?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET at = excluded.at, payload = excluded.payload;`,
-        [message.id, assistantId, message.at, JSON.stringify(message)],
+        `INSERT INTO messages (id, assistant_id, session_id, at, payload) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET at = excluded.at, payload = excluded.payload, session_id = excluded.session_id;`,
+        [message.id, assistantId, sessionId ?? null, message.at, JSON.stringify(message)],
       )
     }
   })
@@ -353,6 +407,8 @@ function rowToAssistant(row: AssistantRow): StoredAssistant {
     sessionId: row.session_id ?? undefined,
     sessionEpoch: row.session_epoch ?? undefined,
     sessionCursor: row.session_cursor ?? 0,
+    tabs: parseJson<string[]>(row.tabs ?? '') ?? undefined,
+    activeSessionId: row.active_session_id ?? undefined,
   }
 }
 

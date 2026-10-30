@@ -3,7 +3,7 @@
 // 零构建、原生 ESM：浏览器直接加载本文件，import 同目录 lib/*.mjs。所有协议 / 加密 /
 // 合并逻辑都在 lib 里（可被 node --test 直接测），这里只负责：
 //   1. 屏幕切换（绑定页 ↔ 聊天页）与移动端交互；
-//   2. 把 ConnectionManager 的事件接到 ChatModel 和 DOM；
+//   2. 把 ConnectionManager 的事件接到 ChatTabsModel 和 DOM（含会话标签条）；
 //   3. 附件选择 / 分块上传 / 下载、设置面板、PWA 安装提示。
 //
 // 终端用户视角：扫码或粘贴绑定信息 → 选地址自动连接 → 聊天。技术细节只出现在设置页。
@@ -45,7 +45,7 @@ import {
   signHello,
   verifyHelloAckProof,
 } from './lib/keys.mjs'
-import { ChatModel, MESSAGE_STATUS, normalizeAttachments, userMessageId } from './lib/messages.mjs'
+import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildSnapshotFrame, buildWatchFrame, normalizeAttachments } from './lib/messages.mjs'
 import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
 import { createStorage } from './lib/storage.mjs'
 import {
@@ -91,12 +91,12 @@ const dom = {
   bindCancel: document.getElementById('bind-cancel'),
   bindStatus: document.getElementById('bind-status'),
   bindVersion: document.getElementById('bind-version'),
+  bindProtocol: document.getElementById('bind-protocol'),
   chatScreen: document.getElementById('chat-screen'),
   statusDot: document.getElementById('status-dot'),
   computerName: document.getElementById('computer-name'),
   connectionDetail: document.getElementById('connection-detail'),
-  sessionChip: document.getElementById('session-chip'),
-  sessionChipLabel: document.getElementById('session-chip-label'),
+  sessionTabs: document.getElementById('session-tabs'),
   sessionSheet: document.getElementById('session-sheet'),
   menuBtn: document.getElementById('menu-btn'),
   statusBanner: document.getElementById('status-banner'),
@@ -163,14 +163,15 @@ const state = {
   settingsOpen: false,
   sessionSheetOpen: false,
   sessionListLoading: false,
-  sessionSelectPending: false,
-  /** 刚由本页发起的会话选择：随后到的 session/state 不再重复提示。 */
-  justSelectedSession: false,
-  /** 这台设备上次选中的会话（localStorage，按助手分开存）。 */
-  lastSessionId: '',
+  /** 正在等电脑端确认的会话操作：{reason:'switch'|'create', sessionId?}。 */
+  pendingSelect: null,
+  /** 已发出但还没回的 session/snapshot（rid → sessionId）。 */
+  pendingSnapshots: new Map(),
   /** 审批倒计时定时器（有带 expiresAt 的待办审批时才跑）。 */
   approvalTicker: null,
   lastRenderSignature: '',
+  lastTabsSignature: '',
+  lastActiveTabId: '',
   connectionWarned: false,
 }
 
@@ -347,13 +348,33 @@ function persistSoon(delay = 700) {
   }, delay)
 }
 
+/**
+ * 标签 / 当前会话变了就立刻落盘：刷新后要能回到同一组标签，不能等 700ms
+ * （手机上切后台可能立刻冻结 JS）。
+ */
+function persistTabsNow() {
+  if (!state.identity || !state.model) return
+  try {
+    storage.saveTabs(state.identity.deviceId, state.model.snapshotTabs())
+  } catch {
+    /* 存储满/隐私模式：不阻塞聊天 */
+  }
+}
+
 function persistNow() {
   if (!state.identity || !state.model) return
   try {
-    storage.saveConversation(state.identity.deviceId, state.model.snapshotForStorage({ limit: 200 }))
+    const snapshot = state.model.snapshotActiveChat({ limit: 200 })
+    if (snapshot) storage.saveConversation(state.identity.deviceId, snapshot)
+    storage.saveTabs(state.identity.deviceId, state.model.snapshotTabs())
     storage.saveOutbox(
       state.identity.deviceId,
-      state.outbox.map(entry => ({ msgId: entry.msgId, text: entry.text ?? '', at: entry.at })),
+      state.outbox.map(entry => ({
+        msgId: entry.msgId,
+        text: entry.text ?? '',
+        at: entry.at,
+        sessionId: entry.sessionId,
+      })),
     )
   } catch {
     /* 存储满/隐私模式：不阻塞聊天 */
@@ -394,6 +415,9 @@ function setupServiceWorker() {
   }
   window.addEventListener('load', () => {
     const url = new URL('sw.js', document.baseURI)
+    // 脚本 URL 带上版本号：每次发布都换一个注册地址，浏览器一定会重新安装 SW，
+    // 不依赖「浏览器是否比较 module import」这种实现细节。
+    url.searchParams.set('v', `${PROTOCOL_VERSION}-${WEBCHAT_VERSION}`)
     // sw.js 是 module worker：它 import lib/protocol.mjs 的版本号来给缓存命名，
     // 这样缓存名不会像 v2.2.0 那样写死在文件里（写死就会和 app.js 版本对不上）。
     // 浏览器不支持 module worker 时注册会失败：在线功能不受影响，只是没有离线壳。
@@ -633,17 +657,25 @@ function startSession(options = {}) {
     return
   }
 
-  state.model = new ChatModel({ myDeviceId: state.identity.deviceId })
+  state.model = new ChatTabsModel({ myDeviceId: state.identity.deviceId })
+  // 先恢复标签列表与当前标签，再把上次缓存的当前会话内容塞回去：
+  // 刷新后立刻有内容，随后由 hello/ack 与 session/state 对账。
+  const savedTabs = storage.loadTabs(state.identity.deviceId)
+  if (savedTabs.tabs.length > 0) state.model.restoreTabs(savedTabs)
   const savedConversation = storage.loadConversation(state.identity.deviceId)
-  if (savedConversation) state.model.restoreFromStorage(savedConversation)
+  if (savedConversation) state.model.restoreActiveChat(savedConversation)
 
   state.outbox = storage.loadOutbox(state.identity.deviceId).map(entry => ({
     msgId: entry.msgId,
     text: entry.text,
     at: entry.at,
+    sessionId: entry.sessionId,
   }))
   for (const entry of state.outbox) {
-    state.model.addLocalUserMessage({ msgId: entry.msgId, text: entry.text, at: entry.at, status: MESSAGE_STATUS.ERROR })
+    state.model.addLocalUserMessage(
+      { msgId: entry.msgId, text: entry.text, at: entry.at, status: MESSAGE_STATUS.ERROR },
+      entry.sessionId || state.model.activeSessionId,
+    )
   }
 
   state.serverCaps = new Set()
@@ -651,18 +683,19 @@ function startSession(options = {}) {
   state.attachments = []
   state.uploader = undefined
   state.sending = false
-  // 会话选择器：记住这台设备上次选中的会话（按助手分开存在 localStorage）。
-  state.lastSessionId = storage.loadLastSession(state.identity.deviceId)
   state.sessionSheetOpen = false
   state.sessionListLoading = false
-  state.sessionSelectPending = false
-  state.justSelectedSession = false
+  state.pendingSelect = null
+  state.pendingSnapshots = new Map()
+  state.lastTabsSignature = ''
+  state.lastActiveTabId = ''
   stopApprovalTicker()
   closeSettings()
   closeSessionSheet()
 
   showView('chat')
   renderAttachmentsTray()
+  renderTabs()
   renderHeader()
   renderMessages({ forceScroll: true })
   renderComposerState()
@@ -762,14 +795,19 @@ function handleOnline(ack, context) {
   state.serverCaps = new Set(Array.isArray(ack.capabilities) ? ack.capabilities : [])
   state.syncReceived = false
   state.sessionListLoading = false
-  state.sessionSelectPending = false
+  state.pendingSelect = null
+  state.pendingSnapshots = new Map()
 
-  // 电脑端换了这台设备的绑定会话（插件重启 / 另一个窗口切过）：本地旧消息作废，
-  // 等随后到达的 session/state 快照整页替换。老电脑端不带宽带这两个字段时保持现状。
-  const ackSessionId = typeof ack.sessionId === 'string' ? ack.sessionId : ''
-  const ackSessionEpoch = Number.isFinite(Number(ack.sessionEpoch)) ? Number(ack.sessionEpoch) : undefined
-  if (state.model.sessionId && (ackSessionId !== '' || ackSessionEpoch !== undefined)) {
-    state.model.adoptServerSession(ackSessionId || state.model.sessionId, ackSessionEpoch ?? state.model.sessionEpoch)
+  // 电脑端当前的绑定。插件重启会忘掉「这台设备在哪个会话」并新建一个：
+  // 我们以恢复出来的标签为准，让它重新 select 当前标签；一个标签都没有时
+  // （首次绑定 / 首次打开网页）才把电脑端绑定的会话开成第一个标签。
+  const boundSession = typeof ack.sessionId === 'string' ? ack.sessionId : ''
+  if (boundSession) state.model.sessionsCurrent = boundSession
+  if (!state.model.activeSessionId && boundSession) {
+    state.model.openTab(boundSession, { activate: true })
+  } else if (state.model.activeSessionId && sessionsSupported() && boundSession !== state.model.activeSessionId) {
+    // 电脑端绑定的不是当前标签（插件重启 / 老版本没带 sessionId）：以标签为准选回来。
+    sendSelect(state.model.activeSessionId, { reason: 'restore' })
   }
 
   // hello/ack 带回电脑当下认为可达的地址：并进候选列表（并保留二维码里的类型判断）。
@@ -785,9 +823,16 @@ function handleOnline(ack, context) {
   state.settings = storage.saveSettings({ preferredEndpoint: context.url })
   persistBinding()
   persistNow()
+  // 重连后每个标签都要重新对账：刷新列表拿到最新标题/live，再让每个标签各取
+  // 一份快照（后台会话的快照不会改变绑定），最后重发订阅与离线队列。
+  if (sessionsSupported()) requestSessionList({ quiet: true })
+  // 先订阅后台标签，再要快照：电脑端只允许「当前绑定或已订阅」的会话取快照，
+  // 反过来发会被回 not-allowed。
+  sendTabWatch()
+  requestTabSnapshots()
   flushOutbox()
   scheduleSessionSync()
-  maybeRestoreSession(ack)
+  renderTabs()
   renderHeader()
   renderStatusBanner()
   renderMessages({ forceScroll: true })
@@ -799,27 +844,6 @@ function handleOnline(ack, context) {
     showToast('已连接', 'ok', 1800)
   }
   state.firstOnlineShown = true
-}
-
-/**
- * 重连后把「上次选中的会话」选回来。
- *
- * 电脑端把「这台设备在哪个会话」存在插件进程内存里：插件重启 / 换个地址重连后就
- * 忘了，会给这台设备新建一个会话。网页版因此把上次的选择存在 localStorage，
- * 连上后发现电脑端的绑定不是它，就重新 `session/select` 一次。选的会话已被删除时
- * 电脑会回 `session/selected {ok:false}`，那时再清掉本地记录。
- * @param {any} ack
- */
-function maybeRestoreSession(ack) {
-  if (!state.model || !state.connection?.online) return
-  if (!state.serverCaps.has(CAPABILITIES.SESSIONS)) return
-  const saved = state.lastSessionId
-  if (!saved) return
-  if (state.sessionSelectPending) return
-  const serverSession = typeof ack?.sessionId === 'string' ? ack.sessionId : ''
-  if (serverSession === saved) return
-  sendSessionFrame(CLIENT_FRAME.SESSION_SELECT, { sessionId: saved })
-  state.sessionSelectPending = true
 }
 
 /** @param {any} status */
@@ -864,36 +888,83 @@ function requestSessionSync() {
 }
 
 // ---------------------------------------------------------------------------
-// 会话选择器
+// 会话标签条
 // ---------------------------------------------------------------------------
 
-/** 电脑端是否支持会话选择（老插件没有 sessions-v1）。 */
+/** 电脑端是否支持会话列表（老插件没有 sessions-v1）。 */
 function sessionsSupported() {
   return state.serverCaps.has(CAPABILITIES.SESSIONS)
 }
 
+/** 电脑端是否支持多标签（session/watch + session/snapshot + 帧上的 sessionId）。 */
+function tabsSupported() {
+  return state.serverCaps.has(CAPABILITIES.SESSION_TABS)
+}
+
 /**
- * 发一条会话相关帧；离线 / 老电脑端时给出可操作提示而不是静默失败。
- * @param {string} type
- * @param {object} [extra]
- * @returns {boolean}
+ * 告诉电脑端「消息发往哪个会话」。电脑端会保留其它会话的 agent（切走的标签继续跑）。
+ * @param {string} sessionId
+ * @param {{reason?: 'switch'|'create'|'restore'}} [options]
  */
-function sendSessionFrame(type, extra = {}) {
-  if (!sessionsSupported()) {
-    showToast('电脑端版本较旧，不支持在网页里切换会话；请升级电脑端插件', 'error', 4600)
-    return false
+function sendSelect(sessionId, options = {}) {
+  if (!sessionsSupported()) return false
+  const id = String(sessionId ?? '')
+  if (id === '' || !state.connection?.online) return false
+  const rid = uid('sess')
+  const pending = { reason: options.reason ?? 'switch', sessionId: id, rid }
+  state.pendingSelect = pending
+  schedulePendingSelectTimeout(pending)
+  return Boolean(state.connection.send({ t: CLIENT_FRAME.SESSION_SELECT, rid, sessionId: id }))
+}
+
+/**
+ * 等 session/selected 的超时兜底：电脑端不回复（帧被代理吞掉 / 老插件）时，
+ * 不能永远卡在「正在切换」把消息全压在队列里。
+ * @param {any} pending
+ */
+function schedulePendingSelectTimeout(pending) {
+  setTimeout(() => {
+    if (state.pendingSelect !== pending) return
+    state.pendingSelect = null
+    flushOutbox()
+  }, 6000)
+}
+
+/** 订阅后台标签（当前标签电脑端本来就会推，不用列进去）。 */
+function sendTabWatch() {
+  if (!tabsSupported() || !state.connection?.online) return
+  const frame = buildWatchFrame(state.model?.watchList() ?? [])
+  state.connection.send(frame)
+}
+
+/**
+ * 让某个标签取一份现状（不改变这台设备的绑定）。用于新打开的标签、重连后对账。
+ * @param {string} sessionId
+ */
+function requestTabSnapshot(sessionId) {
+  if (!tabsSupported() || !state.connection?.online) return false
+  const id = String(sessionId ?? '')
+  if (id === '') return false
+  const rid = uid('snap')
+  state.pendingSnapshots.set(rid, id)
+  // 防止长时间收不到回复时 Map 无限增长。
+  if (state.pendingSnapshots.size > 32) {
+    const oldest = state.pendingSnapshots.keys().next().value
+    if (oldest !== undefined) state.pendingSnapshots.delete(oldest)
   }
-  if (!state.connection?.online) {
-    showToast('还没连上电脑，暂时不能切换会话', 'error')
-    return false
-  }
-  return Boolean(state.connection.send({ t: type, rid: uid('sess'), ...extra }))
+  return Boolean(state.connection.send(buildSnapshotFrame(rid, id)))
+}
+
+/** 重连 / 打开后给每个标签各要一份快照。 */
+function requestTabSnapshots() {
+  if (!tabsSupported()) return
+  for (const id of state.model?.tabs ?? []) requestTabSnapshot(id)
 }
 
 /** 打开会话面板时拉一次列表。 */
-function requestSessionList({ force = false } = {}) {
+function requestSessionList({ force = false, quiet = false } = {}) {
   if (!sessionsSupported()) {
-    showToast('电脑端版本较旧，不支持会话列表；请升级电脑端插件', 'error', 4600)
+    if (!quiet) showToast('电脑端版本较旧，不支持会话列表；请升级电脑端插件', 'error', 4600)
     return
   }
   if (!state.connection?.online) {
@@ -904,50 +975,102 @@ function requestSessionList({ force = false } = {}) {
   }
   if (state.sessionListLoading && !force) return
   state.sessionListLoading = true
-  renderSessionSheet()
+  if (state.sessionSheetOpen) renderSessionSheet()
   state.connection.send({ t: CLIENT_FRAME.SESSION_LIST, rid: uid('list') })
 }
 
-/** @param {string} sessionId */
-function selectSession(sessionId) {
+/**
+ * 标签 / 当前会话变化后的统一收尾：立刻重绘、落盘、重发订阅与绑定。
+ * @param {{select?: boolean}} [options]
+ */
+function afterTabChange(options = {}) {
+  const select = options.select !== false
+  state.lastRenderSignature = ''
+  renderTabs()
+  renderHeader()
+  renderMessages({ forceScroll: true })
+  renderComposerState()
+  syncApprovalTicker()
+  persistTabsNow()
+  if (!state.connection?.online) return
+  sendTabWatch()
+  const activeId = state.model?.activeSessionId ?? ''
+  if (activeId === '') return
+  if (select && sessionsSupported()) sendSelect(activeId)
+  // 点标签先渲染本地缓存，再让电脑端补一份快照对账：缓存可能来自上一次会话
+  // （页面在后台被冻结、socket 半死），快照是权威的。后台标签已经订阅过，允许取。
+  if (tabsSupported()) requestTabSnapshot(activeId)
+  flushOutbox()
+}
+
+/**
+ * 点标签：本地立即切换（缓存先渲染），再让电脑端把绑定与快照对过来。
+ * @param {string} sessionId
+ */
+function switchTab(sessionId) {
+  const result = state.model?.activateTab(sessionId)
+  if (!result?.ok || !result.changed) return
+  afterTabChange()
+}
+
+/**
+ * 从「全部会话」列表打开一个会话：已打开就切过去，没打开就新开一个标签。
+ * @param {string} sessionId
+ */
+function openSessionTab(sessionId) {
   const id = String(sessionId ?? '')
-  if (id === '' || id === state.model?.sessionId) {
-    closeSessionSheet()
+  if (id === '') return
+  if (!tabsSupported()) {
+    // 老电脑端没有后台订阅：多标签只会看到僵住的内容，保持单标签语义。
+    for (const other of [...state.model.tabs]) {
+      if (other !== id) state.model.closeTab(other)
+    }
+  }
+  const result = state.model.openTab(id, { activate: true })
+  if (!result.ok) {
+    if (result.reason === 'limit') {
+      showToast(`最多同时打开 ${TAB_LIMIT} 个会话，先关掉一个标签再试`, 'error', 4200)
+    }
     return
   }
-  if (!sendSessionFrame(CLIENT_FRAME.SESSION_SELECT, { sessionId: id })) return
-  state.sessionSelectPending = true
-  state.justSelectedSession = true
-  renderSessionSheet()
+  closeSessionSheet()
+  afterTabChange({ select: result.opened || result.activated })
 }
 
+/** 关闭标签：只关本地；关的是当前标签就切相邻并让电脑端跟过去。 */
+function closeTab(sessionId) {
+  const before = state.model?.activeSessionId ?? ''
+  const result = state.model?.closeTab(sessionId)
+  if (!result?.ok) return
+  // 被关标签的离线队列没有意义了（消息跟着标签一起消失）。
+  state.outbox = state.outbox.filter(entry => entry.sessionId !== result.closed)
+  // 关的不是当前标签时绑定没变，不用再发 session/select（也就不会白等一次确认）。
+  afterTabChange({ select: result.activeSessionId !== before })
+}
+
+/** 新建会话：电脑端返回新 id 后再开标签并激活。 */
 function createSession() {
-  if (!sendSessionFrame(CLIENT_FRAME.SESSION_CREATE)) return
-  state.sessionSelectPending = true
-  state.justSelectedSession = true
-  renderSessionSheet()
-}
-
-/** 记住这台设备选中的会话（按助手 = 设备身份分开存）。 */
-function rememberSession(sessionId) {
-  const value = String(sessionId ?? '')
-  const deviceId = state.identity?.deviceId ?? ''
-  if (!deviceId) return
-  if (value !== '' && value === state.lastSessionId) return
-  storage.saveLastSession(deviceId, value)
-  state.lastSessionId = value
-}
-
-/** 当前会话标题：会话快照的 title 优先，其次会话列表里的标题。 */
-function currentSessionTitle() {
-  const model = state.model
-  if (!model) return ''
-  const id = model.sessionId
-  const fromList = Array.isArray(model.sessions) ? model.sessions.find(item => item.id === id) : undefined
-  return model.sessionTitle || fromList?.title || ''
+  if (!sessionsSupported()) {
+    showToast('电脑端版本较旧，不支持新建会话；请升级电脑端插件', 'error', 4600)
+    return
+  }
+  if (!state.connection?.online) {
+    showToast('还没连上电脑，暂时不能新建会话', 'error')
+    return
+  }
+  const rid = uid('sess')
+  const pending = { reason: 'create', rid }
+  state.pendingSelect = pending
+  schedulePendingSelectTimeout(pending)
+  state.connection.send({ t: CLIENT_FRAME.SESSION_CREATE, rid })
+  if (state.sessionSheetOpen) renderSessionSheet()
 }
 
 function openSessionSheet() {
+  if (!sessionsSupported()) {
+    showToast('电脑端版本较旧，不支持会话列表；请升级电脑端插件', 'error', 4600)
+    return
+  }
   state.sessionSheetOpen = true
   if (state.settingsOpen) closeSettings()
   dom.sessionSheet.hidden = false
@@ -967,22 +1090,107 @@ function syncSheetBackdrop() {
   dom.sheetBackdrop.hidden = !(state.settingsOpen || state.sessionSheetOpen)
 }
 
-/** 会话面板内容（标题 + 相对时间 + live / 当前徽标 + 新建会话）。 */
+/** 标签条签名：只有它变了才重写 DOM（避免流式输出时标签条每帧闪一下）。 */
+function tabSignature() {
+  const model = state.model
+  if (!model) return ''
+  // 能力位（multi）也进签名：接上电脑端后关闭按钮 / 「+」/「全部会话」才会出现。
+  const parts = [tabsSupported() ? 'multi' : 'single', model.activeSessionId]
+  for (const id of model.tabs) {
+    parts.push(
+      `${id}\u0001${model.titleFor(id)}\u0001${model.unreadFor(id)}\u0001${model.typingFor(id) ? 1 : 0}\u0001${
+        model.liveFor(id) ? 1 : 0
+      }\u0001${model.hasApprovalIn(id) ? 1 : 0}`,
+    )
+  }
+  return parts.join('\u0002')
+}
+
+/** 常驻在标题栏下方的会话标签条（标题 + 运行点 + 未读 + 审批角标 + 关闭 + 「+」）。 */
+function renderTabs() {
+  if (!dom.sessionTabs) return
+  const model = state.model
+  if (!model) {
+    dom.sessionTabs.innerHTML = ''
+    dom.sessionTabs.hidden = true
+    return
+  }
+  const multi = tabsSupported()
+  dom.sessionTabs.hidden = !multi && model.tabs.length === 0
+  const signature = tabSignature()
+  if (signature !== state.lastTabsSignature) {
+    state.lastTabsSignature = signature
+    const scrollLeft = dom.sessionTabs.scrollLeft
+    const items = model.tabs
+      .map(id => {
+        const active = id === model.activeSessionId
+        const title = model.titleFor(id)
+        const unread = model.unreadFor(id)
+        const typing = model.typingFor(id)
+        const live = model.liveFor(id)
+        // 当前标签的审批卡片就在眼前，不需要再挂角标；只提醒「其它标签」有待办。
+        const approval = !active && model.hasApprovalIn(id)
+        const classes = ['session-tab']
+        if (active) classes.push('is-active')
+        if (typing) classes.push('is-running')
+        const indicators = [
+          typing
+            ? '<span class="tab-dot is-running" title="正在回复"></span>'
+            : live
+              ? '<span class="tab-dot is-live" title="运行中"></span>'
+              : '',
+          approval ? '<span class="tab-approval" title="有权限请求">!</span>' : '',
+          unread > 0 ? `<span class="tab-unread">${unread > 99 ? '99+' : unread}</span>` : '',
+        ]
+          .filter(Boolean)
+          .join('')
+        return `<div class="${classes.join(' ')}" role="presentation">
+          <button class="session-tab-main" type="button" role="tab" aria-selected="${active ? 'true' : 'false'}" data-action="activate-tab" data-session-id="${escapeHtml(id)}" title="${escapeHtml(title)}">
+            <span class="session-tab-title">${escapeHtml(title)}</span>
+            ${indicators}
+          </button>
+          ${
+            multi
+              ? `<button class="session-tab-close" type="button" data-action="close-tab" data-session-id="${escapeHtml(
+                  id,
+                )}" aria-label="关闭 ${escapeHtml(title)}">×</button>`
+              : ''
+          }
+        </div>`
+      })
+      .join('')
+    const actions = multi
+      ? `<button class="session-tab-add" type="button" data-action="new-session" aria-label="新建会话" title="新建会话">+</button>
+         <button class="session-tab-all" type="button" data-action="open-sessions" title="全部会话">全部会话</button>`
+      : ''
+    dom.sessionTabs.innerHTML = `${items}${actions}`
+    dom.sessionTabs.scrollLeft = scrollLeft
+  }
+  if (model.activeSessionId !== state.lastActiveTabId) {
+    state.lastActiveTabId = model.activeSessionId
+    const active = dom.sessionTabs.querySelector('.session-tab.is-active')
+    active?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
+  }
+}
+
+/** 会话面板：打开/切换标签的来源。 */
 function renderSessionSheet() {
   if (!state.sessionSheetOpen || !dom.sessionSheet) return
   const model = state.model
   const sessions = Array.isArray(model?.sessions) ? model.sessions : []
-  // 「当前」以电脑端的绑定为准（sessions.current），本地 sessionId 兜底。
-  const currentId = model?.sessionsCurrent || model?.sessionId || ''
+  const openTabs = new Set(model?.tabs ?? [])
+  const activeId = model?.activeSessionId ?? ''
+  const multi = tabsSupported()
   const rows = sessions
     .map(session => {
       const badges = []
       if (session.live) badges.push('<span class="badge is-live">在线</span>')
-      if (session.id === currentId) badges.push('<span class="badge is-current">当前</span>')
+      if (session.id === activeId) badges.push('<span class="badge is-current">当前</span>')
+      else if (openTabs.has(session.id)) badges.push('<span class="badge is-open">已打开</span>')
       const time = relativeTime(session.updatedAt ?? session.createdAt)
       const meta = [time, session.cwd ? session.cwd : ''].filter(Boolean).map(escapeHtml).join(' · ')
-      const busy = state.sessionSelectPending && session.id !== currentId ? ' is-busy' : ''
-      return `<button class="session-row${busy}" type="button" data-action="select-session" data-session-id="${escapeHtml(session.id)}">
+      const action = multi ? 'open-session' : 'select-session'
+      return `<button class="session-row" type="button" data-action="${action}" data-session-id="${escapeHtml(session.id)}">
         <span class="session-row-main">
           <span class="session-row-title">${escapeHtml(session.title)}</span>
           <span class="session-row-meta">${meta}</span>
@@ -1005,12 +1213,62 @@ function renderSessionSheet() {
     : ''
   dom.sessionSheet.innerHTML = `
     <div class="sheet-grip" aria-hidden="true"></div>
-    <h2>会话</h2>
-    <p class="sheet-row-note">每台设备只驱动一个 DSH 会话；切换后这里会换成该会话的历史。</p>
+    <h2>全部会话</h2>
+    <p class="sheet-row-note">${
+      multi
+        ? `点一个会话把它打开成标签（当前已打开 ${openTabs.size} / ${TAB_LIMIT} 个）；已打开的会直接切过去。`
+        : '电脑端版本较旧，切换会话会替换当前页面的内容。'
+    }</p>
     <div class="session-list" role="list">${rows}${empty}</div>
     ${truncated}
-    <button class="btn btn-secondary btn-block session-new" type="button" data-action="new-session" ${state.sessionSelectPending ? 'disabled' : ''}>新建会话</button>
+    <button class="btn btn-secondary btn-block session-new" type="button" data-action="new-session">新建会话</button>
   `
+}
+
+/**
+ * `session/selected`：成功就补标签 / 激活，失败把刚开的标签收回去。
+ * 连点标签时可能有多条 select 在途：只有最新那条的回复能清掉 pending 并放行队列，
+ * 迟到的旧回复只补标签缓存，避免把消息发到旧的绑定上。
+ * @param {any} frame
+ */
+function handleSessionSelected(frame) {
+  const selection = state.model?.lastSessionSelection
+  const pending = state.pendingSelect
+  const frameRid = typeof frame?.rid === 'string' ? frame.rid : ''
+  const stale = pending && pending.rid !== undefined && frameRid !== '' && pending.rid !== frameRid
+  if (stale) {
+    if (selection?.ok && selection.sessionId) state.model.openTab(selection.sessionId, { activate: false })
+    persistTabsNow()
+    return
+  }
+  state.pendingSelect = null
+  if (!selection) return
+  if (selection.ok) {
+    const id = selection.sessionId || pending?.sessionId || ''
+    if (id === '') return
+    if (pending?.reason === 'create') {
+      state.model.openTab(id, { activate: true })
+      closeSessionSheet()
+      afterTabChange({ select: false })
+      // 列表里也补上新会话（标题 / live 需要电脑端算），下次打开面板就能看到。
+      requestSessionList({ force: true, quiet: true })
+      showToast(selection.title ? `已新建「${selection.title}」` : '已新建会话', 'ok', 2400)
+    } else {
+      const result = state.model.openTab(id, { activate: false })
+      if (result.opened) afterTabChange({ select: false })
+    }
+    flushOutbox()
+    return
+  }
+  // 切换 / 新建失败：not-found 的标签直接收回，避免一个永远加载不出来的标签。
+  const id = pending?.sessionId || selection.sessionId || ''
+  if (id) {
+    const result = state.model.closeTab(id)
+    if (result.changed) afterTabChange({ select: false })
+  }
+  if (state.sessionSheetOpen) renderSessionSheet()
+  showToast(selection.message || selection.error || '切换会话失败', 'error', 4600)
+  flushOutbox()
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,24 +1411,37 @@ function handleFrame(frame) {
   }
   if (frame.t === SERVER_FRAME.PONG) return
 
-  if (frame.t === SERVER_FRAME.SESSION_STATE || frame.t === SERVER_FRAME.SESSION_EVENTS) {
+  if (frame.t === SERVER_FRAME.SESSION_EVENTS || (frame.t === SERVER_FRAME.SESSION_STATE && frame.active !== false)) {
+    // 只有「当前会话」的快照/回放才算补同步；后台标签的快照不影响 cursor 策略。
     state.syncReceived = true
     if (state.syncTimer) {
       clearTimeout(state.syncTimer)
       state.syncTimer = null
     }
   }
+  if (frame.t === SERVER_FRAME.SESSION_STATE && typeof frame.rid === 'string') {
+    state.pendingSnapshots.delete(frame.rid)
+  }
 
-  const approvalsBefore = state.model.approvals.length
+  const approvalsBefore = targetApprovalsCount(frame)
   const result = state.model.applyFrame(frame)
+  const target = result.targetSessionId ?? state.model?.activeSessionId ?? ''
+  const isActiveTarget = target === (state.model?.activeSessionId ?? '')
 
   if (frame.t === SERVER_FRAME.CHAT_ACK) {
     const msgId = String(frame.rid ?? frame.callId ?? '')
     if (msgId) {
+      // ack 帧不带 sessionId，可能在切标签后才到：按 msgId 找到它真正的会话。
+      state.model.markUserMessageSent(msgId, { callId: frame.callId, duplicate: frame.duplicate === true })
       state.outbox = state.outbox.filter(entry => entry.msgId !== msgId)
       storage.saveOutbox(
         state.identity?.deviceId ?? '',
-        state.outbox.map(entry => ({ msgId: entry.msgId, text: entry.text ?? '', at: entry.at })),
+        state.outbox.map(entry => ({
+          msgId: entry.msgId,
+          text: entry.text ?? '',
+          at: entry.at,
+          sessionId: entry.sessionId,
+        })),
       )
     }
     persistSoon(200)
@@ -1183,88 +1454,74 @@ function handleFrame(frame) {
       if (state.sessionSheetOpen) renderSessionSheet()
     }
   }
-  if (frame.t === SERVER_FRAME.CHAT_ERROR) renderComposerState()
-  if (frame.t === SERVER_FRAME.CHAT_DONE) renderComposerState()
+  if (frame.t === SERVER_FRAME.CHAT_ERROR || frame.t === SERVER_FRAME.CHAT_DONE) renderComposerState()
 
   if (frame.t === SERVER_FRAME.SESSIONS) {
     state.sessionListLoading = false
     if (state.sessionSheetOpen) renderSessionSheet()
-    renderHeader()
+    if (Array.isArray(result.dropped) && result.dropped.length > 0) {
+      // 恢复出来的标签里有会话在电脑上已经没了：丢掉并提示（契约 §4）。
+      afterTabChange({ select: true })
+      showToast(`${result.dropped.length} 个会话在电脑上已不存在，已从标签里移除`, '', 4600)
+    } else {
+      renderTabs()
+    }
+    persistTabsNow()
   }
-  if (frame.t === SERVER_FRAME.SESSION_SELECTED) handleSessionSelected()
+  if (frame.t === SERVER_FRAME.SESSION_SELECTED) handleSessionSelected(frame)
   if (frame.t === SERVER_FRAME.APPROVAL_ASK) {
-    syncApprovalTicker()
-    if (state.model.approvals.length > approvalsBefore) {
-      showToast('电脑在请求权限，请在上面这张卡片里作答', '', 3200)
+    if (isActiveTarget) {
+      syncApprovalTicker()
+      if (targetApprovalsCount(frame) > approvalsBefore) {
+        showToast('电脑在请求权限，请在上面这张卡片里作答', '', 3200)
+      }
+    } else if (targetApprovalsCount(frame) > approvalsBefore) {
+      showToast(`「${state.model.titleFor(target)}」有一个权限请求，切到该标签处理`, '', 3600)
     }
   }
   if (frame.t === SERVER_FRAME.APPROVAL_RESOLVED) handleApprovalResolved(result.resolved)
+  if (result.needsWatch) sendTabWatch()
 
   if (result.changed) {
     scheduleRender({
       forceScroll:
-        frame.t === SERVER_FRAME.SESSION_STATE ||
-        frame.t === SERVER_FRAME.APPROVAL_ASK ||
-        frame.t === SERVER_FRAME.SESSION_EVENTS,
+        isActiveTarget &&
+        (frame.t === SERVER_FRAME.SESSION_STATE ||
+          frame.t === SERVER_FRAME.APPROVAL_ASK ||
+          frame.t === SERVER_FRAME.SESSION_EVENTS),
     })
     persistSoon()
   }
-  if (result.sessionChanged) handleSessionChanged(frame)
+  if (frame.t === SERVER_FRAME.SESSION_SELECTED || result.opened) persistTabsNow()
 }
 
 /**
- * 会话确实换了（本页选的，或电脑端通知的）：整页换成新会话的快照。
+ * 某条会话帧到达前的审批数（用于「这是新审批吗」的判断）。
  * @param {any} frame
  */
-function handleSessionChanged(frame) {
-  state.lastRenderSignature = ''
-  if (state.model.sessionId) rememberSession(state.model.sessionId)
-  renderHeader()
-  renderMessages({ forceScroll: true })
-  renderComposerState()
-  if (state.sessionSheetOpen) renderSessionSheet()
-  if (state.justSelectedSession) {
-    // 选择结果已经在 session/selected 里提示过了。
-    state.justSelectedSession = false
-  } else if (frame.t === SERVER_FRAME.SESSION_STATE) {
-    showToast('已切换到电脑上的新会话', 'ok', 2400)
-  }
-}
-
-/** `session/selected`：成功就关面板并记住选择，失败留在面板里说明原因。 */
-function handleSessionSelected() {
-  const selection = state.model?.lastSessionSelection
-  state.sessionSelectPending = false
-  if (!selection) return
-  if (selection.ok) {
-    // justSelectedSession 留给紧随其后的 session/state 消费，避免连报两次「已切换」。
-    if (selection.sessionId) rememberSession(selection.sessionId)
-    closeSessionSheet()
-    showToast(selection.title ? `已切换到「${selection.title}」` : '已切换会话', 'ok', 2400)
-  } else {
-    state.justSelectedSession = false
-    renderSessionSheet()
-    // not-found：记住的会话可能已经在电脑上消失了，别再每次重连都重选它。
-    if (selection.error === 'not-found') {
-      rememberSession('')
-      state.lastSessionId = ''
-    }
-    showToast(selection.message || selection.error || '切换会话失败', 'error', 4600)
-  }
+function targetApprovalsCount(frame) {
+  const model = state.model
+  if (!model) return 0
+  const sessionId =
+    typeof frame?.sessionId === 'string' && frame.sessionId !== '' ? frame.sessionId : model.activeSessionId
+  return model.chatFor(sessionId)?.approvals.length ?? 0
 }
 
 /** `approval/resolved`：卡片由 reducer 移出队列；这里只补充用户看得懂的提示。 */
 function handleApprovalResolved(resolved) {
   syncApprovalTicker()
   if (!resolved) return
+  // 后台标签的请求被电脑处理掉时也给一句，但只在当前标签才需要「你答的」语气。
+  const title = resolved.sessionId ? state.model?.titleFor(resolved.sessionId) : ''
+  const label = resolved.sessionId && resolved.sessionId !== state.model?.activeSessionId ? `「${title}」的` : '这条'
   if (resolved.outcome === 'cancelled') {
     showToast(
-      resolved.source === 'timeout' ? '这条权限请求已超时，交回电脑处理' : '这条权限请求已在电脑上取消',
+      resolved.source === 'timeout' ? `${label}权限请求已超时，交回电脑处理` : `${label}权限请求已在电脑上取消`,
       '',
       3200,
     )
   } else if (resolved.source === 'desktop') {
-    showToast('这条权限请求已在电脑上回答', '', 2400)
+    showToast(`${label}权限请求已在电脑上回答`, '', 2400)
   }
 }
 
@@ -1488,12 +1745,27 @@ function uploadAttachment(attachment) {
   })
 }
 
-/** @param {object} frame */
-function queueOutbox(frame) {
+/**
+ * 消息能不能现在发：必须在线，而且「消息发往哪个会话」的切换已经生效。
+ * 点标签会同时发 session/select；在它回来之前发消息会被电脑端投到旧会话里。
+ * @param {string} sessionId
+ */
+function canSendTo(sessionId) {
+  if (!state.connection?.online) return false
+  const active = state.model?.activeSessionId ?? ''
+  if (active === '' || sessionId === '' || sessionId !== active) return false
+  // 绑定切换（含新建）还没确认前一律不发：宁可多等一次 selected，也不能投错会话。
+  if (state.pendingSelect) return false
+  return true
+}
+
+/** @param {object} frame @param {string} sessionId */
+function queueOutbox(frame, sessionId) {
   const entry = {
     msgId: String(frame.msgId),
     text: String(frame.text ?? ''),
     at: new Date().toISOString(),
+    sessionId: String(sessionId ?? ''),
     frame,
   }
   // 同一 msgId 只留一份（重试不应翻倍）。
@@ -1501,7 +1773,7 @@ function queueOutbox(frame) {
   state.outbox.push(entry)
   storage.saveOutbox(
     state.identity?.deviceId ?? '',
-    state.outbox.map(item => ({ msgId: item.msgId, text: item.text, at: item.at })),
+    state.outbox.map(item => ({ msgId: item.msgId, text: item.text, at: item.at, sessionId: item.sessionId })),
   )
 }
 
@@ -1510,7 +1782,11 @@ function flushOutbox() {
   // 把队列里的消息都送一遍（服务端按 (deviceId, msgId) 幂等，重复发送安全），
   // 但**不**在发送后清空：只有收到 chat/ack 才从队列删除，否则「发出去但 ack 丢了」
   // 会在刷新/重连后变成永远「发送中」的孤儿消息。
+  // 只发当前标签的消息：别的标签的排队消息等切回去再发，绝不能投到错的会话里。
+  const active = state.model?.activeSessionId ?? ''
   for (const entry of state.outbox) {
+    const target = entry.sessionId || active
+    if (!canSendTo(target)) continue
     const frame = entry.frame ?? {
       t: CLIENT_FRAME.CHAT,
       rid: entry.msgId,
@@ -1525,6 +1801,10 @@ function flushOutbox() {
 
 async function sendComposer() {
   if (state.sending) return
+  if (!state.model?.activeSessionId) {
+    showToast('还没有打开的会话：先在「全部会话」里打开一个，或新建一个', 'error', 4200)
+    return
+  }
   const text = dom.composerInput.value.trim()
   const attachments = state.attachments.slice()
   if (text === '' && attachments.length === 0) return
@@ -1560,11 +1840,15 @@ async function sendComposer() {
     }
 
     const msgId = uid('m')
-    state.model.addLocalUserMessage({
-      msgId,
-      text,
-      files: files.map(file => ({ name: file.name, size: file.size, mime: file.mime, uploadId: file.uploadId })),
-    })
+    const targetSessionId = state.model.activeSessionId
+    state.model.addLocalUserMessage(
+      {
+        msgId,
+        text,
+        files: files.map(file => ({ name: file.name, size: file.size, mime: file.mime, uploadId: file.uploadId })),
+      },
+      targetSessionId,
+    )
     /** @type {any} */
     const frame = {
       t: CLIENT_FRAME.CHAT,
@@ -1576,9 +1860,11 @@ async function sendComposer() {
     if (files.length > 0) frame.files = files
 
     // 先入离线队列再发送：ack 丢失或页面被刷新时，重连后会带着同一个 msgId 重发，
-    // 电脑端按幂等键去重，不会出现第二条消息。
-    queueOutbox(frame)
-    if (state.connection?.online) state.connection.send(frame)
+    // 电脑端按幂等键去重，不会出现第二条消息。消息绑定它所属的标签：切到别的标签后
+    // 不会再被发到错的会话里。
+    queueOutbox(frame, targetSessionId)
+    if (canSendTo(targetSessionId)) state.connection.send(frame)
+    else if (state.pendingSelect) showToast('正在切换会话，消息会在切换完成后发出', '', 2600)
 
     dom.composerInput.value = ''
     autosizeInput()
@@ -1595,9 +1881,12 @@ async function sendComposer() {
 
 /** @param {string} msgId */
 function retryMessage(msgId) {
-  const message = state.model?.byId.get(userMessageId(msgId))
-  if (!message) return
+  const found = state.model?.findUserMessage(msgId)
+  if (!found) return
+  const { sessionId, message } = found
   state.model.resetUserMessageForRetry(msgId)
+  // 消息属于别的标签：先切过去，避免把内容发到当前会话。
+  if (sessionId !== state.model.activeSessionId) switchTab(sessionId)
   const frame = {
     t: CLIENT_FRAME.CHAT,
     rid: msgId,
@@ -1605,8 +1894,8 @@ function retryMessage(msgId) {
     callId: msgId,
     text: String(message.text ?? ''),
   }
-  queueOutbox(frame)
-  const sent = Boolean(state.connection?.online && state.connection.send(frame))
+  queueOutbox(frame, sessionId)
+  const sent = canSendTo(sessionId) && Boolean(state.connection.send(frame))
   renderMessages({ forceScroll: true })
   if (!sent) showToast('当前离线：消息已排队，连上后自动发送', '', 2600)
 }
@@ -1645,20 +1934,7 @@ function renderHeader() {
     detail = '已断开'
   }
   dom.connectionDetail.textContent = detail
-  renderSessionChip()
-}
-
-/** 顶部会话胶囊：显示当前会话标题，点开是会话列表。 */
-function renderSessionChip() {
-  if (!dom.sessionChip) return
-  const supported = sessionsSupported()
-  // 老电脑端没有 sessions-v1：不显示一个点了只会报错的按钮。
-  dom.sessionChip.hidden = !supported
-  dom.sessionChip.title = '切换会话'
-  if (!supported) return
-  const title = currentSessionTitle()
-  dom.sessionChipLabel.textContent = title || '会话'
-  dom.sessionChip.classList.toggle('is-known', title !== '')
+  renderTabs()
 }
 
 function renderStatusBanner() {
@@ -1687,7 +1963,9 @@ function renderStatusBanner() {
 
 function messageSignature() {
   if (!state.model) return ''
-  let hash = state.model.messages.length
+  // 换标签时必须整页换掉消息，所以 activeSessionId 进签名。
+  let hash = state.model.activeSessionId.length + 7
+  hash = (hash * 31 + state.model.messages.length) % 1_000_000_007
   for (const message of state.model.messages) {
     hash = (hash * 31 + message.id.length + (message.text?.length ?? 0) + (message.status?.length ?? 0)) % 1_000_000_007
     if (message.tools?.length) hash = (hash * 31 + message.tools.length) % 1_000_000_007
@@ -1715,6 +1993,7 @@ function scheduleRender({ forceScroll = false } = {}) {
     forceScrollQueued = false
     renderMessages({ forceScroll: force })
     renderHeader()
+    renderTabs()
     renderComposerState()
   })
 }
@@ -1924,11 +2203,16 @@ function renderComposerState() {
   const hasText = dom.composerInput.value.trim() !== ''
   const hasAttachments = state.attachments.length > 0
   const streaming = Boolean(state.model?.activeCallId)
+  const hasSession = Boolean(state.model?.activeSessionId)
   dom.sendBtn.hidden = streaming
   dom.stopBtn.hidden = !streaming
-  dom.sendBtn.disabled = state.sending || (!hasText && !hasAttachments)
-  if (state.uploader) {
+  dom.sendBtn.disabled = !hasSession || state.sending || (!hasText && !hasAttachments)
+  if (!hasSession) {
+    dom.composerHint.textContent = '还没有打开的会话：用标签条末端的「+」新建，或在「全部会话」里打开一个'
+  } else if (state.uploader) {
     dom.composerHint.textContent = '正在上传附件…'
+  } else if (state.pendingSelect) {
+    dom.composerHint.textContent = '正在切换会话：消息会先排队，切换完成后自动发送'
   } else if (!state.connection?.online) {
     dom.composerHint.textContent = '当前离线：消息会先排队，连上后自动发送'
   } else {
@@ -1989,19 +2273,21 @@ function renderSettings() {
     )
     .join('')
   const binding = state.binding
-  const sessionTitle = currentSessionTitle()
-  const sessionsNote = sessionsSupported()
-    ? '每台设备只驱动一个 DSH 会话；切换后网页会换成该会话的历史。'
-    : '电脑端版本较旧，暂不支持在网页里切换会话。'
+  const openTabs = state.model?.tabs.length ?? 0
+  const sessionsNote = !sessionsSupported()
+    ? '电脑端版本较旧，暂不支持在网页里切换会话。'
+    : tabsSupported()
+      ? `已打开 ${openTabs} / ${TAB_LIMIT} 个标签：切走的会话继续在后台跑，标签上会显示运行点与未读数。`
+      : '电脑端版本较旧，切换会话会替换当前页面的内容（没有后台标签）。'
   dom.settingsSheet.innerHTML = `
     <div class="sheet-grip" aria-hidden="true"></div>
     <h2>设置</h2>
 
     <section class="sheet-section">
-      <h3 class="sheet-section-title">会话</h3>
+      <h3 class="sheet-section-title">会话标签</h3>
       <div class="sheet-row">
-        <span class="sheet-row-label">${escapeHtml(sessionTitle || '未选择')}</span>
-        <button class="btn btn-secondary btn-sm" type="button" data-action="open-sessions" ${sessionsSupported() ? '' : 'disabled'}>切换会话</button>
+        <span class="sheet-row-label">${escapeHtml(state.model?.titleFor(state.model?.activeSessionId) || '未选择')}</span>
+        <button class="btn btn-secondary btn-sm" type="button" data-action="open-sessions" ${sessionsSupported() ? '' : 'disabled'}>全部会话</button>
       </div>
       <p class="sheet-row-note">${escapeHtml(sessionsNote)}</p>
     </section>
@@ -2156,7 +2442,7 @@ async function unbindDevice() {
   if (state.identity) {
     storage.clearConversation(state.identity.deviceId)
     storage.clearOutbox(state.identity.deviceId)
-    storage.clearLastSession(state.identity.deviceId)
+    storage.clearTabs(state.identity.deviceId)
   }
   storage.clearBinding()
   state.binding = undefined
@@ -2166,11 +2452,14 @@ async function unbindDevice() {
   state.pairSecret = ''
   state.serverCaps = new Set()
   state.status = { state: CONNECTION_STATE.STOPPED }
-  state.lastSessionId = ''
   state.sessionListLoading = false
-  state.sessionSelectPending = false
+  state.pendingSelect = null
+  state.pendingSnapshots = new Map()
   state.lastRenderSignature = ''
+  state.lastTabsSignature = ''
+  state.lastActiveTabId = ''
   stopApprovalTicker()
+  if (dom.sessionTabs) dom.sessionTabs.innerHTML = ''
   closeSettings()
   closeSessionSheet()
   showView('bind')
@@ -2253,12 +2542,23 @@ function setupBindEvents() {
 
 function setupChatEvents() {
   dom.menuBtn.addEventListener('click', openSettings)
-  dom.sessionChip.addEventListener('click', () => {
-    if (!sessionsSupported()) {
-      showToast('电脑端版本较旧，不支持切换会话；请升级电脑端插件', 'error', 4600)
+  dom.sessionTabs.addEventListener('click', event => {
+    const target = event.target.closest('[data-action]')
+    if (!target) return
+    const action = target.dataset.action
+    if (action === 'activate-tab') {
+      switchTab(target.dataset.sessionId ?? '')
       return
     }
-    openSessionSheet()
+    if (action === 'close-tab') {
+      closeTab(target.dataset.sessionId ?? '')
+      return
+    }
+    if (action === 'new-session') {
+      createSession()
+      return
+    }
+    if (action === 'open-sessions') openSessionSheet()
   })
   dom.sheetBackdrop.addEventListener('click', () => {
     closeSettings()
@@ -2267,11 +2567,16 @@ function setupChatEvents() {
   dom.sessionSheet.addEventListener('click', event => {
     const target = event.target.closest('[data-action]')
     if (!target) return
-    if (target.dataset.action === 'select-session') {
-      selectSession(target.dataset.sessionId ?? '')
+    const action = target.dataset.action
+    if (action === 'open-session' || action === 'select-session') {
+      openSessionTab(target.dataset.sessionId ?? '')
       return
     }
-    if (target.dataset.action === 'new-session') createSession()
+    if (action === 'open-sessions') {
+      openSessionSheet()
+      return
+    }
+    if (action === 'new-session') createSession()
   })
   dom.settingsSheet.addEventListener('click', async event => {
     const target = event.target.closest('[data-action], [data-mode], [data-theme-choice]')
@@ -2327,11 +2632,12 @@ function setupChatEvents() {
           danger: true,
         })
         if (ok) {
-          state.model?.clearConversation()
+          state.model?.clearActiveConversation()
           state.lastRenderSignature = ''
           stopApprovalTicker()
           if (state.identity) storage.clearConversation(state.identity.deviceId)
           renderMessages({ forceScroll: true })
+          renderTabs()
           closeSettings()
           showToast('已清空本机记录', 'ok')
         }
@@ -2448,6 +2754,7 @@ function setupLifecycleEvents() {
 async function boot() {
   applyTheme(state.settings.theme)
   dom.bindVersion.textContent = `Open Whale 网页版 v${APP_VERSION}`
+  if (dom.bindProtocol) dom.bindProtocol.textContent = `协议 ${PROTOCOL_VERSION}`
   setupBindEvents()
   setupComposerEvents()
   setupChatEvents()

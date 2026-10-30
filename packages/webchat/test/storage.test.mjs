@@ -82,15 +82,19 @@ test('binding 校验：缺关键字段 → undefined（避免半绑定状态）'
   assert.equal(normalizeBinding({ ...good, endpoints: 'nope' }).endpoints.length, 0)
 })
 
-test('outbox 规整：最多 20 条，过滤非法条目', () => {
+test('outbox 规整：最多 20 条，过滤非法条目，保留所属会话', () => {
   const outbox = normalizeOutbox([
-    { msgId: 'm1', text: '一' },
+    { msgId: 'm1', text: '一', sessionId: 'sess_a' },
+    { msgId: 'm2', text: '二' },
     { msgId: 42, text: '坏' },
     { text: '缺 id' },
-    ...Array.from({ length: 30 }, (_v, index) => ({ msgId: `m${index + 2}`, text: `第 ${index}` })),
+    { msgId: 'm3', text: '三', sessionId: 7 },
+    ...Array.from({ length: 30 }, (_v, index) => ({ msgId: `x${index + 2}`, text: `第 ${index}` })),
   ])
   assert.equal(outbox.length, 20)
   assert.equal(outbox[0].msgId, 'm1')
+  assert.equal(outbox[0].sessionId, 'sess_a')
+  assert.equal('sessionId' in outbox[1], false, '旧记录没有 sessionId 时按当前会话处理')
   assert.equal(normalizeOutbox(undefined).length, 0)
 })
 
@@ -126,14 +130,17 @@ test('createStorage：绑定 / 设置 / 会话 / outbox 完整往返', () => {
   storage.clearOutbox('web_123')
   assert.deepEqual(storage.loadOutbox('web_123'), [])
 
-  // 上次选中的会话按设备分开存：换一台电脑不会误用另一台的 sessionId。
-  assert.equal(storage.loadLastSession('web_123'), '')
-  assert.equal(storage.saveLastSession('web_123', 'sess_a'), true)
-  assert.equal(storage.loadLastSession('web_123'), 'sess_a')
-  assert.equal(storage.loadLastSession('web_999'), '')
-  storage.saveLastSession('web_123', '')
-  assert.equal(storage.loadLastSession('web_123'), '')
-  assert.equal(storage.saveLastSession('', 'sess_a'), false)
+  // 标签页状态按设备分开存：换一台电脑不会拿另一台的 sessionId 去开标签。
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '' })
+  assert.equal(storage.saveTabs('web_123', { tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_b' }), true)
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_b' })
+  assert.deepEqual(storage.loadTabs('web_999'), { tabs: [], activeSessionId: '' })
+  // active 不在列表里 / 非法条目会被规整掉。
+  storage.saveTabs('web_123', { tabs: ['sess_a', 42, ''], activeSessionId: 'missing' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a'], activeSessionId: 'sess_a' })
+  storage.saveTabs('web_123', { tabs: [], activeSessionId: '' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '' })
+  assert.equal(storage.saveTabs('', { tabs: ['a'] }), false)
 
   storage.clearBinding()
   assert.equal(storage.loadBinding(), undefined)

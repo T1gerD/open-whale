@@ -112,15 +112,22 @@ export function normalizeBinding(value) {
 
 /**
  * 待发消息（离线队列）。只持久化文本消息：附件体积大，宁可让用户重发。
+ * `sessionId` 在 v2.4.0 加入：排队中的消息必须记得它属于哪个会话标签，
+ * 否则重连/切标签后会被发到错的会话里。旧记录没有这个字段，按当前会话处理。
  * @param {any} value
- * @returns {Array<{msgId: string, text: string, at: string}>}
+ * @returns {Array<{msgId: string, text: string, at: string, sessionId?: string}>}
  */
 export function normalizeOutbox(value) {
   if (!Array.isArray(value)) return []
   return value
     .filter(item => item && typeof item.msgId === 'string' && typeof item.text === 'string')
     .slice(0, 20)
-    .map(item => ({ msgId: item.msgId, text: item.text, at: typeof item.at === 'string' ? item.at : new Date().toISOString() }))
+    .map(item => ({
+      msgId: item.msgId,
+      text: item.text,
+      at: typeof item.at === 'string' ? item.at : new Date().toISOString(),
+      ...(typeof item.sessionId === 'string' && item.sessionId !== '' ? { sessionId: item.sessionId } : {}),
+    }))
 }
 
 /**
@@ -233,31 +240,43 @@ export function createStorage(storage, prefix = STORAGE_PREFIX) {
       removeRaw(`outbox.${deviceId}`)
     },
     /**
-     * 这台设备上次选中的 DSH 会话。按设备（= 电脑助手）分开存，换一台电脑不会
-     * 把上一台电脑的 sessionId 拿来乱选。
+     * 标签页状态：`{tabs, activeSessionId}`。按设备（= 电脑助手）分开存，
+     * 换一台电脑不会把上一台电脑的 sessionId 拿来乱开标签。
      * @param {string} deviceId
-     * @returns {string} 没有记录时返回空串
+     * @returns {{tabs: string[], activeSessionId: string}}
      */
-    loadLastSession(deviceId) {
-      if (!deviceId) return ''
-      const saved = parseStored(getRaw(`session.${deviceId}`))
-      const sessionId = saved && typeof saved.sessionId === 'string' ? saved.sessionId : ''
-      return sessionId.length > 0 && sessionId.length <= 200 ? sessionId : ''
+    loadTabs(deviceId) {
+      if (!deviceId) return { tabs: [], activeSessionId: '' }
+      const saved = parseStored(getRaw(`tabs.${deviceId}`))
+      const tabs = Array.isArray(saved?.tabs)
+        ? saved.tabs
+            .filter(item => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(item => item !== '' && item.length <= 200)
+        : []
+      const activeSessionId =
+        typeof saved?.activeSessionId === 'string' && tabs.includes(saved.activeSessionId)
+          ? saved.activeSessionId
+          : ''
+      return { tabs: [...new Set(tabs)], activeSessionId }
     },
-    /** @param {string} deviceId @param {string} sessionId */
-    saveLastSession(deviceId, sessionId) {
+    /** @param {string} deviceId @param {{tabs?: string[], activeSessionId?: string}} state */
+    saveTabs(deviceId, state) {
       if (!deviceId) return false
-      const value = String(sessionId ?? '').trim()
-      if (value === '' || value.length > 200) {
-        removeRaw(`session.${deviceId}`)
-        return true
-      }
-      return setRaw(`session.${deviceId}`, JSON.stringify({ sessionId: value, at: new Date().toISOString() }))
+      const input = state && typeof state === 'object' ? state : {}
+      const tabs = Array.isArray(input.tabs)
+        ? [...new Set(input.tabs.filter(item => typeof item === 'string' && item.length > 0 && item.length <= 200))]
+        : []
+      const activeSessionId =
+        typeof input.activeSessionId === 'string' && tabs.includes(input.activeSessionId)
+          ? input.activeSessionId
+          : tabs[0] ?? ''
+      return setRaw(`tabs.${deviceId}`, JSON.stringify({ version: 1, tabs, activeSessionId }))
     },
     /** @param {string} deviceId */
-    clearLastSession(deviceId) {
+    clearTabs(deviceId) {
       if (!deviceId) return
-      removeRaw(`session.${deviceId}`)
+      removeRaw(`tabs.${deviceId}`)
     },
   }
 }

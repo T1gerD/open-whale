@@ -33,14 +33,13 @@ import { endpointKindLabel } from '../../../src/core/endpoint.mts'
 import { describeTransfer, formatBytes, transferProgress } from '../../../src/core/files.mts'
 import { formatCountdown } from '../../../src/core/power.mts'
 import type { ChatMessage, Transfer } from '../../../src/core/reducer.mts'
-import { sessionAvailability, sessionTitleOf } from '../../../src/core/sessions.mts'
+import { sessionAvailability } from '../../../src/core/sessions.mts'
 import { pickAttachment, type PickedAttachment } from '../../../src/services/attachments'
 import type { AssistantView } from '../../../src/state/app-store'
 import { useAppStore, useAssistantView } from '../../../src/state/store'
 import { ApprovalCard } from '../../../src/ui/approval-card'
 import {
   ActionSheet,
-  Chip,
   EmptyState,
   InlineBanner,
   MessageText,
@@ -52,6 +51,7 @@ import {
   type ActionSheetOption,
 } from '../../../src/ui/components'
 import { SessionPickerSheet } from '../../../src/ui/session-picker'
+import { TabStrip } from '../../../src/ui/tab-strip'
 import { font, radius, spacing, useTheme, useThemedStyles, type Theme } from '../../../src/ui/theme'
 
 /**
@@ -99,12 +99,17 @@ export default function ChatScreen() {
   const rows = useMemo(() => buildRows(messages), [messages])
   const streaming = Boolean(view?.chat.typing?.active) || messages.some(message => message.streaming === true)
 
-  // ---- 2.3.0：会话选择器 / 权限请求 ----
+  // ---- 2.3.0：会话选择器 / 权限请求；2.4.0：会话标签条 ----
   const sessions = view?.sessions
   const approvals = view?.approvals ?? []
   // 多条待答请求按队列显示：先显示最早的一条，其余用一行字提示，绝不互相覆盖。
   const pendingApproval = approvals[0]
-  const sessionLabel = sessionTitleOf(sessions, view?.chat.sessionId) ?? (view?.chat.sessionId ? '当前会话' : '选择会话')
+  const tabViews = view?.tabViews ?? []
+  const activeSessionId = view?.tabs.activeSessionId ?? ''
+  const tabsSupported = view?.tabsSupported === true
+  // 旧电脑端没有 session-tabs-v1：后台标签不会收到任何事件，多标签只会骗人。
+  // 这时标签条只显示当前会话，切换仍走「全部会话」+ session/select（v2.3.0 行为）。
+  const visibleTabs = tabsSupported ? tabViews : tabViews.filter(tab => tab.active)
   // 离线 / 电脑端没有 sessions-v1：面板里的行与「新建会话」都禁用，并明说原因。
   const sessionGate = sessionAvailability(view?.link.online === true, view?.link.capabilities)
   const sessionsDisabledHint = sessionGate.ok ? undefined : `${sessionGate.error}\n${sessionGate.hint}`
@@ -164,6 +169,16 @@ export default function ChatScreen() {
     // 只在进入会话（消息首次可用）时跑一次；后续新消息由上面的 effect 处理。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages.length === 0])
+
+  // 切换标签（v2.4.0）：整页消息换了一批，必须重置"用户接管"状态并贴底，
+  // 否则用户在上一个标签里往上翻过，新标签会停在他的旧位置。
+  useEffect(() => {
+    userTookOver.current = false
+    nearBottom.current = true
+    lastContentHeight.current = 0
+    const timer = setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 60)
+    return () => clearTimeout(timer)
+  }, [activeSessionId])
 
   const copy = useCallback(
     async (value: string, label = '已复制') => {
@@ -289,6 +304,42 @@ export default function ChatScreen() {
     setShowJump(distance > 240)
   }, [])
 
+  // ---- 会话标签页（2.4.0） ------------------------------------------------
+
+  /** 点标签：store 里是同步切换（本地缓存先渲染），随后补 session/snapshot。 */
+  const selectTab = useCallback(
+    (sessionId: string) => {
+      if (!assistantId || !sessionId) return
+      setNotice(undefined)
+      store.activateTab(assistantId, sessionId)
+    },
+    [assistantId, store],
+  )
+
+  const closeTab = useCallback(
+    (sessionId: string) => {
+      if (!assistantId) return
+      store.closeTab(assistantId, sessionId)
+    },
+    [assistantId, store],
+  )
+
+  /** 标签条末尾的 ＋：新建会话；成功后电脑端回 session/selected，容器会把它开成新标签。 */
+  const createTab = useCallback(() => {
+    if (!assistantId) return
+    setSessionError(undefined)
+    void store
+      .createSession(assistantId)
+      .then(result => {
+        if (!result.ok) setNotice([result.error, result.hint].filter(Boolean).join('\n'))
+      })
+      .catch((error: Error) => setNotice(`新建会话失败：${error.message}`))
+  }, [assistantId, store])
+
+  const dismissTabsNotice = useCallback(() => {
+    if (assistantId) store.dismissTabsNotice(assistantId)
+  }, [assistantId, store])
+
   // ---- 会话选择器 ---------------------------------------------------------
 
   /** 拉一次会话列表；离线/电脑端太旧时不发帧，直接把原因显示在面板里。 */
@@ -301,7 +352,7 @@ export default function ChatScreen() {
         setSessionError(`${gate.error}\n${gate.hint}`)
         return
       }
-      if (!force && view.chat.sessionList) return
+      if (!force && view.sessions) return
       setSessionBusy(true)
       void store
         .listSessions(assistantId)
@@ -322,12 +373,19 @@ export default function ChatScreen() {
     loadSessions(false)
   }, [loadSessions])
 
-  /** 选中一个会话：面板先关掉，聊天页会显示「正在打开…」并在快照到达后整页替换。 */
+  /**
+   * 从「全部会话」里选一个：v2.4.0 把它**打开成标签**（不重放历史，快照补齐）；
+   * 旧电脑端没有 session-tabs-v1 时退回 v2.3.0 的 session/select 单会话切换。
+   */
   const chooseSession = useCallback(
     (sessionId: string) => {
       if (!assistantId) return
       setShowSessions(false)
       setSessionError(undefined)
+      if (view?.tabsSupported) {
+        store.openSessionTab(assistantId, sessionId)
+        return
+      }
       void store
         .selectSession(assistantId, sessionId)
         .then(result => {
@@ -338,7 +396,7 @@ export default function ChatScreen() {
         })
         .catch((error: Error) => setNotice(`切换会话失败：${error.message}`))
     },
-    [assistantId, store],
+    [assistantId, store, view?.tabsSupported],
   )
 
   const createSession = useCallback(() => {
@@ -423,6 +481,12 @@ export default function ChatScreen() {
           {notice}
         </InlineBanner>
       ) : null}
+
+      {view.tabsNotice ? (
+        <InlineBanner tone="warning" title="会话标签已更新" actionLabel="知道了" onAction={dismissTabsNotice}>
+          {view.tabsNotice}
+        </InlineBanner>
+      ) : null}
     </View>
   )
 
@@ -454,6 +518,18 @@ export default function ChatScreen() {
             </Link>
           ),
         }}
+      />
+
+      {/* 页内常驻标签条：标题栏下方、消息列表上方，永远可见（不是弹窗）。 */}
+      <TabStrip
+        tabs={visibleTabs}
+        activeId={activeSessionId}
+        supported={tabsSupported}
+        online={link.online}
+        onSelect={selectTab}
+        onClose={closeTab}
+        onCreate={createTab}
+        onOpenAll={openSessions}
       />
 
       <FlatList
@@ -533,28 +609,12 @@ export default function ChatScreen() {
       ) : null}
 
       <View style={[styles.composerWrap, { backgroundColor: theme.colors.composer }, { paddingBottom: keyboardShown ? spacing.sm : Math.max(insets.bottom, spacing.sm) }]}>
-        {/* 会话胶囊：随时能看/换电脑上的会话，不用翻设置页。 */}
-        <View style={styles.sessionBar}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="切换会话"
-            onPress={openSessions}
-            hitSlop={6}
-            style={({ pressed }) => [
-              styles.sessionChip,
-              { backgroundColor: theme.colors.surfaceAlt, borderColor: theme.colors.border },
-              pressed && styles.pressed,
-            ]}
-          >
-            <Text style={styles.sessionGlyph}>🗂</Text>
-            <Text style={[styles.sessionLabel, { color: theme.colors.textSecondary }]} numberOfLines={1}>
-              {sessionLabel}
-            </Text>
-            <Text style={[styles.sessionChevron, { color: theme.colors.textMuted }]}>▾</Text>
-          </Pressable>
-          {sessions?.truncated ? <Chip label="仅最近" /> : null}
-          {link.online ? null : <Chip label="离线" tone="warning" />}
-        </View>
+        {/* v2.4.0：底部不再放会话胶囊。会话切换在顶部标签条（全部会话 / ＋ 也在那里）。 */}
+        {!link.online ? (
+          <View style={styles.offlineRow}>
+            <Text style={styles.offlineHint}>离线：消息会排队，连上电脑后自动发出。</Text>
+          </View>
+        ) : null}
 
         {/* 权限请求：多条排队，只有第一条展开（其余先计数），绝不互相覆盖。 */}
         {pendingApproval ? (
@@ -663,6 +723,7 @@ export default function ChatScreen() {
         visible={showSessions}
         list={sessions}
         currentId={view.chat.sessionId}
+        openIds={tabsSupported ? view.tabs.tabs : []}
         loading={sessionBusy}
         error={sessionError}
         disabledHint={sessionsDisabledHint}
@@ -1150,19 +1211,8 @@ const createChatStyles = (theme: Theme) =>
       ...theme.shadow.composer,
     },
     sessionBar: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
-    sessionChip: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: spacing.xs,
-      maxWidth: '78%',
-      borderRadius: radius.pill,
-      borderWidth: StyleSheet.hairlineWidth,
-      paddingHorizontal: spacing.md,
-      paddingVertical: 5,
-    },
-    sessionGlyph: { fontSize: font.tiny },
-    sessionLabel: { fontSize: font.tiny, fontWeight: '600', flexShrink: 1 },
-    sessionChevron: { fontSize: font.tiny },
+    offlineRow: { paddingHorizontal: spacing.xs },
+    offlineHint: { color: theme.colors.textMuted, fontSize: font.tiny },
     approvalWrap: { gap: 2 },
     moreApprovals: { color: theme.colors.textMuted, fontSize: font.tiny, lineHeight: 16, marginBottom: spacing.xs },
     composerRow: { flexDirection: 'row', alignItems: 'flex-end', gap: spacing.sm },

@@ -82,10 +82,8 @@ import {
 } from '../core/outbox.mts'
 import { validateQrText } from '../core/qr-image.mts'
 import {
-  emptyChatState,
   hydrateChat,
   isKnownServerFrame,
-  reduceChat,
   type ChatEffect,
   type ChatEvent,
   type ChatMessage,
@@ -94,6 +92,23 @@ import {
   type Transfer,
 } from '../core/reducer.mts'
 import { sessionAvailability, type SessionListState } from '../core/sessions.mts'
+import {
+  PLACEHOLDER_SESSION,
+  activeChat,
+  emptyTabs,
+  parseTabsMeta,
+  pendingApprovalsElsewhere,
+  restoreTabs,
+  routeEvent,
+  sessionOfApproval,
+  tabStripModel,
+  tabsMeta,
+  totalUnread,
+  watchSessionIds,
+  type TabView,
+  type TabsInput,
+  type TabsState,
+} from '../core/tabs.mts'
 import { uploadFailureLabel, uploadGuard } from '../core/upload.mts'
 import { planWake, type WakeSetting } from '../core/wake.mts'
 import { pairingDeps, orderEndpoints } from '../protocol/runtime'
@@ -111,18 +126,23 @@ import { performWake } from '../services/wake'
 
 export interface StoredAssistantRow extends AssistantRecord {
   wakeMac?: string
+  /** 已打开的会话标签（打开顺序，2.4.0 持久化）。 */
+  tabs?: string[]
+  /** 当前显示的标签（= 这台手机绑定的会话）。 */
+  activeSessionId?: string
 }
 
 export interface AssistantView {
   assistant: StoredAssistantRow
   link: LinkSnapshot
+  /** 当前标签的聊天状态（v2.4.0 起一个助理可以有多个会话标签）。 */
   chat: ChatState
   power: PowerState
   /** 未确认（待发/失败）的消息条数，列表页用来提示。 */
   pendingMessages: number
   /** 正在下载的文件数。 */
   activeTransfers: number
-  /** 电脑上会话列表（会话选择器的数据源；没拉过就是 undefined）。 */
+  /** 电脑上会话列表（「全部会话」面板的数据源；没拉过就是 undefined）。 */
   sessions: SessionListState | undefined
   /** 等待手机回答的 DSH 权限请求（多条并存，不会互相覆盖）。 */
   approvals: ApprovalPrompt[]
@@ -132,6 +152,16 @@ export interface AssistantView {
   connectionMode: string
   /** 当前线路的人类可读标签（例如「Tailscale」）。 */
   endpointLabel: string
+  /** 标签页容器（tabs / activeSessionId / chats / activity）。 */
+  tabs: TabsState
+  /** 标签条的渲染模型（顺序 = 打开顺序）。 */
+  tabViews: TabView[]
+  /** 电脑端是否声明了 `session-tabs-v1`；没有就退回 v2.3.0 单会话行为。 */
+  tabsSupported: boolean
+  /** 其它标签里排队的审批总数（标签条上的角标）。 */
+  otherApprovals: number
+  /** 恢复时被丢弃的标签提示（已经不在电脑上的会话）。 */
+  tabsNotice?: string
 }
 
 export type Appearance = 'system' | 'light' | 'dark'
@@ -186,10 +216,11 @@ function uploadRefsFor(entry: OutboxEntry): OutboxUploadRef[] {
   return entry.uploads ?? []
 }
 
-/** 每个助理一个：聊天状态 + 离线队列 + 文件组装缓冲。 */
+/** 每个助理一个：多会话标签容器 + 离线队列 + 文件组装缓冲。 */
 class ChatController {
   readonly assistantId: string
-  chat: ChatState
+  /** 多会话容器；`chat` 是它的只读视图（当前标签）。 */
+  tabs: TabsState
   outbox: Outbox = createOutbox()
   power: PowerState = idlePowerState()
   unread = 0
@@ -201,10 +232,14 @@ class ChatController {
   private sinks = new Map<string, DownloadSink>()
   /** 每个文件的写入串行队列（保证分块按序落盘）。 */
   private sinkQueues = new Map<string, Promise<void>>()
-  private pendingWrites = new Map<string, ChatMessage>()
+  private pendingWrites = new Map<string, { message: ChatMessage; sessionId: string }>()
   private persistedTransfers: Record<string, Transfer> = {}
   private flushTimer: ReturnType<typeof setTimeout> | undefined
   private cursorTimer: ReturnType<typeof setTimeout> | undefined
+  private tabsTimer: ReturnType<typeof setTimeout> | undefined
+  private persistedTabs = ''
+  /** 上次自动拉会话列表的时间（重连风暴时的节流）。 */
+  private lastListRequestAt = 0
   private sendChain: Promise<void> = Promise.resolve()
   private lastSend: { key: string; at: number; rid: string } | undefined
   private pumping = false
@@ -214,32 +249,61 @@ class ChatController {
   constructor(store: AppStore, assistantId: string) {
     this.store = store
     this.assistantId = assistantId
-    this.chat = emptyChatState(assistantId)
+    this.tabs = emptyTabs(assistantId)
+  }
+
+  /** 当前标签的聊天状态。 */
+  get chat(): ChatState {
+    return activeChat(this.tabs)
   }
 
   attach(link: AssistantLink | undefined): void {
     this.link = link
   }
 
+  /**
+   * 从 SQLite 恢复：标签（v2.4.0 持久化）、每个标签自己的消息、传输与离线队列。
+   *
+   * 消息按 `session_id` 分开读；升级前的老库没有这一列，那些行的
+   * `session_id IS NULL`，只归给当前绑定的会话（否则升级后同一批历史会出现在
+   * 每一个标签里）。
+   */
   async load(): Promise<void> {
-    const [messages, transfers, outbox] = await Promise.all([
-      loadMessages(this.assistantId),
-      loadTransfers(this.assistantId),
-      loadOutbox(this.assistantId),
-    ])
-    this.chat = hydrateChat(this.assistantId, messages, transfers, Date.now())
-    // 会话元数据从助理记录恢复（游标用于重连补发）。
     const row = this.store.assistantRow(this.assistantId)
-    this.chat = {
-      ...this.chat,
-      sessionId: row.sessionId,
-      sessionEpoch: row.sessionEpoch,
-      sessionCursor: typeof row.sessionCursor === 'number' ? row.sessionCursor : 0,
+    const transfers = await loadTransfers(this.assistantId)
+    const outbox = await loadOutbox(this.assistantId)
+    const meta = parseTabsMeta(JSON.stringify({ tabs: row.tabs, activeSessionId: row.activeSessionId }))
+    let state = restoreTabs(this.assistantId, meta, row.sessionId)
+    const now = Date.now()
+    // 还没有任何会话（首次绑定/还没连过）时，历史消息属于占位标签。
+    const targets = state.tabs.length > 0 ? state.tabs : [PLACEHOLDER_SESSION]
+
+    for (const id of targets) {
+      const placeholder = id === PLACEHOLDER_SESSION
+      // 升级前的老库没有 session_id：那些历史只归给当前绑定的会话，不能出现在每个标签里。
+      const legacy = !placeholder && id === state.activeSessionId
+      const messages = await loadMessages(this.assistantId, placeholder ? undefined : id, 400, legacy)
+      let chat = hydrateChat(this.assistantId, messages, transfers, now)
+      chat = { ...chat, sessionId: placeholder ? row.sessionId : id }
+      if (id === state.activeSessionId) {
+        // 游标/纪元只对当前绑定的会话有意义（hello 带的就是它）。
+        chat = {
+          ...chat,
+          sessionEpoch: row.sessionEpoch,
+          sessionCursor: typeof row.sessionCursor === 'number' ? row.sessionCursor : 0,
+        }
+      }
+      state = { ...state, chats: { ...state.chats, [id]: chat } }
     }
-    this.persistedTransfers = { ...this.chat.transfers }
+    this.tabs = state
+    this.persistedTabs = JSON.stringify(tabsMeta(this.tabs))
+    this.persistedTransfers = { ...allTransfers(this.tabs) }
     // 重启后“飞行中”的条目必须退回 pending，否则它们永远不会被重发。
     this.outbox = releaseInflight(outbox)
     await saveOutbox(this.assistantId, this.outbox)
+    // 老库（2.3.0）没有 tabs 列：把默认标签立刻落盘，下次启动就是完整的了。
+    this.persistedTabs = ''
+    this.persistTabs(true)
   }
 
   /**
@@ -266,7 +330,11 @@ class ChatController {
     this.dispatch(frame as ChatEvent)
   }
 
-  /** 连接断开：把未确认消息退回队列，标记流式中断，停掉进行中的上传。 */
+  /**
+   * 连接断开：把未确认消息退回队列，标记流式中断，停掉进行中的上传。
+   * 容器会把 `conn/disconnected` 应用到**每一个**标签：切走的会话里还在流的回答
+   * 同样要标成"可能不完整"，审批卡也同样失效。
+   */
   onDisconnected(): void {
     this.uploader?.abortAll('网络已断开，上传中断')
     this.dispatch({ t: 'conn/disconnected', at: Date.now() })
@@ -277,26 +345,49 @@ class ChatController {
   onConnected(): void {
     this.dispatch({ t: 'conn/connected', at: Date.now() })
     this.pumpOutbox()
+    // 电脑端不记得上一次的订阅：重连后必须重新发一次 session/watch（契约 §2）。
+    this.syncWatch()
   }
 
-  /** 会话切换（电脑端换了绑定会话）：清空本地会话，等 session/state 快照。 */
+  /**
+   * 电脑端把绑定会话切走了（桌面端换了一个会话，或 hello/ack 里 sessionId/纪元变了）。
+   * 标签页模式下不要清空整个页面：激活对应标签，只重新拉它自己的快照。
+   */
   onSessionSwitch(info: { sessionId?: string; sessionEpoch?: number; reason?: string }): void {
+    const at = Date.now()
+    const hasId = typeof info.sessionId === 'string' && info.sessionId !== ''
+    if (hasId) {
+      // 激活会走 syncTabFrames：session/select + session/snapshot 都已发出。
+      this.dispatch({ t: 'tabs/activate', sessionId: info.sessionId as string, at })
+    }
     this.dispatch({
       t: 'session/reset',
       sessionId: info.sessionId,
       sessionEpoch: info.sessionEpoch,
       reason: info.reason,
-      at: Date.now(),
+      at,
     })
+    // 只有纪元变了（没给 sessionId）时才需要自己补一次快照；否则上面已经发过了。
+    if (!hasId && this.link?.isOnline) {
+      const id = this.tabs.activeSessionId
+      if (id) this.link.requestSessionSnapshot(id)
+    }
   }
 
   /**
    * 本地每秒节拍：权限请求过期后必须自己消失。
    * 电脑端到点会把提示交回桌面，之后不会再有任何帧告诉手机“这条已经不用答了”。
+   * v2.4.0 要**所有**标签都扫一遍，否则切走后那条卡会一直挂在那里。
    */
   tickApprovals(): void {
-    if (this.chat.approvals.length === 0) return
-    this.dispatch({ t: 'approval/tick', at: Date.now() })
+    const any = Object.values(this.tabs.chats).some(chat => (chat?.approvals.length ?? 0) > 0)
+    if (!any) return
+    this.dispatch({ t: 'tabs/tick', at: Date.now() })
+  }
+
+  /** 是否有任何一个标签在等审批（AppStore 用它决定要不要起每秒节拍）。 */
+  hasApprovals(): boolean {
+    return Object.values(this.tabs.chats).some(chat => (chat?.approvals.length ?? 0) > 0)
   }
 
   /**
@@ -305,7 +396,16 @@ class ChatController {
    * 等它才撤会让用户对着一个已经答过的按钮发呆。reducer 里 resolved 是幂等的。
    */
   ackApproval(approvalId: string, outcome: 'allowed-once' | 'rejected'): void {
-    this.dispatch({ t: 'approval/resolved', approvalId, outcome, source: 'phone', at: Date.now() })
+    // 审批卡可能属于任何一个标签：把 resolved 送进它真正的会话，别误删别的标签的卡。
+    const owner = sessionOfApproval(this.tabs, approvalId)
+    this.dispatch({
+      t: 'approval/resolved',
+      sessionId: owner,
+      approvalId,
+      outcome,
+      source: 'phone',
+      at: Date.now(),
+    })
   }
 
   /** 进入聊天页：清未读。 */
@@ -468,7 +568,7 @@ class ChatController {
 
   /** 点击文件卡片：已落盘就直接打开，否则先请求下载。 */
   async openFile(fileId: string): Promise<void> {
-    const transfer = this.chat.transfers[fileId]
+    const transfer = this.transferOf(fileId)
     if (!transfer) return
     if (!transfer.localPath) {
       this.requestFile(fileId)
@@ -479,20 +579,31 @@ class ChatController {
 
   snapshot(): AssistantView {
     const row = this.store.assistantRow(this.assistantId)
+    const supportsTabs = this.link?.hasCapability(CAPABILITIES.SESSION_TABS) === true
+    const transfers = allTransfers(this.tabs)
     return {
       assistant: row,
       link: this.link?.snapshot ?? OFFLINE_LINK,
       chat: this.chat,
       power: this.power,
       pendingMessages: pendingCount(this.outbox),
-      activeTransfers: Object.values(this.chat.transfers).filter(
+      activeTransfers: Object.values(transfers).filter(
         transfer => transfer.status === 'downloading' || transfer.status === 'queued',
       ).length,
-      sessions: this.chat.sessionList,
+      sessions: this.tabs.sessionList,
       approvals: this.chat.approvals,
-      unread: this.unread,
+      // 未读 = 当前标签的助理级未读 + 后台标签的未读（activity 只在非当前标签累加）。
+      unread: this.unread + totalUnread(this.tabs),
       connectionMode: normalizeConnectionMode(row.connectionMode),
       endpointLabel: this.link?.snapshot.endpoint ? endpointLabel(this.link.snapshot.endpoint) : '未连接',
+      tabs: this.tabs,
+      tabViews: tabStripModel(this.tabs),
+      tabsSupported: supportsTabs,
+      otherApprovals: pendingApprovalsElsewhere(this.tabs),
+      tabsNotice:
+        this.tabs.droppedTabs.length > 0
+          ? `${this.tabs.droppedTabs.length} 个会话已经不在电脑上，相关标签已关闭。`
+          : undefined,
     }
   }
 
@@ -500,8 +611,10 @@ class ChatController {
     this.disposed = true
     if (this.flushTimer) clearTimeout(this.flushTimer)
     if (this.cursorTimer) clearTimeout(this.cursorTimer)
+    if (this.tabsTimer) clearTimeout(this.tabsTimer)
     this.flushTimer = undefined
     this.cursorTimer = undefined
+    this.tabsTimer = undefined
     void this.abortAllSinks('页面已销毁')
     this.uploader?.dispose()
     this.sinks.clear()
@@ -673,23 +786,162 @@ class ChatController {
     return refs
   }
 
-  /** 统一的 reducer 出口：执行副作用、按需持久化、最后通知 UI。 */
-  private dispatch(event: ChatEvent): void {
-    const before = this.chat.messages
-    const beforeTransfers = this.chat.transfers
+  /**
+   * 统一的 reducer 出口。
+   *
+   * 事件先经过标签容器路由（`routeEvent`）——决定它属于哪个会话、标签条上的
+   * 未读/运行怎么变——再对**那个会话**的 ChatState 跑 reducer。所以切走的会话
+   * 收到的流式输出会进它自己的标签，不会污染当前会话。
+   */
+  private dispatch(event: TabsInput): void {
+    const at = Date.now()
+    const beforeChats = this.tabs.chats
+    const beforeActive = this.tabs.activeSessionId
+    const beforePersistedTabs = JSON.stringify(tabsMeta(this.tabs))
     const beforeCursor = this.chat.sessionCursor
-    const beforeIds = new Set(before.map(message => message.id))
-    const result = reduceChat(this.chat, event, Date.now())
-    this.chat = result.state
+    const result = routeEvent(this.tabs, event, at)
+    this.tabs = result.state
     this.runEffects(result.effects)
-    this.persistMessageDiff(before, result.state.messages)
-    this.persistTransferDiff(beforeTransfers, result.state.transfers)
-    this.bumpUnread(beforeIds, result.state.messages)
+
+    for (const id of result.touched) {
+      const before = beforeChats[id]
+      const after = this.tabs.chats[id]
+      if (!after) continue
+      this.persistMessageDiff(before?.messages ?? [], after.messages, id)
+      this.persistTransferDiff(before?.transfers ?? {}, after.transfers)
+    }
+    // 未读角标（助理列表页）：新出现的助手回复计入当前标签；后台标签由 activity 计。
+    if (result.target !== undefined && result.target === this.tabs.activeSessionId) {
+      const target = this.tabs.chats[result.target]
+      if (target) {
+        const beforeIds = new Set((beforeChats[result.target]?.messages ?? []).map(message => message.id))
+        this.bumpUnread(beforeIds, target.messages)
+      }
+    }
     if (this.chat.sessionCursor !== beforeCursor) this.scheduleCursorPersist()
+    const afterPersistedTabs = JSON.stringify(tabsMeta(this.tabs))
+    const tabsChanged = afterPersistedTabs !== beforePersistedTabs
+    if (result.activeChanged) {
+      // 切换标签：select + snapshot + 重新订阅其余标签。
+      this.onActiveTabChanged()
+    } else if (tabsChanged || beforeActive !== this.tabs.activeSessionId) {
+      // 只是打开/关闭/丢弃了标签：绑定会话没变，但后台订阅集合变了。
+      this.syncTabFrames(false)
+    }
+    if (tabsChanged) this.persistTabs()
     this.store.notify()
   }
 
-  private runEffects(effects: ChatEffect[]): void {
+  // ---------------------------------------------------------------------------
+  // 标签页（2.4.0）
+  // ---------------------------------------------------------------------------
+
+  /** 切到某个标签：本地缓存立即渲染，然后补一次快照（电脑端不重发历史）。 */
+  activate(sessionId: string): void {
+    if (!sessionId || sessionId === this.tabs.activeSessionId) return
+    this.dispatch({ t: 'tabs/activate', sessionId, at: Date.now() })
+  }
+
+  /** 打开一个标签（不切换；已经在标签条里就只是激活）。 */
+  open(sessionId: string): void {
+    if (!sessionId) return
+    this.dispatch({ t: 'tabs/open', sessionId, at: Date.now() })
+    this.activate(sessionId)
+  }
+
+  /** 关闭标签：只关本地；关的是当前标签就切到相邻的并把它绑给电脑端。 */
+  close(sessionId: string): void {
+    if (!sessionId) return
+    this.dispatch({ t: 'tabs/close', sessionId, at: Date.now() })
+  }
+
+  dismissTabsNotice(): void {
+    this.dispatch({ t: 'tabs/notice-clear', at: Date.now() })
+  }
+
+  /**
+   * 活跃标签变化后的三件事：
+   *  1. `session/select`：让接下来的 `chat/send` 发往这个会话（电脑端不会释放旧会话的 agent）；
+   *  2. `session/snapshot`：只要状态，不重放历史，切过去是瞬时的；
+   *  3. `session/watch`：重新算"哪些标签要继续在后台收事件"。
+   * 电脑端没有 `session-tabs-v1` 时只发 select（v2.3.0 行为）。
+   */
+  private onActiveTabChanged(): void {
+    this.syncTabFrames(true)
+  }
+
+  private syncTabFrames(activated: boolean): void {
+    const link = this.link
+    if (!link || !link.isOnline) return
+    const supported = link.hasCapability(CAPABILITIES.SESSION_TABS)
+    if (supported) link.sendSessionWatch(watchSessionIds(this.tabs))
+    const active = this.tabs.activeSessionId
+    if (!active || active === PLACEHOLDER_SESSION) return
+    if (activated) {
+      link.selectSession(active)
+      if (supported) link.requestSessionSnapshot(active)
+      // 绑定会话变了：下一次 hello 要带新的 sessionId + 游标 0。
+      this.store.saveSessionMeta(this.assistantId, {
+        sessionId: active,
+        sessionEpoch: this.chat.sessionEpoch,
+        sessionCursor: 0,
+      })
+    }
+  }
+
+  /** 连接建立后补发一次 `session/watch`（电脑端不记得上次的订阅）。 */
+  syncWatch(): void {
+    const link = this.link
+    if (!link || !link.isOnline) return
+    const active = this.tabs.activeSessionId
+    // 离线时用户可能切过标签：hello 带上去的还是旧绑定。这里补一次 session/select，
+    // 否则重连后 `chat/send` 会发到上一个会话里去。
+    if (active && active !== PLACEHOLDER_SESSION && link.snapshot.sessionId !== undefined && active !== link.snapshot.sessionId) {
+      link.selectSession(active)
+      this.store.saveSessionMeta(this.assistantId, {
+        sessionId: active,
+        sessionEpoch: this.chat.sessionEpoch,
+        sessionCursor: 0,
+      })
+      if (link.hasCapability(CAPABILITIES.SESSION_TABS)) link.requestSessionSnapshot(active)
+    }
+    // 恢复出来的标签要有标题和 live 状态，而且"电脑上已经删掉的会话"必须能被发现：
+    // 每次连接最多拉一次列表（重连风暴时不至于把 socket 刷满）。
+    const now = Date.now()
+    if (this.tabs.tabs.length > 0 && now - this.lastListRequestAt > 5_000 && link.hasCapability(CAPABILITIES.SESSIONS)) {
+      this.lastListRequestAt = now
+      link.requestSessionList()
+    }
+    if (!link.hasCapability(CAPABILITIES.SESSION_TABS)) return
+    link.sendSessionWatch(watchSessionIds(this.tabs))
+  }
+
+  /** 当前显示在哪个标签（store 的 UI 方法用它）。 */
+  get activeSessionId(): string {
+    return this.tabs.activeSessionId
+  }
+
+  get tabViews(): TabView[] {
+    return tabStripModel(this.tabs)
+  }
+
+  /** 标签（tabs + activeSessionId）落库，300ms 合并一次。 */
+  private persistTabs(immediate = false): void {
+    const snapshot = JSON.stringify(tabsMeta(this.tabs))
+    if (snapshot === this.persistedTabs) return
+    if (!immediate && this.tabsTimer) {
+      clearTimeout(this.tabsTimer)
+      this.tabsTimer = setTimeout(() => {
+        this.tabsTimer = undefined
+        this.persistTabs(true)
+      }, 300)
+      return
+    }
+    this.persistedTabs = snapshot
+    this.store.saveTabsMeta(this.assistantId, JSON.parse(snapshot) as { tabs: string[]; activeSessionId: string })
+  }
+
+  private runEffects(effects: Array<ChatEffect & { sessionId?: string }>): void {
     for (const effect of effects) {
       switch (effect.kind) {
         case 'file-chunk': {
@@ -722,9 +974,12 @@ class ChatController {
           void this.abortSink(effect.fileId, '已取消下载')
           break
         case 'persist-cursor':
-          if (effect.cursor > this.chat.sessionCursor) {
-            // reducer 已经把游标写进 state；这里只保证一定落库。
-            this.scheduleCursorPersist()
+          // 只有当前绑定会话的游标才有意义（hello 带的是它），后台标签的快照不写库。
+          if (effect.sessionId === undefined || effect.sessionId === this.tabs.activeSessionId) {
+            if (effect.cursor >= this.chat.sessionCursor && effect.cursor > 0) {
+              // reducer 已经把游标写进 state；这里只保证一定落库。
+              this.scheduleCursorPersist()
+            }
           }
           break
         default:
@@ -736,7 +991,7 @@ class ChatController {
   private async ensureSink(fileId: string): Promise<DownloadSink | undefined> {
     const existing = this.sinks.get(fileId)
     if (existing) return existing
-    const transfer = this.chat.transfers[fileId]
+    const transfer = this.transferOf(fileId)
     const sink = await createDownloadSink({
       fileId,
       name: transfer?.name ?? fileId,
@@ -744,6 +999,15 @@ class ChatController {
     })
     this.sinks.set(fileId, sink)
     return sink
+  }
+
+  /** 文件属于哪个标签：传输可能是在别的标签里发起的（切走后下载不该断）。 */
+  private transferOf(fileId: string): Transfer | undefined {
+    for (const chat of Object.values(this.tabs.chats)) {
+      const transfer = chat?.transfers[fileId]
+      if (transfer) return transfer
+    }
+    return undefined
   }
 
   private enqueueSinkWrite(fileId: string, task: () => Promise<void>): void {
@@ -781,7 +1045,7 @@ class ChatController {
   private async finishTransfer(fileId: string): Promise<void> {
     try {
       await (this.sinkQueues.get(fileId) ?? Promise.resolve())
-      const transfer = this.chat.transfers[fileId]
+      const transfer = this.transferOf(fileId)
       if (!transfer) return
       let sink = this.sinks.get(fileId)
       if (!sink) {
@@ -801,7 +1065,7 @@ class ChatController {
   }
 
   /** 只写变化的行：delta 很频繁，整段历史重写会让 SQLite 成为瓶颈。 */
-  private persistMessageDiff(before: ChatMessage[], after: ChatMessage[]): void {
+  private persistMessageDiff(before: ChatMessage[], after: ChatMessage[], sessionId: string): void {
     const previous = new Map(before.map(message => [message.id, message]))
     for (const message of after) {
       const old = previous.get(message.id)
@@ -812,7 +1076,7 @@ class ChatController {
         old.streaming !== message.streaming ||
         old.files !== message.files
       ) {
-        this.queueMessageWrite(message, message.streaming !== true)
+        this.queueMessageWrite(message, message.streaming !== true, sessionId)
       }
     }
   }
@@ -842,8 +1106,8 @@ class ChatController {
     }
   }
 
-  private queueMessageWrite(message: ChatMessage, immediate: boolean): void {
-    this.pendingWrites.set(message.id, message)
+  private queueMessageWrite(message: ChatMessage, immediate: boolean, sessionId: string): void {
+    this.pendingWrites.set(message.id, { message, sessionId })
     if (immediate) {
       void this.flushWrites()
       return
@@ -858,10 +1122,20 @@ class ChatController {
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = undefined
     if (this.pendingWrites.size === 0) return
-    const messages = [...this.pendingWrites.values()]
+    const pending = [...this.pendingWrites.values()]
     this.pendingWrites.clear()
-    if (messages.length === 1) await saveMessage(this.assistantId, messages[0] as ChatMessage)
-    else await saveMessages(this.assistantId, messages)
+    // 一条 SQL 只带一个 session_id：不同标签的消息分开批量写。
+    const bySession = new Map<string, ChatMessage[]>()
+    for (const entry of pending) {
+      const bucket = bySession.get(entry.sessionId)
+      if (bucket) bucket.push(entry.message)
+      else bySession.set(entry.sessionId, [entry.message])
+    }
+    for (const [sessionId, messages] of bySession) {
+      const key = sessionId === PLACEHOLDER_SESSION ? undefined : sessionId
+      if (messages.length === 1) await saveMessage(this.assistantId, key, messages[0] as ChatMessage)
+      else await saveMessages(this.assistantId, key, messages)
+    }
   }
 
   /** 会话游标落库：合并 300ms 内的多次变化，避免每条事件写一次 SQLite。 */
@@ -869,13 +1143,24 @@ class ChatController {
     if (this.cursorTimer) clearTimeout(this.cursorTimer)
     this.cursorTimer = setTimeout(() => {
       this.cursorTimer = undefined
+      const active = this.tabs.activeSessionId
       this.store.saveSessionMeta(this.assistantId, {
-        sessionId: this.chat.sessionId,
+        sessionId: active === PLACEHOLDER_SESSION ? this.chat.sessionId : active,
         sessionEpoch: this.chat.sessionEpoch,
         sessionCursor: this.chat.sessionCursor,
       })
     }, 300)
   }
+}
+
+/** 所有标签的传输表合并成一份（下载计数、文件卡片查找用）。 */
+function allTransfers(tabs: TabsState): Record<string, Transfer> {
+  const out: Record<string, Transfer> = {}
+  for (const chat of Object.values(tabs.chats)) {
+    if (!chat) continue
+    for (const [fileId, transfer] of Object.entries(chat.transfers)) out[fileId] = transfer
+  }
+  return out
 }
 
 /** 内联附件的上限判断（老电脑端兼容路径）：≤ 8 MiB。 */
@@ -1245,6 +1530,44 @@ export class AppStore {
     const sent = link.createSession()
     if (!sent) return { ok: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
     return { ok: true }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 会话标签页（2.4.0）
+  // ---------------------------------------------------------------------------
+
+  /** 点标签：即时切换（本地缓存先渲染），随后补快照。 */
+  activateTab(assistantId: string, sessionId: string): void {
+    this.controller(assistantId).activate(sessionId)
+  }
+
+  /** 从「全部会话」里打开一个会话作为标签；已经打开过就是切换。 */
+  openSessionTab(assistantId: string, sessionId: string): void {
+    this.controller(assistantId).open(sessionId)
+  }
+
+  /** 关闭标签（只关本地；当前标签被关时切到相邻的并重新绑定）。 */
+  closeTab(assistantId: string, sessionId: string): void {
+    this.controller(assistantId).close(sessionId)
+  }
+
+  /** 关掉「有会话已经不在电脑上」的提示。 */
+  dismissTabsNotice(assistantId: string): void {
+    this.controller(assistantId).dismissTabsNotice()
+  }
+
+  /**
+   * 标签的持久化出口（ChatController 在 tabs/activeSessionId 变化 300ms 后调用）。
+   * 只写本地偏好，不碰连接/游标字段——那些有自己的写入路径。
+   */
+  saveTabsMeta(assistantId: string, meta: { tabs: string[]; activeSessionId: string }): void {
+    const row = this.rows.get(assistantId)
+    if (!row) return
+    const sameTabs = JSON.stringify(row.tabs ?? []) === JSON.stringify(meta.tabs)
+    if (sameTabs && (row.activeSessionId ?? '') === meta.activeSessionId) return
+    const updated: StoredAssistantRow = { ...row, tabs: meta.tabs, activeSessionId: meta.activeSessionId }
+    this.rows.set(assistantId, updated)
+    void upsertAssistant(updated)
   }
 
   /**
@@ -1674,7 +1997,8 @@ export class AppStore {
    * 没有待答请求就停掉定时器，不空转耗电。
    */
   private ensureApprovalTicker(): void {
-    const anyPending = [...this.controllers.values()].some(controller => controller.chat.approvals.length > 0)
+    // 注意：后台标签里的审批同样有倒计时，同样会过期，不能只看当前标签。
+    const anyPending = [...this.controllers.values()].some(controller => controller.hasApprovals())
     if (anyPending && !this.approvalTicker) {
       this.approvalTicker = setInterval(() => {
         for (const controller of this.controllers.values()) controller.tickApprovals()

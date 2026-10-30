@@ -649,46 +649,157 @@ pre {
   gap: var(--space-2);
 }
 
-/* 会话胶囊：当前 DSH 会话标题 + 切换入口（v2.3.0 的会话选择器） */
-.session-chip {
+/* 会话标签条（v2.4.0）：常驻在标题栏下方，DSH 侧边栏式多会话 */
+.session-tabs {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  height: 40px;
+  padding: 0 calc(var(--safe-right) + 8px) 0 calc(var(--safe-left) + 8px);
+  background: color-mix(in srgb, var(--bg-elevated) 78%, transparent);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+.session-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.session-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  max-width: 190px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+}
+
+.session-tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  background: linear-gradient(180deg, transparent, var(--accent-soft));
+}
+
+.session-tab-main {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  max-width: 46vw;
-  min-height: 34px;
-  padding: 0 10px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--line);
-  background: var(--surface-2);
-  color: var(--text-dim);
+  min-width: 0;
+  height: 100%;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
   font-size: 12.5px;
   font-weight: 600;
-  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
 }
 
-.session-chip:hover {
-  background: var(--surface-3);
-  color: var(--text);
+.session-tab.is-active .session-tab-main {
+  font-weight: 650;
 }
 
-.session-chip.is-known {
-  color: var(--text);
-  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
-}
-
-.session-chip .icon {
-  width: 16px;
-  height: 16px;
-}
-
-.session-chip-label {
+.session-tab-title {
+  max-width: 128px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.session-chip-caret {
-  opacity: 0.65;
+.session-tab-close {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-right: 3px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.session-tab-close:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.session-tab-add,
+.session-tab-all {
+  flex: none;
+  align-self: center;
+  height: 28px;
+  margin-left: 4px;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.session-tab-add {
+  width: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.session-tab-add:hover,
+.session-tab-all:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+/* 运行中圆点 / 在线点 / 未读 / 审批角标 */
+.tab-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.tab-dot.is-live {
+  background: var(--song);
+}
+
+.tab-dot.is-running {
+  background: var(--accent);
+  animation: dot-pulse 1.4s ease-in-out infinite;
+}
+
+.tab-unread {
+  flex: none;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.tab-approval {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--warn);
+  color: #0b1220;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 15px;
+  text-align: center;
 }
 
 /* 状态横幅：非在线时出现，永远给一个可点的下一步 */
@@ -1765,6 +1876,12 @@ pre {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   background: var(--accent-soft);
+}
+
+.badge.is-open {
+  color: var(--text-dim);
+  border-color: var(--line-strong);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
 }
 
 .session-empty,

@@ -138,6 +138,8 @@ export interface ChatAckFrame {
 
 export interface ChatDeltaFrame {
   t: 'chat/delta'
+  /** 哪个会话的增量（1.3.0 标签路由）。 */
+  sessionId?: string
   callId: string
   seq: number
   text: string
@@ -147,6 +149,7 @@ export interface ChatDeltaFrame {
 
 export interface ChatDoneFrame {
   t: 'chat/done'
+  sessionId?: string
   callId: string
   text: string
   durationMs?: number
@@ -164,6 +167,7 @@ export interface ChatErrorFrame {
 
 export interface ToolFrame {
   t: 'chat/tool'
+  sessionId?: string
   callId: string
   phase: 'tool-start' | 'tool-end'
   toolCallId: string
@@ -175,6 +179,7 @@ export interface ToolFrame {
 
 export interface TypingFrame {
   t: 'chat/typing'
+  sessionId?: string
   callId: string
   active?: boolean
 }
@@ -189,6 +194,7 @@ export interface ChatEchoFile {
 /** 会话内任意设备发出的用户消息（广播给所有设备，含发送者）。 */
 export interface ChatEchoFrame {
   t: 'chat/echo'
+  sessionId?: string
   msgId: string
   rid?: string
   callId?: string
@@ -207,6 +213,7 @@ export interface ChatEchoFrame {
 /** 一条助手消息，按 messageId 全文替换（修「回复重复拼接」）。 */
 export interface ChatMessageFrame {
   t: 'chat/message'
+  sessionId?: string
   callId: string
   messageId: string
   index: number
@@ -224,11 +231,15 @@ export interface SessionSnapshotMessage {
   files?: ChatEchoFile[]
 }
 
-/** 会话快照（首次连接 / 会话切换 / 游标失效）。 */
+/** 会话快照（首次连接 / 会话切换 / `session/snapshot` 的回复）。 */
 export interface SessionStateFrame {
   t: 'session/state'
   sessionId: string
-  /** 会话标题（会话选择器也显示它）。 */
+  /** `session/snapshot` 的回包带上同一条 rid（1.3.0）。 */
+  rid?: string
+  /** 是否是这台设备的当前绑定会话；后台标签的快照是 false。 */
+  active?: boolean
+  /** 会话标题（会话选择器与标签条都显示它）。 */
   title?: string
   sessionEpoch: number
   head: number
@@ -298,6 +309,8 @@ export interface SessionSelectedFrame {
 /** 一条转发到手机的 DSH 权限请求。 */
 export interface ApprovalAskFrame {
   t: 'approval/ask'
+  /** 工具属于哪个会话（1.3.0：审批卡显示在自己的标签里）。 */
+  sessionId?: string
   approvalId: string
   toolName: string
   /** 电脑端记录的机器原因。 */
@@ -312,6 +325,7 @@ export interface ApprovalAskFrame {
 /** 那条请求已经被处理（手机/电脑/超时）。 */
 export interface ApprovalResolvedFrame {
   t: 'approval/resolved'
+  sessionId?: string
   approvalId: string
   outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
   source?: 'phone' | 'desktop' | 'timeout' | 'cancelled'
@@ -331,6 +345,22 @@ export interface SessionSelectFrame {
 export interface SessionCreateFrame {
   t: 'session/create'
   rid: string
+}
+
+/**
+ * 保持这些会话的事件继续推给我（1.3.0 标签页）。整体替换上一次的订阅集合；
+ * 当前活跃会话不需要列进来（电脑端总是推它）。
+ */
+export interface SessionWatchFrame {
+  t: 'session/watch'
+  sessionIds: string[]
+}
+
+/** 取某一个标签的状态，不改变"消息发往哪个会话"。回包是带同 rid 的 `session/state`。 */
+export interface SessionSnapshotFrame {
+  t: 'session/snapshot'
+  rid: string
+  sessionId: string
 }
 
 /** 手机对一条权限请求的答复（只允许这两种结果）。 */
@@ -543,6 +573,8 @@ export type ClientFrame =
   | SessionListFrame
   | SessionSelectFrame
   | SessionCreateFrame
+  | SessionWatchFrame
+  | SessionSnapshotFrame
   | ApprovalReplyFrame
   | UploadStartFrame
   | UploadChunkFrame

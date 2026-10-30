@@ -30,6 +30,13 @@ export const CLIENT_FRAME = {
   SESSION_SELECT: 'session/select',
   /** 新建一个会话并绑定这台设备。 */
   SESSION_CREATE: 'session/create',
+  /**
+   * 保持这些会话的事件继续推给我（2.4.0 标签页）。
+   * 整体替换上一次的订阅集合；当前活跃会话不需要列进来。
+   */
+  SESSION_WATCH: 'session/watch',
+  /** 取某个标签的状态快照，不改变"消息发往哪个会话"（2.4.0）。 */
+  SESSION_SNAPSHOT: 'session/snapshot',
   /** 回答电脑端转发来的 DSH 权限请求（2.3.0）。 */
   APPROVAL_REPLY: 'approval/reply',
 } as const
@@ -87,6 +94,11 @@ export const CAPABILITIES = {
   SESSIONS: 'sessions-v1',
   /** 权限请求转发（2.3.0）。 */
   APPROVAL: 'approval-v1',
+  /**
+   * 会话标签页（2.4.0）：`session/watch` + `session/snapshot`，且所有会话帧
+   * 都带 `sessionId`。旧电脑端不声明它，手机端就退回单会话行为。
+   */
+  SESSION_TABS: 'session-tabs-v1',
 } as const
 
 /** 本 build 理解的全部能力（hello 时整包声明）。 */
@@ -119,7 +131,7 @@ export const DEFAULT_PORT = 8787
 export const UPLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
 
 /** 协议版本，镜像 `PROTOCOL_VERSION`（由 frames 测试核对）。 */
-export const PROTOCOL_VERSION = '1.2.0'
+export const PROTOCOL_VERSION = '1.3.0'
 
 /** 心跳默认值，镜像 `DEFAULT_HEARTBEAT_MS`。 */
 export const DEFAULT_HEARTBEAT_MS = 25_000
@@ -144,6 +156,12 @@ export const MAX_FILE_BYTES = 512 * 1024 * 1024
 
 /** 一次 `sessions` 帧里最多列出的会话数，镜像 `SESSION_LIST_LIMIT`。 */
 export const SESSION_LIST_LIMIT = 200
+
+/**
+ * 一个设备在活跃会话之外最多保持实时订阅的会话数，镜像 `SESSION_WATCH_LIMIT`。
+ * `session/watch` 超过这个数量会被整体截断，手机端在构造帧时先截断。
+ */
+export const SESSION_WATCH_LIMIT = 8
 
 /** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
 export const APPROVAL_TIMEOUT_MS = 60_000

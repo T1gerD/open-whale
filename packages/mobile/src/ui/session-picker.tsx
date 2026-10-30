@@ -20,6 +20,7 @@ export function SessionPickerSheet({
   visible,
   list,
   currentId,
+  openIds,
   disabledHint,
   loading,
   error,
@@ -31,8 +32,10 @@ export function SessionPickerSheet({
   visible: boolean
   /** 电脑端最近一次给的列表（可能还没拉过）。 */
   list?: SessionListState
-  /** 这台手机当前绑定的会话 id（本地记录，列表还没回来时也有值）。 */
+  /** 这台手机当前显示的会话 id（列表还没回来时也有值）。 */
   currentId?: string
+  /** 已经打开成标签的会话 id（v2.4.0：显示「已打开」，点一下就是切换）。 */
+  openIds?: string[]
   /** 非空表示现在不能切换（离线/电脑端太旧），整块禁用并显示这句话。 */
   disabledHint?: string
   loading?: boolean
@@ -48,6 +51,7 @@ export function SessionPickerSheet({
   const sessions = list?.sessions ?? []
   const disabled = Boolean(disabledHint)
   const current = currentId ?? list?.current
+  const opened = new Set(openIds ?? [])
 
   return (
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose} statusBarTranslucent>
@@ -91,6 +95,7 @@ export function SessionPickerSheet({
                   key={session.id}
                   session={session}
                   current={session.id === current}
+                  opened={opened.has(session.id)}
                   disabled={disabled}
                   onPress={() => onSelect(session.id)}
                 />
@@ -112,11 +117,13 @@ export function SessionPickerSheet({
 function SessionRow({
   session,
   current,
+  opened,
   disabled,
   onPress,
 }: {
   session: SessionSummary
   current: boolean
+  opened: boolean
   disabled: boolean
   onPress: () => void
 }) {
@@ -125,7 +132,7 @@ function SessionRow({
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`${session.title}${current ? '（当前会话）' : ''}`}
+      accessibilityLabel={`${session.title}${current ? '（当前会话）' : opened ? '（已打开）' : ''}`}
       accessibilityState={{ selected: current }}
       onPress={onPress}
       disabled={disabled}
@@ -146,7 +153,7 @@ function SessionRow({
       </View>
       <View style={styles.rowBadges}>
         {session.live ? <Chip label="运行中" tone="success" /> : null}
-        {current ? <Chip label="当前" tone="accent" /> : null}
+        {current ? <Chip label="当前" tone="accent" /> : opened ? <Chip label="已打开" tone="neutral" /> : null}
       </View>
     </Pressable>
   )

@@ -25,7 +25,7 @@ import { buildHelloFrame, handshakeErrorHint, helloSignatureMessage, interpretHe
 import type { AssistantRecord } from '../core/pairing.mts'
 import { buildPowerRequest, type PowerAction } from '../core/power.mts'
 import { RaceTracker, type CloseInfo, type CloseVerdict } from '../core/race-state.mts'
-import { buildSessionCreateFrame, buildSessionListFrame, buildSessionSelectFrame } from '../core/sessions.mts'
+import { buildSessionCreateFrame, buildSessionListFrame, buildSessionSelectFrame, buildSessionSnapshotFrame, buildSessionWatchFrame } from '../core/sessions.mts'
 import type { ChatSendFile, ClientFrame, HelloAckFrame, LinkSnapshot, LinkStatus, ServerFrame } from '../protocol/types'
 
 import { randomNonce, randomRequestId, signMessage } from './crypto'
@@ -273,6 +273,22 @@ export class AssistantLink {
   /** 新建一个会话并绑定这台设备。 */
   createSession(rid = randomRequestId('sess')): boolean {
     return this.send(buildSessionCreateFrame(rid))
+  }
+
+  /**
+   * 保持这些会话的事件继续推给我（2.4.0 标签页）。整体替换上一次的订阅集合：
+   * 每次都要传**全量**（活跃会话除外），空数组表示取消全部后台订阅。
+   */
+  sendSessionWatch(sessionIds: readonly string[]): boolean {
+    const frame = buildSessionWatchFrame(sessionIds)
+    return this.send(frame)
+  }
+
+  /** 取一个标签的状态快照，不改变"消息发往哪个会话"（回包是带同 rid 的 session/state）。 */
+  requestSessionSnapshot(sessionId: string, rid = randomRequestId('snap')): string | undefined {
+    const frame = buildSessionSnapshotFrame(rid, sessionId)
+    if (!frame) return undefined
+    return this.send(frame) ? rid : undefined
   }
 
   /** 回答一条权限请求（`allowed-once` / `rejected`）。 */

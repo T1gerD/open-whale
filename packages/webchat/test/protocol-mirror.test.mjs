@@ -43,6 +43,7 @@ const CONSTANT_KEYS = [
   'SESSION_LIST_LIMIT',
   'APPROVAL_TIMEOUT_MS',
   'APPROVAL_REPLY_OUTCOMES',
+  'SESSION_WATCH_LIMIT',
   'WEB_CLIENT_PATH',
   'DOWNLOAD_PATH',
 ]
@@ -54,11 +55,13 @@ test('lib/protocol.mjs 的常量与真实 protocol 逐项一致', () => {
   }
 })
 
-test('协议版本已跟到冻结的 1.2.0（v2.3.0 删协作、加会话与审批）', () => {
-  assert.equal(mirror.PROTOCOL_VERSION, '1.2.0')
+test('协议版本已跟到冻结的 1.3.0（v2.4.0 会话标签页）', () => {
+  assert.equal(mirror.PROTOCOL_VERSION, '1.3.0')
   assert.equal(mirror.PROTOCOL_VERSION, real.PROTOCOL_VERSION)
   assert.equal(mirror.CAPABILITIES.SESSIONS, 'sessions-v1')
   assert.equal(mirror.CAPABILITIES.APPROVAL, 'approval-v1')
+  assert.equal(mirror.CAPABILITIES.SESSION_TABS, 'session-tabs-v1')
+  assert.equal(mirror.SESSION_WATCH_LIMIT, 8)
   // 协作语义必须彻底消失：能力位、帧名、字段一个都不能留。
   for (const key of ['COLLAB', 'PARTICIPANTS']) {
     assert.equal(key in mirror.CAPABILITIES, false, `镜像不应再有能力位 ${key}`)
@@ -68,7 +71,7 @@ test('协议版本已跟到冻结的 1.2.0（v2.3.0 删协作、加会话与审�
     const owned = [...Object.values(mirror.CLIENT_FRAME), ...Object.values(mirror.SERVER_FRAME)]
     assert.equal(owned.includes(frame), false, `镜像不应再有帧 ${frame}`)
   }
-  for (const frame of ['session/list', 'session/select', 'session/create', 'approval/reply']) {
+  for (const frame of ['session/list', 'session/select', 'session/create', 'approval/reply', 'session/watch', 'session/snapshot']) {
     assert.equal(Object.values(mirror.CLIENT_FRAME).includes(frame), true, `镜像缺少客户端帧 ${frame}`)
   }
   for (const frame of ['sessions', 'session/selected', 'approval/ask', 'approval/resolved']) {

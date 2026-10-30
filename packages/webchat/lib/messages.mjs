@@ -1,4 +1,4 @@
-// 会话模型：把电脑端推来的帧合并成一份「可直接渲染的消息列表」。
+// 会话模型：两层结构，把电脑端推来的帧合并成「可直接渲染的消息列表」。
 //
 // 这一层刻意是零 DOM 的纯逻辑，`test/messages.test.mjs` 全量覆盖：
 //
@@ -6,15 +6,20 @@
 //  * 助手消息 id = `msg_<callId>`（按 messageId upsert，`chat/done` 全文覆盖）；
 //  * `chat/delta` 只在不支持 `chat/message` 的老电脑端上追加，且按 seq 去重；
 //  * `session/state` 幂等覆盖，`session/events` 按 seq 回放，cursor 持久化；
-//  * v2.3.0：`sessions` / `session/selected` 维护会话选择器状态，会话切换后由
-//    `session/state` 整页替换消息；`approval/ask` 进队列、`approval/resolved` 出队，
-//    多条待办审批**排队**而不是互相覆盖；
+//  * `approval/ask` 进队列、`approval/resolved` 出队，多条待办审批**排队**而不是互相覆盖；
 //  * 未知帧一律忽略（协议只增不改）。
+//
+// v2.4.0（协议 1.3.0）把「一个会话」升级成「一组会话标签」：
+//
+//  * `ChatModel` 仍然只管**一个**会话的消息 / 游标 / 审批；
+//  * `ChatTabsModel` 负责标签（`tabs` / `activeSessionId` / `chats` / `activity`），
+//    按帧里的 `sessionId` 把事件路由到对应会话（没有 `sessionId` 的旧帧进当前会话），
+//    并维护「运行中 / 未读 / 最近活动时间」与审批角标。
 //
 // 协作（共享会话 / 在线成员 / 昵称前缀）已在 v2.3.0 删除：每台设备只驱动它当前
 // 绑定的那个 DSH 会话，消息里不再有 `speaker`。
 
-import { CLIENT_FRAME, SERVER_FRAME } from './protocol.mjs'
+import { CLIENT_FRAME, SERVER_FRAME, SESSION_WATCH_LIMIT } from './protocol.mjs'
 import { clampAssistantText } from './protocol.mjs'
 
 /** 用户消息 id 前缀。 */
@@ -29,6 +34,48 @@ export const FILE_MESSAGE_PREFIX = 'file_'
  * 堆积；这里留一个硬上限，保证一个出错的对端也不能把手机内存撑爆。
  */
 export const APPROVAL_QUEUE_LIMIT = 8
+
+/**
+ * 标签条最多同时打开多少个会话：当前会话 + `SESSION_WATCH_LIMIT` 个后台会话。
+ * 多出来的后台会话电脑端根本不会推事件，标签上只能是一片死气，所以干脆不让开。
+ */
+export const TAB_LIMIT = SESSION_WATCH_LIMIT + 1
+
+/** 没有活动会话时给调用方一个稳定的空容器，避免到处写 `?.`。 */
+const EMPTY_MAP = new Map()
+const EMPTY_ARRAY = Object.freeze([])
+
+/**
+ * `session/watch` 帧（整体替换订阅集）。调用方传 `tabs - active`，这里再兜一层：
+ * 过滤非法值、去重、截断到 `SESSION_WATCH_LIMIT`（协议上限 8）。
+ * @param {unknown[]} sessionIds
+ * @returns {{t: string, sessionIds: string[]}}
+ */
+export function buildWatchFrame(sessionIds) {
+  const list = []
+  for (const raw of Array.isArray(sessionIds) ? sessionIds : []) {
+    if (typeof raw !== 'string') continue
+    const id = raw.trim()
+    if (id === '' || id.length > 200 || list.includes(id)) continue
+    list.push(id)
+    if (list.length >= SESSION_WATCH_LIMIT) break
+  }
+  return { t: CLIENT_FRAME.SESSION_WATCH, sessionIds: list }
+}
+
+/**
+ * `session/snapshot` 帧：只取某个标签的现状，不改变绑定。
+ * @param {string} rid
+ * @param {string} sessionId
+ * @returns {{t: string, rid: string, sessionId: string}}
+ */
+export function buildSnapshotFrame(rid, sessionId) {
+  return {
+    t: CLIENT_FRAME.SESSION_SNAPSHOT,
+    rid: String(rid ?? ''),
+    sessionId: String(sessionId ?? ''),
+  }
+}
 
 /** 本地消息状态。 */
 export const MESSAGE_STATUS = Object.freeze({
@@ -169,14 +216,6 @@ export class ChatModel {
     this.sessionEpoch = 0
     /** 当前会话的人类可读标题（来自 session/state / session/selected / 会话列表）。 */
     this.sessionTitle = ''
-    /** @type {any[]} 电脑上的会话列表（`sessions` 帧，新的在前）。 */
-    this.sessions = []
-    /** `sessions.current`：电脑认为这台设备当前绑定的会话。 */
-    this.sessionsCurrent = ''
-    /** 会话列表是否被电脑截断。 */
-    this.sessionsTruncated = false
-    /** @type {any | null} 最近一次 session/selected 的结果（UI 用来提示/关面板）。 */
-    this.lastSessionSelection = null
     /** @type {any[]} 待处理审批，队首是最早收到的。 */
     this.approvals = []
     /** @type {Map<string, any>} */
@@ -258,26 +297,6 @@ export class ChatModel {
     this.lastError = null
     this.clearApprovals()
     this.#touch()
-  }
-
-  /**
-   * 电脑端在 hello/ack 里告诉我们「你绑定的会话变了」（插件重启后重建了绑定、
-   * 或另一个窗口切换过会话）：旧会话的本地视图 / cursor / 审批全部作废，
-   * 等随后到达的 `session/state` 整页替换。
-   * @param {unknown} sessionId
-   * @param {unknown} sessionEpoch
-   * @returns {boolean} 是否真的换了会话
-   */
-  adoptServerSession(sessionId, sessionEpoch) {
-    const nextId = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null
-    const nextEpoch = Number.isFinite(Number(sessionEpoch)) ? Number(sessionEpoch) : 0
-    if (nextId === this.sessionId && nextEpoch === this.sessionEpoch) return false
-    this.clearConversation()
-    this.sessionId = nextId
-    this.sessionEpoch = nextEpoch
-    this.sessionTitle = ''
-    this.#touch()
-    return true
   }
 
   /** 清空待处理审批（会话切换、解绑时调用）。 */
@@ -409,10 +428,6 @@ export class ChatModel {
         return this.#onSessionState(frame, now)
       case SERVER_FRAME.SESSION_EVENTS:
         return this.#onSessionEvents(frame, now)
-      case SERVER_FRAME.SESSIONS:
-        return this.#onSessions(frame, now)
-      case SERVER_FRAME.SESSION_SELECTED:
-        return this.#onSessionSelected(frame, now)
       case SERVER_FRAME.APPROVAL_ASK:
         return this.#onApprovalAsk(frame, now)
       case SERVER_FRAME.APPROVAL_RESOLVED:
@@ -648,7 +663,12 @@ export class ChatModel {
     }
     // 快照里可能带一条正在生成的助手消息（activeCall）。
     const activeCall = snapshot.activeCall
-    if (activeCall && typeof activeCall.callId === 'string' && activeCall.callId !== '') {
+    const hasActiveCall = Boolean(activeCall && typeof activeCall.callId === 'string' && activeCall.callId !== '')
+    if (!hasActiveCall) {
+      // 快照是权威的：没有在跑的一轮，就不能剩着上一轮的「正在输入」。
+      this.typing.clear()
+    }
+    if (hasActiveCall) {
       const id = assistantMessageId(activeCall.callId)
       const existing = nextById.get(id)
       if (existing) {
@@ -744,67 +764,6 @@ export class ChatModel {
     if (Number.isFinite(Number(frame.head))) this.cursor = Math.max(this.cursor, Number(frame.head))
     if (changed) this.#touch(now)
     return { handled: true, changed, sessionChanged, frame }
-  }
-
-  /**
-   * `sessions`：会话选择器的数据源（电脑上的 DSH 会话，新的在前）。
-   * 重复/非法条目直接过滤，`current` 以帧为准重算，避免本地标记过期。
-   * @param {any} frame
-   * @param {number} now
-   */
-  #onSessions(frame, now) {
-    const raw = Array.isArray(frame.sessions) ? frame.sessions : []
-    /** @type {any[]} */
-    const next = []
-    const seen = new Set()
-    for (const item of raw) {
-      const summary = normalizeSessionSummary(item)
-      if (!summary || seen.has(summary.id)) continue
-      seen.add(summary.id)
-      next.push(summary)
-    }
-    const current = typeof frame.current === 'string' && frame.current !== '' ? frame.current : this.sessionsCurrent
-    this.sessions = next
-    this.sessionsCurrent = current
-    this.sessionsTruncated = frame.truncated === true
-    for (const summary of this.sessions) summary.current = summary.id === current
-    // 列表里的标题比会话快照更及时（重命名后刷新列表就能看到）。
-    const active = this.sessions.find(summary => summary.id === this.sessionId)
-    if (active) this.sessionTitle = active.title
-    this.#touch(now)
-    return { handled: true, changed: true, frame }
-  }
-
-  /**
-   * `session/selected`：`session/select` / `session/create` 的结果。
-   * 成功时电脑紧接着推 `session/state`，由它整页替换消息；这里只记录结果。
-   * @param {any} frame
-   * @param {number} now
-   */
-  #onSessionSelected(frame, now) {
-    const ok = frame.ok === true
-    const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : ''
-    const title = typeof frame.title === 'string' ? frame.title : ''
-    this.lastSessionSelection = {
-      ok,
-      sessionId,
-      title: title || undefined,
-      error: typeof frame.error === 'string' ? frame.error : undefined,
-      message: typeof frame.message === 'string' ? frame.message : undefined,
-      at: new Date(now).toISOString(),
-    }
-    if (ok) {
-      this.sessionsCurrent = sessionId || this.sessionsCurrent
-      for (const summary of this.sessions) summary.current = summary.id === this.sessionsCurrent
-      if (title !== '') this.sessionTitle = title
-      if (sessionId !== '' && sessionId !== this.sessionId) {
-        // 真正的消息替换在随后到达的 session/state；先清掉上一会话的审批。
-        this.clearApprovals()
-        this.typing.clear()
-      }
-    }
-    this.#touch(now)
-    return { handled: true, changed: true, frame, selection: this.lastSessionSelection }
   }
 
   /**
@@ -984,5 +943,628 @@ export class ChatModel {
   }
 }
 
+/** 没有活动状态时的只读占位。 */
+const EMPTY_ACTIVITY = Object.freeze({ typing: false, unread: 0, lastAt: 0 })
+
+/**
+ * 多会话标签 store：DSH 桌面侧边栏的网页版等价物。
+ *
+ * 状态形状（与协议契约 §3 一致）：
+ *   tabs: string[]                         已打开的标签，按打开顺序
+ *   activeSessionId: string                当前显示的标签
+ *   chats: Map<sessionId, ChatModel>       每个标签自己的消息 / 游标 / 审批
+ *   activity: Map<sessionId, {typing, unread, lastAt}>
+ *
+ * 帧路由：`frame.sessionId` 存在就进那个会话；没有（旧电脑端）就进当前会话。
+ */
+export class ChatTabsModel {
+  /**
+   * @param {{chatLimit?: number, tabLimit?: number, myDeviceId?: string}} [options]
+   */
+  constructor(options = {}) {
+    this.chatLimit = Math.max(20, options.chatLimit ?? 400)
+    this.tabLimit = Math.max(1, Math.min(TAB_LIMIT, options.tabLimit ?? TAB_LIMIT))
+    this.myDeviceId = options.myDeviceId ?? ''
+    /** @type {string[]} */
+    this.tabs = []
+    /** @type {string} */
+    this.activeSessionId = ''
+    /** @type {Map<string, ChatModel>} */
+    this.chats = new Map()
+    /** @type {Map<string, {typing: boolean, unread: number, lastAt: number}>} */
+    this.activity = new Map()
+    /**
+     * 最近被用户关掉的标签。关掉后电脑端可能还有几帧在途（尤其被跑着的会话），
+     * 这些帧不能把标签又弹回来；用户主动再打开时才移除。
+     * @type {Set<string>}
+     */
+    this.closedSessions = new Set()
+    /** @type {any[]} 电脑上的会话列表（`sessions` 帧，新的在前）。 */
+    this.sessions = []
+    /** `sessions.current`：电脑认为这台设备当前绑定的会话。 */
+    this.sessionsCurrent = ''
+    this.sessionsTruncated = false
+    /** 是否收到过一次会话列表（没收到前不要按列表丢标签）。 */
+    this.sessionsReceived = false
+    /** @type {any | null} 最近一次 session/selected 的结果（UI 用来提示/关面板）。 */
+    this.lastSessionSelection = null
+    /** 最近一次按会话列表清掉的标签（恢复后会话已不存在的提示）。 */
+    this.droppedSessions = []
+    this.changedAt = 0
+  }
+
+  /** @param {string} deviceId */
+  setDeviceId(deviceId) {
+    this.myDeviceId = String(deviceId ?? '')
+    for (const chat of this.chats.values()) chat.setDeviceId(this.myDeviceId)
+  }
+
+  /** @param {number} [now] */
+  #touch(now = Date.now()) {
+    this.changedAt = now
+  }
+
+  // -------------------------------------------------------------------------
+  // 当前标签转发（渲染层只认识「当前会话」，不用到处查 tabs）
+  // -------------------------------------------------------------------------
+
+  /** @returns {ChatModel | undefined} */
+  get active() {
+    return this.activeSessionId ? this.chats.get(this.activeSessionId) : undefined
+  }
+
+  get messages() {
+    return this.active?.messages ?? EMPTY_ARRAY
+  }
+
+  get byId() {
+    return this.active?.byId ?? EMPTY_MAP
+  }
+
+  get files() {
+    return this.active?.files ?? EMPTY_MAP
+  }
+
+  get approvals() {
+    return this.active?.approvals ?? EMPTY_ARRAY
+  }
+
+  get approvalsById() {
+    return this.active?.approvalsById ?? EMPTY_MAP
+  }
+
+  get typing() {
+    return this.active?.typing ?? new Set()
+  }
+
+  get activeCallId() {
+    return this.active?.activeCallId
+  }
+
+  get isTyping() {
+    return this.active?.isTyping === true
+  }
+
+  get hasPendingApprovals() {
+    return (this.active?.approvals.length ?? 0) > 0
+  }
+
+  get cursor() {
+    return this.active?.cursor ?? 0
+  }
+
+  get sessionId() {
+    return this.activeSessionId
+  }
+
+  get sessionEpoch() {
+    return this.active?.sessionEpoch ?? 0
+  }
+
+  get sessionTitle() {
+    return this.active?.sessionTitle ?? ''
+  }
+
+  get lastError() {
+    return this.active?.lastError ?? null
+  }
+
+  // -------------------------------------------------------------------------
+  // 标签 / 会话
+  // -------------------------------------------------------------------------
+
+  /** @param {string} sessionId */
+  chatFor(sessionId) {
+    return this.chats.get(String(sessionId ?? ''))
+  }
+
+  /** 确保某个会话有一个 ChatModel（不改变标签）。 */
+  ensureChat(sessionId) {
+    const id = String(sessionId ?? '')
+    if (id === '') return undefined
+    let chat = this.chats.get(id)
+    if (!chat) {
+      chat = new ChatModel({ limit: this.chatLimit, myDeviceId: this.myDeviceId })
+      chat.sessionId = id
+      this.chats.set(id, chat)
+    }
+    this.#activityFor(id)
+    return chat
+  }
+
+  /** @param {string} sessionId */
+  #activityFor(sessionId) {
+    let activity = this.activity.get(sessionId)
+    if (!activity) {
+      activity = { typing: false, unread: 0, lastAt: 0 }
+      this.activity.set(sessionId, activity)
+    }
+    return activity
+  }
+
+  /** @param {string} sessionId */
+  activityFor(sessionId) {
+    return this.activity.get(String(sessionId ?? '')) ?? EMPTY_ACTIVITY
+  }
+
+  /** @param {string} sessionId */
+  titleFor(sessionId) {
+    const id = String(sessionId ?? '')
+    const summary = this.sessions.find(item => item.id === id)
+    return summary?.title || this.chats.get(id)?.sessionTitle || '会话'
+  }
+
+  /** 是否有 agent 正在这个会话里跑（电脑端 live 或本地看到 typing）。 */
+  liveFor(sessionId) {
+    const id = String(sessionId ?? '')
+    if (this.#activityFor(id).typing) return true
+    return this.sessions.find(item => item.id === id)?.live === true
+  }
+
+  /** @param {string} sessionId */
+  unreadFor(sessionId) {
+    return this.#activityFor(String(sessionId ?? '')).unread
+  }
+
+  /** @param {string} sessionId */
+  typingFor(sessionId) {
+    return this.#activityFor(String(sessionId ?? '')).typing
+  }
+
+  /** 该标签里是否有待处理的审批（标签角标）。 */
+  hasApprovalIn(sessionId) {
+    return (this.chats.get(String(sessionId ?? ''))?.approvals.length ?? 0) > 0
+  }
+
+  /**
+   * 打开一个标签。
+   * @param {string} sessionId
+   * @param {{activate?: boolean}} [options]
+   * @returns {{ok: boolean, opened: boolean, activated: boolean, reason?: string}}
+   */
+  openTab(sessionId, options = {}) {
+    const id = String(sessionId ?? '')
+    if (id === '') return { ok: false, opened: false, activated: false, reason: 'invalid' }
+    const existed = this.tabs.includes(id)
+    if (!existed && this.tabs.length >= this.tabLimit) {
+      return { ok: false, opened: false, activated: false, reason: 'limit' }
+    }
+    this.closedSessions.delete(id)
+    this.ensureChat(id)
+    if (!existed) this.tabs.push(id)
+    const activate = options.activate !== false
+    let activated = false
+    if (activate && this.activeSessionId !== id) {
+      this.activeSessionId = id
+      this.#activityFor(id).unread = 0
+      activated = true
+    }
+    if (!existed || activated) this.#touch()
+    return { ok: true, opened: !existed, activated }
+  }
+
+  /**
+   * 切换当前标签（本地立即生效；网络上的 select/snapshot 由 app 负责）。
+   * @param {string} sessionId
+   */
+  activateTab(sessionId) {
+    const id = String(sessionId ?? '')
+    if (!this.tabs.includes(id)) return { ok: false, changed: false }
+    const activity = this.#activityFor(id)
+    const hadUnread = activity.unread > 0
+    activity.unread = 0
+    if (this.activeSessionId === id) {
+      if (hadUnread) this.#touch()
+      return { ok: true, changed: hadUnread, activated: false }
+    }
+    const previousSessionId = this.activeSessionId
+    this.activeSessionId = id
+    this.#touch()
+    return { ok: true, changed: true, activated: true, previousSessionId }
+  }
+
+  /**
+   * 关闭本地标签。关掉当前标签时切到相邻标签（并告诉调用方需要 select 它）。
+   * 不会通知电脑端，也不会停止那个会话里的 agent。
+   * @param {string} sessionId
+   */
+  closeTab(sessionId) {
+    const id = String(sessionId ?? '')
+    const index = this.tabs.indexOf(id)
+    if (index < 0) return { ok: false, changed: false }
+    this.tabs.splice(index, 1)
+    this.#forgetChat(id)
+    // 记住「刚关掉」：在途帧不能把标签弹回来（用户主动 openTab 时才解除）。
+    this.closedSessions.add(id)
+    while (this.closedSessions.size > 16) {
+      const oldest = this.closedSessions.values().next().value
+      if (oldest === undefined) break
+      this.closedSessions.delete(oldest)
+    }
+    let nextActive = this.activeSessionId
+    let activated = false
+    if (this.activeSessionId === id) {
+      nextActive = this.tabs[Math.min(index, this.tabs.length - 1)] ?? ''
+      this.activeSessionId = nextActive
+      if (nextActive) {
+        this.#activityFor(nextActive).unread = 0
+        activated = true
+      }
+    }
+    this.#touch()
+    return { ok: true, changed: true, closed: id, activeSessionId: nextActive, activated }
+  }
+
+  /** @param {string} sessionId */
+  #forgetChat(sessionId) {
+    this.chats.delete(sessionId)
+    this.activity.delete(sessionId)
+  }
+
+  /**
+   * 用会话列表清理已不存在的标签（只在列表未被截断时可信）。
+   * @param {Iterable<string>} knownIds
+   * @param {number} [now]
+   * @returns {string[]} 被丢掉的会话 id
+   */
+  dropMissingSessions(knownIds, now = Date.now()) {
+    const known = knownIds instanceof Set ? knownIds : new Set(knownIds ?? [])
+    const missing = this.tabs.filter(id => !known.has(id))
+    if (missing.length === 0) {
+      this.droppedSessions = []
+      return []
+    }
+    for (const id of missing) {
+      const index = this.tabs.indexOf(id)
+      if (index >= 0) this.tabs.splice(index, 1)
+      this.#forgetChat(id)
+      this.closedSessions.add(id)
+    }
+    if (!this.tabs.includes(this.activeSessionId)) {
+      this.activeSessionId = this.tabs[0] ?? ''
+      if (this.activeSessionId) this.#activityFor(this.activeSessionId).unread = 0
+    }
+    this.droppedSessions = missing
+    this.#touch(now)
+    return missing
+  }
+
+  /** 需要发给电脑端的后台订阅（不含当前标签，最多 SESSION_WATCH_LIMIT 个）。 */
+  watchList() {
+    return this.tabs.filter(id => id !== this.activeSessionId).slice(0, SESSION_WATCH_LIMIT)
+  }
+
+  // -------------------------------------------------------------------------
+  // 帧处理
+  // -------------------------------------------------------------------------
+
+  /**
+   * 处理一条电脑端帧：按 `sessionId` 路由到对应会话。
+   * @param {any} frame
+   * @param {{now?: number}} [options]
+   * @returns {{handled: boolean, changed: boolean, targetSessionId?: string,
+   *            sessionChanged?: boolean, activityChanged?: boolean, needsWatch?: boolean,
+   *            opened?: boolean, selection?: any, resolved?: any, unread?: number}}
+   */
+  applyFrame(frame, options = {}) {
+    if (!frame || typeof frame.t !== 'string') return { handled: false, changed: false }
+    const now = options.now ?? Date.now()
+
+    if (frame.t === SERVER_FRAME.SESSIONS) {
+      const result = this.applySessions(frame, now)
+      return { ...result, needsWatch: result.changed }
+    }
+    if (frame.t === SERVER_FRAME.SESSION_SELECTED) {
+      return this.#onSelected(frame, now)
+    }
+
+    const explicit = typeof frame.sessionId === 'string' && frame.sessionId !== ''
+    const target = explicit ? frame.sessionId : this.activeSessionId
+    if (target === '') {
+      // 还没有任何会话（第一条 session/state 之前的杂帧）：交给调用方当全局处理。
+      return { handled: false, changed: false, frame }
+    }
+
+    // 标签里没有这个会话：自动开一个（不抢焦点）。可能是电脑端刚把绑定切过来，
+    // 也可能是后台订阅里的会话——消息不能丢，也不能把当前标签顶掉。刚被用户
+    // 关掉的标签例外：在途帧只更新它的缓存，不再弹回来。
+    let opened = false
+    if (!this.tabs.includes(target) && !this.closedSessions.has(target)) {
+      const result = this.openTab(target, { activate: this.activeSessionId === '' })
+      opened = result.opened === true
+      if (!result.ok) {
+        // 标签数到上限：仍然保留 ChatModel，事件不丢，只是没有可见标签。
+        this.ensureChat(target)
+      }
+    }
+
+    const chat = this.ensureChat(target)
+    if (!chat) return { handled: false, changed: false, frame }
+    if (chat.sessionId !== target) chat.sessionId = target
+    const result = chat.applyFrame(frame, { now })
+
+    // 活动状态：未读只在后台标签累积；typing 由 chat/typing 与 done/error 驱动。
+    const activity = this.#activityFor(target)
+    const beforeTyping = activity.typing
+    const beforeUnread = activity.unread
+    activity.lastAt = now
+    switch (frame.t) {
+      case SERVER_FRAME.CHAT_ECHO:
+      case SERVER_FRAME.CHAT_MESSAGE:
+        if (target !== this.activeSessionId) activity.unread += 1
+        break
+      case SERVER_FRAME.TYPING:
+        activity.typing = frame.active !== false
+        break
+      case SERVER_FRAME.SESSION_STATE:
+        // 快照是权威的：没有 activeCall 就说明这一轮已经结束，运行点不能残留。
+        activity.typing = chat.isTyping === true
+        break
+      case SERVER_FRAME.CHAT_DONE:
+      case SERVER_FRAME.CHAT_ERROR:
+        activity.typing = false
+        break
+      default:
+        break
+    }
+    // 当前会话的快照 = 电脑端此刻的绑定；后台快照（active:false）不改变绑定。
+    if (frame.t === SERVER_FRAME.SESSION_STATE && frame.active !== false) {
+      this.sessionsCurrent = target
+    }
+    const activityChanged = activity.typing !== beforeTyping || activity.unread !== beforeUnread
+    if (activityChanged) this.#touch(now)
+    return {
+      handled: result.handled !== false,
+      changed: result.changed === true || activityChanged || opened,
+      targetSessionId: target,
+      sessionChanged: result.sessionChanged === true,
+      activityChanged,
+      needsWatch: opened,
+      opened,
+      unread: activity.unread,
+      resolved: result.resolved ? { ...result.resolved, sessionId: target } : undefined,
+    }
+  }
+
+  /**
+   * `sessions`：会话列表（标签标题 / live / 打开新标签的来源）。
+   * 未被截断时顺手清掉恢复出来但电脑上已不存在的标签。
+   * @param {any} frame
+   * @param {number} [now]
+   */
+  applySessions(frame, now = Date.now()) {
+    const raw = Array.isArray(frame.sessions) ? frame.sessions : []
+    /** @type {any[]} */
+    const next = []
+    const seen = new Set()
+    for (const item of raw) {
+      const summary = normalizeSessionSummary(item)
+      if (!summary || seen.has(summary.id)) continue
+      seen.add(summary.id)
+      next.push(summary)
+    }
+    const current = typeof frame.current === 'string' && frame.current !== '' ? frame.current : this.sessionsCurrent
+    this.sessions = next
+    this.sessionsCurrent = current
+    this.sessionsTruncated = frame.truncated === true
+    this.sessionsReceived = true
+    for (const summary of next) summary.current = summary.id === current
+    // 列表里的标题比会话快照更及时（重命名后刷新列表就能看到）。
+    for (const id of this.tabs) {
+      const summary = next.find(item => item.id === id)
+      const chat = this.chats.get(id)
+      if (summary && chat && summary.title) chat.sessionTitle = summary.title
+    }
+    const dropped = this.sessionsTruncated ? [] : this.dropMissingSessions(new Set(next.map(item => item.id)), now)
+    this.#touch(now)
+    return { handled: true, changed: true, dropped }
+  }
+
+  /**
+   * `session/selected`：`session/select` / `session/create` 的结果。成功时把该会话
+   * 补进标签（不抢焦点），随后到达的 `session/state` 填内容。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onSelected(frame, now) {
+    const ok = frame.ok === true
+    const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : ''
+    const title = typeof frame.title === 'string' ? frame.title : ''
+    this.lastSessionSelection = {
+      ok,
+      sessionId: sessionId || undefined,
+      title: title || undefined,
+      error: typeof frame.error === 'string' ? frame.error : undefined,
+      message: typeof frame.message === 'string' ? frame.message : undefined,
+      at: new Date(now).toISOString(),
+    }
+    let opened = false
+    if (ok) {
+      if (sessionId !== '') {
+        this.sessionsCurrent = sessionId
+        for (const summary of this.sessions) summary.current = summary.id === sessionId
+        const result = this.openTab(sessionId, { activate: false })
+        opened = result.opened === true
+        const chat = this.chats.get(sessionId)
+        if (chat && title !== '') chat.sessionTitle = title
+        const summary = this.sessions.find(item => item.id === sessionId)
+        if (summary && title !== '') summary.title = title
+      }
+    }
+    this.#touch(now)
+    return { handled: true, changed: true, opened, needsWatch: opened, selection: this.lastSessionSelection }
+  }
+
+  // -------------------------------------------------------------------------
+  // 本地操作（发送 / 重发 / 审批）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把本地用户消息插进某一个会话（默认当前标签）。
+   * @param {any} input
+   * @param {string} [sessionId]
+   */
+  addLocalUserMessage(input, sessionId) {
+    const target = String(sessionId || this.activeSessionId || '')
+    if (target === '') return undefined
+    const chat = this.ensureChat(target)
+    if (!chat) return undefined
+    const message = chat.addLocalUserMessage(input)
+    this.#activityFor(target).lastAt = Date.now()
+    this.#touch()
+    return { sessionId: target, message }
+  }
+
+  /**
+   * 在任意标签里找一条本地用户消息（重发时用）。
+   * @param {string} msgId
+   * @returns {{sessionId: string, message: any, chat: ChatModel} | undefined}
+   */
+  findUserMessage(msgId) {
+    for (const [sessionId, chat] of this.chats) {
+      const message = chat.byId.get(userMessageId(msgId))
+      if (message) return { sessionId, message, chat }
+    }
+    return undefined
+  }
+
+  /** 重发前把消息标回待发送；找不到就返回 false。 */
+  resetUserMessageForRetry(msgId) {
+    const found = this.findUserMessage(msgId)
+    if (!found) return false
+    return found.chat.resetUserMessageForRetry(msgId)
+  }
+
+  /**
+   * `chat/ack` 可能在我们切到别的标签后才到（ack 帧不带 sessionId）：
+   * 按 msgId 找到真正持有这条消息的会话再标记，避免它永远停在「发送中」。
+   */
+  markUserMessageSent(msgId, info = {}) {
+    const found = this.findUserMessage(msgId)
+    return found ? found.chat.markUserMessageSent(msgId, info) : false
+  }
+
+  /** @param {string} msgId @param {string} reason */
+  markUserMessageFailed(msgId, reason) {
+    const found = this.findUserMessage(msgId)
+    return found ? found.chat.markUserMessageFailed(msgId, reason) : false
+  }
+
+  /** 是否已经收到了某条消息的 ack（重连后重复回放时用来跳过）。 */
+  hasMessage(msgId) {
+    return Boolean(this.findUserMessage(msgId))
+  }
+
+  /**
+   * 在任意标签里找一条审批（approval/reply 只带 approvalId）。
+   * @param {string} approvalId
+   */
+  findApproval(approvalId) {
+    const id = String(approvalId ?? '')
+    if (id === '') return undefined
+    for (const [sessionId, chat] of this.chats) {
+      const approval = chat.approvalsById.get(id)
+      if (approval) return { sessionId, approval, chat }
+    }
+    return undefined
+  }
+
+  /** @param {string} approvalId @param {'allowed-once'|'rejected'} outcome */
+  markApprovalReplied(approvalId, outcome) {
+    const found = this.findApproval(approvalId)
+    if (!found) return false
+    return found.chat.markApprovalReplied(approvalId, outcome)
+  }
+
+  /** 清空当前标签的消息（「清空本机聊天记录」）。 */
+  clearActiveConversation() {
+    const chat = this.active
+    if (!chat) return false
+    chat.clearConversation()
+    const activity = this.#activityFor(this.activeSessionId)
+    activity.unread = 0
+    activity.typing = false
+    this.#touch()
+    return true
+  }
+
+  // -------------------------------------------------------------------------
+  // 持久化
+  // -------------------------------------------------------------------------
+
+  /** 标签列表要保存的最小状态（每个助理一份）。 */
+  snapshotTabs() {
+    return { version: 1, tabs: this.tabs.slice(), activeSessionId: this.activeSessionId }
+  }
+
+  /** 当前标签的消息快照（沿用 v2.3.0 的会话缓存，刷新后先出内容再对账）。 */
+  snapshotActiveChat(options = {}) {
+    return this.active?.snapshotForStorage(options)
+  }
+
+  /**
+   * 恢复标签列表（按打开顺序），并建立空的 ChatModel。
+   * @param {any} saved
+   */
+  restoreTabs(saved) {
+    const input = saved && typeof saved === 'object' ? saved : {}
+    /** @type {string[]} */
+    const ids = []
+    if (Array.isArray(input.tabs)) {
+      for (const raw of input.tabs) {
+        const id = typeof raw === 'string' ? raw.trim() : ''
+        if (id === '' || ids.includes(id)) continue
+        if (ids.length >= this.tabLimit) break
+        ids.push(id)
+      }
+    }
+    this.tabs = ids
+    this.closedSessions.clear()
+    for (const id of ids) this.ensureChat(id)
+    const wanted = typeof input.activeSessionId === 'string' ? input.activeSessionId : ''
+    this.activeSessionId = ids.includes(wanted) ? wanted : ids[0] ?? ''
+    if (this.activeSessionId) this.#activityFor(this.activeSessionId).unread = 0
+    this.#touch()
+    return { restored: ids.length, activeSessionId: this.activeSessionId }
+  }
+
+  /**
+   * 把缓存的当前会话内容塞回对应标签（sessionId 不匹配就丢弃，避免把 A 的消息
+   * 显示在 B 的标签里）。
+   * @param {any} saved
+   */
+  restoreActiveChat(saved) {
+    const chat = this.active
+    if (!chat || !saved || typeof saved !== 'object') return false
+    const savedSessionId = typeof saved.sessionId === 'string' ? saved.sessionId : ''
+    if (savedSessionId !== '' && savedSessionId !== this.activeSessionId) return false
+    const restored = chat.restoreFromStorage(saved)
+    if (restored && chat.sessionId !== this.activeSessionId) chat.sessionId = this.activeSessionId
+    return restored
+  }
+}
+
 /** 客户端会发的帧（导出便于测试与 UI 逻辑判断）。 */
 export const CLIENT_FRAMES = CLIENT_FRAME
+
+

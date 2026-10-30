@@ -1786,7 +1786,7 @@ test('hello/ack advertises capabilities, the conversation and classified endpoin
   const device = freshDevice()
   const { client, ack } = await pairDevice(port, device)
 
-  assert.equal(ack.version, '1.2.0', 'version keeps meaning the wire-protocol version')
+  assert.equal(ack.version, '1.3.0', 'version keeps meaning the wire-protocol version')
   assert.equal(ack.serverVersion, PLUGIN_VERSION)
   assert.ok(Array.isArray(ack.capabilities))
   assert.ok(ack.capabilities.includes(CAPABILITIES.CHAT_ECHO))
@@ -1830,7 +1830,7 @@ test('the binding page carries the v2.3.0 features the user has to see', async t
   const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
   t.after(() => gateway.close())
   const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
-  assert.match(html, /Open Whale 2\.3\.\d/)
+  assert.match(html, /Open Whale 2\.4\.\d/)
   assert.match(html, /连接方式/)
   assert.match(html, /Tailscale/)
   assert.match(html, /局域网/)
@@ -2028,3 +2028,110 @@ test('the built-in web client is served under /openwhale/app from either layout'
 
 
 
+
+// ---------------------------------------------------------------------------
+// v1.3.0 / 2.4.0: session tabs — several conversations stay live at once
+// ---------------------------------------------------------------------------
+
+test('every conversation frame names the session it belongs to', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
+  const sessionId = gateway.deviceSession.get(device.deviceId)
+
+  gateway.pushEvent({ kind: 'typing', sessionId, deviceId: device.deviceId, callId: 'c1', active: true })
+  gateway.pushEvent({ kind: 'done', sessionId, deviceId: device.deviceId, callId: 'c1', text: '好' })
+
+  const typing = await client.waitFor(f => f.t === 'chat/typing')
+  assert.equal(typing.sessionId, sessionId, 'a client with several tabs needs the routing key')
+  const done = await client.waitFor(f => f.t === 'chat/done')
+  assert.equal(done.sessionId, sessionId)
+  client.close()
+})
+
+test('a watched tab keeps receiving events without becoming the active conversation', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
+  const active = gateway.deviceSession.get(device.deviceId)
+
+  client.send({ t: 'session/watch', sessionIds: ['tab-b'] })
+  await delay(30)
+  assert.equal(gateway.deviceSession.get(device.deviceId), active, 'watching must not move the binding')
+
+  gateway.pushEvent({ kind: 'delta', sessionId: 'tab-b', deviceId: device.deviceId, callId: 'cb', seq: 0, text: '后台' })
+  gateway.pushEvent({ kind: 'done', sessionId: 'tab-b', deviceId: device.deviceId, callId: 'cb', text: '后台跑完了' })
+
+  const delta = await client.waitFor(f => f.t === 'chat/delta' && f.sessionId === 'tab-b')
+  assert.ok(delta, 'a background tab must still stream while another tab is shown')
+  const done = await client.waitFor(f => f.t === 'chat/done' && f.sessionId === 'tab-b')
+  assert.equal(done.text, '后台跑完了')
+  client.close()
+})
+
+test('a session that is neither bound nor watched never leaks to the device', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
+  gateway.pushEvent({ kind: 'delta', sessionId: 'someone-elses', deviceId: device.deviceId, callId: 'x', seq: 0, text: 'leak' })
+  await delay(40)
+  assert.equal(client.frames.some(f => f.t === 'chat/delta'), false)
+  client.close()
+})
+
+test('session/snapshot answers for an open tab and refuses a foreign one', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
+  client.send({ t: 'session/watch', sessionIds: ['tab-b'] })
+  await delay(20)
+
+  client.send({ t: 'session/snapshot', rid: 'snap-b', sessionId: 'tab-b' })
+  const state = await client.waitFor(f => f.t === 'session/state' && f.rid === 'snap-b')
+  assert.ok(state, 'a watched tab must be snapshot-able')
+  assert.equal(state.sessionId, 'tab-b')
+  assert.equal(state.active, false, 'a background snapshot must not look like a switch')
+
+  client.send({ t: 'session/snapshot', rid: 'snap-x', sessionId: 'not-mine' })
+  const error = await client.waitFor(f => f.t === 'error' && f.code === 'not-allowed')
+  assert.ok(error, 'a device must not read arbitrary conversations')
+  client.close()
+})
+
+test('switching tabs does not tear down the conversation left behind', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSIONS] })
+  const first = gateway.deviceSession.get(device.deviceId)
+
+  harness.selectResult = { ok: true, sessionId: 'tab-b' }
+  client.send({ t: 'session/select', rid: 'sel', sessionId: 'tab-b' })
+  assert.ok(await client.waitFor(f => f.t === 'session/selected' && f.ok === true))
+  await delay(30)
+
+  assert.deepEqual(harness.releasedSessions, [], 'the old tab keeps running; switching is not unbinding')
+  assert.equal(gateway.deviceSession.get(device.deviceId), 'tab-b')
+  assert.notEqual(first, 'tab-b')
+  client.close()
+})
+
+test('closing a tab is client-side; unbinding still releases everything it used', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
+  const bound = gateway.deviceSession.get(device.deviceId)
+  client.send({ t: 'session/watch', sessionIds: ['tab-b'] })
+  await delay(20)
+
+  client.send({ t: 'device/forget', deviceId: device.deviceId })
+  assert.ok(await client.waitFor(f => f.t === 'assistants' && f.unbound === true))
+  assert.ok(harness.releasedSessions.includes('tab-b'), 'an unbound device must not leave background agents alive')
+  assert.ok(harness.releasedSessions.includes(bound))
+  client.close()
+})
