@@ -139,6 +139,9 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
+  max-width: 100%;
+  /* 兜底：任何一处算错宽度都不该让整页可以左右拖动 */
+  overflow-x: hidden;
 }
 
 html {
@@ -848,6 +851,9 @@ pre {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 聊天页永远不能横向滚动：长代码行在 `.code-block pre` 里各自滚动。
+   * 没有这一行，一条超长命令会把整个会话区变成可左右拖动的画布。 */
+  overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-y: contain;
   scroll-behavior: smooth;
@@ -869,6 +875,11 @@ pre {
   display: flex;
   flex-direction: column;
   max-width: 86%;
+  /* 关键：flex item 的 min-width 默认是 auto（= 内容的 min-content）。
+   * 一条超长的代码行/路径会让 min-content 比屏幕还宽，max-width:86% 直接失效，
+   * 气泡被撑到 1000px 以上，整个 `.message-area` 于是出现横向滚动条——
+   * 这就是手机上「聊天页可以左右拖动、文字两边被切掉」的根因。 */
+  min-width: 0;
   margin-top: 9px;
 }
 
@@ -889,6 +900,9 @@ pre {
 
 .bubble {
   position: relative;
+  /* 同样不能低于 min-content，否则长代码行会把气泡撑出屏幕 */
+  min-width: 0;
+  max-width: 100%;
   padding: 9px 13px;
   border-radius: var(--radius-md);
   font-size: 15.5px;
@@ -965,10 +979,34 @@ pre {
   border-radius: 4px;
   padding: 1px 5px;
   font-size: 0.88em;
+  /* 行内路径/命令（C:\…\node_modules\…）是最容易撑破气泡的东西 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* 图片、表格、内嵌内容同样不允许超出气泡 */
+.bubble-text img,
+.bubble-text video,
+.bubble-text iframe,
+.bubble-text table {
+  max-width: 100%;
+  height: auto;
+}
+
+.bubble-text table {
+  display: block;
+  overflow-x: auto;
+}
+
+.bubble-text pre {
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .code-block {
   margin: 8px 0;
+  min-width: 0;
+  max-width: 100%;
   border-radius: var(--radius-xs);
   border: 1px solid var(--line);
   background: var(--bg-elevated);
@@ -1000,6 +1038,7 @@ pre {
 .code-block pre {
   margin: 0;
   padding: 10px 12px;
+  max-width: 100%;
   overflow-x: auto;
   font-size: 12.5px;
   line-height: 1.55;

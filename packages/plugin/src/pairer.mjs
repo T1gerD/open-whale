@@ -54,7 +54,7 @@ export function buildPairingPayload(options) {
     port: options.port ?? DEFAULT_PORT,
     lan: (options.lanUrls ?? [])[0],
     name: store.computerName,
-    version: options.version ?? '2.4.0',
+    version: options.version ?? '2.4.1',
   }
 }
 

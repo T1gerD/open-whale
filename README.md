@@ -222,7 +222,7 @@ dsh plugin --profile desktop add ./packages/plugin
 
 ```bash
 cd open-whale
-node scripts/run-tests.mjs          # 全部：48 个测试文件 / 747 项测试（v2.4.0 基线）
+node scripts/run-tests.mjs          # 全部：49 个测试文件 / 751 项测试（v2.4.1 基线）
 node scripts/run-tests.mjs qr       # 只跑文件名含 "qr" 的
 node packages/mobile/scripts/check-syntax.mjs   # 手机端 TS 语法检查
 ```

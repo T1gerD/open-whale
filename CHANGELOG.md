@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.4.1] - 2026-10-30
+
+**修复网页版聊天页可以横向拖动、消息两边被切掉的问题。**
+
+### 修复
+
+- **超长代码行/路径把气泡撑出屏幕**：`.msg` 是 flex item，`min-width` 默认为
+  `auto`（= 内容的 min-content）。一条 Windows 路径或命令行（例如
+  `C:\Users\…\node_modules\cc-safety-net\dist\bin\cc-safety-net.js`）会让
+  min-content 远宽于手机屏宽，`max-width: 86%` 被压过，气泡涨到 1000px 以上，
+  `.message-area` 出现横向滚动条——手机上表现为「聊天页能左右拖、文字两边被切」。
+  现在 `.msg` / `.bubble` / `.code-block` 都显式 `min-width: 0`，
+  `.message-area` 与整页禁止横向滚动，长代码行改为在 `.code-block pre` 内自己滚动。
+- 顺带约束 `img` / `video` / `iframe` / `table` 不超过气泡宽度，行内 `code`
+  允许在任意字符处换行。
+- 网页版缓存版本号随之更新（Service Worker 缓存名由协议版本 + 网页版版本派生），
+  升级后不会继续用旧的 `styles.css`。
+
+### 测试
+
+- 新增 `packages/webchat/test/layout.test.mjs`：对样式表做结构性断言（禁止横向
+  滚动、`min-width: 0`、代码块内部滚动、媒体不超宽），防止这类「纯 CSS 回归」
+  再溜过去。
+
 ## [2.4.0] - 2026-10-30
 
 **会话像 DSH 桌面侧边栏一样用：页内常驻标签条、多个会话同时跑、点一下就切换。**
