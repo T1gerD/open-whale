@@ -16,6 +16,7 @@
 import { AppState, type AppStateStatus } from 'react-native'
 
 import { isRetryAllowed, nextBackoffMs } from '../core/backoff.mts'
+import { buildApprovalReplyFrame, type ApprovalOutcome } from '../core/approvals.mts'
 import { failureReport, onRaceFailed, onRaceWon, planRace, createRetryState, type RetryState } from '../core/connection-plan.mts'
 import { getConnectionPolicy } from '../core/connection-policy.mts'
 import { endpointKind, endpointLadder, missingModeHint, wsUrlFor } from '../core/endpoint.mts'
@@ -24,6 +25,7 @@ import { buildHelloFrame, handshakeErrorHint, helloSignatureMessage, interpretHe
 import type { AssistantRecord } from '../core/pairing.mts'
 import { buildPowerRequest, type PowerAction } from '../core/power.mts'
 import { RaceTracker, type CloseInfo, type CloseVerdict } from '../core/race-state.mts'
+import { buildSessionCreateFrame, buildSessionListFrame, buildSessionSelectFrame } from '../core/sessions.mts'
 import type { ChatSendFile, ClientFrame, HelloAckFrame, LinkSnapshot, LinkStatus, ServerFrame } from '../protocol/types'
 
 import { randomNonce, randomRequestId, signMessage } from './crypto'
@@ -234,7 +236,6 @@ export class AssistantLink {
     rid: string
     msgId?: string
     text: string
-    speaker?: string
     files?: ChatSendFile[]
   }): boolean {
     return this.send({
@@ -244,7 +245,6 @@ export class AssistantLink {
       msgId: input.msgId ?? input.rid,
       callId: input.rid,
       text: input.text,
-      speaker: input.speaker,
       files: input.files,
     })
   }
@@ -254,8 +254,32 @@ export class AssistantLink {
     return this.send({ t: 'session/sync', cursor: cursor ?? this.cursor })
   }
 
-  setCollaboration(on: boolean, rid = randomRequestId('collab')): boolean {
-    return this.send({ t: 'collab/set', rid, on })
+  // ---------------------------------------------------------------------------
+  // 会话选择器 / 权限请求（2.3.0）
+  // ---------------------------------------------------------------------------
+
+  /** 列出电脑上的 DSH 会话（回包是 `sessions`）。 */
+  requestSessionList(rid = randomRequestId('sess')): boolean {
+    return this.send(buildSessionListFrame(rid))
+  }
+
+  /** 绑定到其中一个会话；成功后电脑端会推 `session/selected` + `session/state`。 */
+  selectSession(sessionId: string, rid = randomRequestId('sess')): boolean {
+    const frame = buildSessionSelectFrame(rid, sessionId)
+    if (!frame) return false
+    return this.send(frame)
+  }
+
+  /** 新建一个会话并绑定这台设备。 */
+  createSession(rid = randomRequestId('sess')): boolean {
+    return this.send(buildSessionCreateFrame(rid))
+  }
+
+  /** 回答一条权限请求（`allowed-once` / `rejected`）。 */
+  replyApproval(approvalId: string, outcome: ApprovalOutcome): boolean {
+    const frame = buildApprovalReplyFrame(approvalId, outcome)
+    if (!frame) return false
+    return this.send(frame)
   }
 
   sendUploadStart(input: { uploadId: string; name: string; size: number; mime?: string }): boolean {
@@ -290,7 +314,7 @@ export class AssistantLink {
     return this.send({ t: 'assistant/rename', label })
   }
 
-  /** 设置「我在这台电脑上的昵称」，电脑端用它做多人协作的消息前缀。 */
+  /** 设置这台手机在电脑端的显示名（设置页 / 助理详情里的设备名）。 */
   renameDevice(label: string): boolean {
     return this.send({ t: 'device/rename', label })
   }
@@ -562,7 +586,6 @@ export class AssistantLink {
       sessionId: outcome.sessionId ?? this.sessionId,
       sessionEpoch: outcome.sessionEpoch,
       eventCursor: outcome.eventCursor,
-      collaboration: outcome.collaboration,
       serverConnectionMode: outcome.connectionMode,
       lastError: undefined,
       fatal: false,

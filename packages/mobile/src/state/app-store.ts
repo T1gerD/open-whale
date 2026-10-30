@@ -26,6 +26,11 @@ import {
 } from '../services/db'
 import { base64ToBytes } from '../core/base64.mts'
 import {
+  approvalAvailability,
+  type ApprovalOutcome,
+  type ApprovalPrompt,
+} from '../core/approvals.mts'
+import {
   CONNECTION_POLICY_KEYS,
   DEFAULT_CONNECTION_POLICY,
   formatPolicyFlag,
@@ -88,6 +93,7 @@ import {
   type FileRef,
   type Transfer,
 } from '../core/reducer.mts'
+import { sessionAvailability, type SessionListState } from '../core/sessions.mts'
 import { uploadFailureLabel, uploadGuard } from '../core/upload.mts'
 import { planWake, type WakeSetting } from '../core/wake.mts'
 import { pairingDeps, orderEndpoints } from '../protocol/runtime'
@@ -107,15 +113,6 @@ export interface StoredAssistantRow extends AssistantRecord {
   wakeMac?: string
 }
 
-/** 在线成员（UI 的头像条）。 */
-export interface ParticipantView {
-  deviceId: string
-  name: string
-  online: boolean
-  /** 是不是本机（头像条给“我”加描边）。 */
-  isMe: boolean
-}
-
 export interface AssistantView {
   assistant: StoredAssistantRow
   link: LinkSnapshot
@@ -125,10 +122,10 @@ export interface AssistantView {
   pendingMessages: number
   /** 正在下载的文件数。 */
   activeTransfers: number
-  /** 协作模式是否开启。 */
-  collaboration: boolean
-  /** 会话内在线成员。 */
-  participants: ParticipantView[]
+  /** 电脑上会话列表（会话选择器的数据源；没拉过就是 undefined）。 */
+  sessions: SessionListState | undefined
+  /** 等待手机回答的 DSH 权限请求（多条并存，不会互相覆盖）。 */
+  approvals: ApprovalPrompt[]
   /** 未读消息数（进入聊天页调用 markRead 清零）。 */
   unread: number
   /** 每台电脑持久化的连接方式。 */
@@ -230,9 +227,7 @@ class ChatController {
       loadTransfers(this.assistantId),
       loadOutbox(this.assistantId),
     ])
-    this.chat = hydrateChat(this.assistantId, messages, transfers, Date.now(), {
-      selfDeviceId: this.store.deviceIdentity.deviceId,
-    })
+    this.chat = hydrateChat(this.assistantId, messages, transfers, Date.now())
     // 会话元数据从助理记录恢复（游标用于重连补发）。
     const row = this.store.assistantRow(this.assistantId)
     this.chat = {
@@ -284,7 +279,7 @@ class ChatController {
     this.pumpOutbox()
   }
 
-  /** 会话切换（协作模式/纪元变化）：清空本地会话，等 session/state 快照。 */
+  /** 会话切换（电脑端换了绑定会话）：清空本地会话，等 session/state 快照。 */
   onSessionSwitch(info: { sessionId?: string; sessionEpoch?: number; reason?: string }): void {
     this.dispatch({
       t: 'session/reset',
@@ -293,6 +288,24 @@ class ChatController {
       reason: info.reason,
       at: Date.now(),
     })
+  }
+
+  /**
+   * 本地每秒节拍：权限请求过期后必须自己消失。
+   * 电脑端到点会把提示交回桌面，之后不会再有任何帧告诉手机“这条已经不用答了”。
+   */
+  tickApprovals(): void {
+    if (this.chat.approvals.length === 0) return
+    this.dispatch({ t: 'approval/tick', at: Date.now() })
+  }
+
+  /**
+   * 手机已经作答：本地先撤掉卡片。
+   * 电脑端通常也会推 `approval/resolved`，但那一条不保证会到（超时/换连接都可能丢），
+   * 等它才撤会让用户对着一个已经答过的按钮发呆。reducer 里 resolved 是幂等的。
+   */
+  ackApproval(approvalId: string, outcome: 'allowed-once' | 'rejected'): void {
+    this.dispatch({ t: 'approval/resolved', approvalId, outcome, source: 'phone', at: Date.now() })
   }
 
   /** 进入聊天页：清未读。 */
@@ -466,7 +479,6 @@ class ChatController {
 
   snapshot(): AssistantView {
     const row = this.store.assistantRow(this.assistantId)
-    const deviceId = row.deviceId || this.store.deviceIdentity.deviceId
     return {
       assistant: row,
       link: this.link?.snapshot ?? OFFLINE_LINK,
@@ -476,11 +488,8 @@ class ChatController {
       activeTransfers: Object.values(this.chat.transfers).filter(
         transfer => transfer.status === 'downloading' || transfer.status === 'queued',
       ).length,
-      collaboration: this.chat.collaboration,
-      participants: this.chat.participants.map(participant => ({
-        ...participant,
-        isMe: deviceId !== undefined && participant.deviceId === deviceId,
-      })),
+      sessions: this.chat.sessionList,
+      approvals: this.chat.approvals,
       unread: this.unread,
       connectionMode: normalizeConnectionMode(row.connectionMode),
       endpointLabel: this.link?.snapshot.endpoint ? endpointLabel(this.link.snapshot.endpoint) : '未连接',
@@ -553,7 +562,6 @@ class ChatController {
               rid: entry.rid,
               msgId: entry.msgId ?? entry.rid,
               text: entry.text,
-              speaker: entry.speaker,
               files: files.length > 0 ? files : undefined,
             })
             if (!sent) break
@@ -820,13 +828,13 @@ class ChatController {
     }
   }
 
-  /** 未读计数：新出现的助手消息 / 他人消息才 +1（流式增量不重复计数）。 */
+  /** 未读计数：新出现的助手消息才 +1（流式增量不重复计数）。 */
   private bumpUnread(beforeIds: Set<string>, after: ChatMessage[]): void {
     let added = 0
     for (const message of after) {
       if (beforeIds.has(message.id)) continue
+      // v2.3.0 起每台手机只驱动自己的会话，用户消息永远是本机发的：只算助手回复。
       if (message.kind === 'assistant' && message.fileOffer !== true) added += 1
-      else if (message.kind === 'user' && message.mine === false) added += 1
     }
     if (added > 0) {
       this.unread += added
@@ -908,6 +916,8 @@ export class AppStore {
   private identity: DeviceIdentity | undefined
   private seed: Uint8Array | undefined
   private powerTicker: ReturnType<typeof setInterval> | undefined
+  /** 权限请求的每秒节拍（倒计时 + 过期后自动撤卡片）。 */
+  private approvalTicker: ReturnType<typeof setInterval> | undefined
   private badgeTimer: ReturnType<typeof setTimeout> | undefined
   private pairWaiter:
     | { assistantId: string; resolve: (result: PairResult) => void; timer: ReturnType<typeof setTimeout> }
@@ -1200,23 +1210,64 @@ export class AppStore {
     for (const id of this.rows.keys()) this.reconnectNow(id)
   }
 
-  /** 手机端切换协作模式（需要电脑声明 collab-v1）。 */
-  async setCollaboration(assistantId: string, on: boolean): Promise<{ ok: boolean; error?: string; hint?: string }> {
+  /**
+   * 打开会话列表：离线或电脑端不支持 `sessions-v1` 时**不**发帧，直接给可操作提示。
+   * 返回的 ok 只表示“请求已发出”，列表本身通过 `sessions` 帧异步回来。
+   */
+  async listSessions(assistantId: string): Promise<{ ok: boolean; error?: string; hint?: string }> {
     const link = this.links.get(assistantId)
-    if (!link) return { ok: false, error: '还没有建立连接', hint: '请先连上电脑再切换协作模式。' }
-    if (!link.isOnline) {
-      return { ok: false, error: '当前离线，暂时无法切换协作模式', hint: '等连接恢复后再试。' }
-    }
-    if (!link.hasCapability(CAPABILITIES.COLLAB)) {
-      return {
-        ok: false,
-        error: '电脑端版本较旧（v2.1.0），不支持在手机上切换协作模式',
-        hint: '请在电脑上的 Open Whale 页面开启协作模式，或升级电脑端插件后重试。',
-      }
-    }
-    const sent = link.setCollaboration(on)
+    const gate = sessionAvailability(link?.isOnline === true, link?.capabilityList)
+    if (!gate.ok) return { ok: false, error: gate.error, hint: gate.hint }
+    if (!link) return { ok: false, error: '还没有建立连接', hint: '请先连上电脑。' }
+    const sent = link.requestSessionList()
     if (!sent) return { ok: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
     return { ok: true }
+  }
+
+  /** 选中一个会话：电脑端会回 `session/selected` + 一份 `session/state` 快照。 */
+  async selectSession(assistantId: string, sessionId: string): Promise<{ ok: boolean; error?: string; hint?: string }> {
+    if (!sessionId) return { ok: false, error: '这个会话没有 id，无法打开', hint: '刷新列表后再选一次。' }
+    const link = this.links.get(assistantId)
+    const gate = sessionAvailability(link?.isOnline === true, link?.capabilityList)
+    if (!gate.ok) return { ok: false, error: gate.error, hint: gate.hint }
+    if (!link) return { ok: false, error: '还没有建立连接', hint: '请先连上电脑。' }
+    const sent = link.selectSession(sessionId)
+    if (!sent) return { ok: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
+    return { ok: true }
+  }
+
+  /** 新建会话并绑定这台手机。 */
+  async createSession(assistantId: string): Promise<{ ok: boolean; error?: string; hint?: string }> {
+    const link = this.links.get(assistantId)
+    const gate = sessionAvailability(link?.isOnline === true, link?.capabilityList)
+    if (!gate.ok) return { ok: false, error: gate.error, hint: gate.hint }
+    if (!link) return { ok: false, error: '还没有建立连接', hint: '请先连上电脑。' }
+    const sent = link.createSession()
+    if (!sent) return { ok: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
+    return { ok: true }
+  }
+
+  /**
+   * 回答一条权限请求。
+   *
+   * 手机端**不发假帧**：离线或电脑端没有 `approval-v1` 时直接拒绝并说明原因
+   * （电脑端到点会把提示交回桌面，用户仍能在电脑上处理）。
+   */
+  replyApproval(
+    assistantId: string,
+    approvalId: string,
+    outcome: ApprovalOutcome,
+  ): { sent: boolean; error?: string; hint?: string } {
+    const link = this.links.get(assistantId)
+    const gate = approvalAvailability(link?.isOnline === true, link?.capabilityList)
+    if (!gate.ok) return { sent: false, error: gate.error, hint: gate.hint }
+    if (!link) return { sent: false, error: '还没有建立连接' }
+    const sent = link.replyApproval(approvalId, outcome)
+    if (!sent) return { sent: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
+    // 发出去了就立刻撤卡片（乐观更新；resolved 帧到达时是幂等的）。
+    this.controller(assistantId).ackApproval(approvalId, outcome)
+    this.notify()
+    return { sent: true }
   }
 
   // ---------------------------------------------------------------------------
@@ -1234,22 +1285,6 @@ export class AppStore {
     await renameAssistantRow(assistantId, trimmed)
     this.notify()
     this.links.get(assistantId)?.renameAssistant(trimmed)
-  }
-
-  /**
-   * 我在电脑端的昵称：多人协作时作为消息前缀，存在设置 KV 里并推给电脑端。
-   * `assistantId` 省略时应用到所有已绑定电脑（设置页的全局输入）。
-   */
-  async setMyNickname(assistantId: string | undefined, nickname: string): Promise<void> {
-    const trimmed = nickname.trim().slice(0, 24)
-    await setSetting('device.nickname', trimmed || undefined)
-    const targets = assistantId ? [assistantId] : [...this.links.keys()]
-    for (const id of targets) this.links.get(id)?.renameDevice(trimmed)
-  }
-
-  /** 读取本机保存的昵称（为空表示用设备默认名）。 */
-  async getMyNickname(): Promise<string> {
-    return (await getSetting('device.nickname')) ?? ''
   }
 
   async setWakeSetting(assistantId: string, setting: WakeSetting): Promise<void> {
@@ -1455,6 +1490,7 @@ export class AppStore {
     }
     for (const listener of this.listeners) listener()
     this.ensurePowerTicker()
+    this.ensureApprovalTicker()
   }
 
   // ---------------------------------------------------------------------------
@@ -1484,31 +1520,39 @@ export class AppStore {
       this.notify()
       return
     }
-    this.controller(assistantId).onFrame(frame)
-    // 协作开关/参与者这类帧不改变消息，但 UI 要立刻看到状态变化。
-    if (frame.t === 'collab/state') {
-      const row = this.rows.get(assistantId)
-      const epoch = typeof frame.sessionEpoch === 'number' && Number.isFinite(frame.sessionEpoch) ? frame.sessionEpoch : undefined
-      if (row && epoch !== undefined && row.sessionEpoch !== undefined && epoch !== row.sessionEpoch) {
-        // 纪元变了 = 会话已经切换（电脑端刚广播 collab/state，紧跟 session/state 快照）。
-        this.controller(assistantId).onSessionSwitch({
-          sessionId: typeof frame.sessionId === 'string' ? frame.sessionId : row.sessionId,
-          sessionEpoch: epoch,
-          reason: frame.on ? '已加入协作会话，正在同步聊天记录…' : '已退出协作会话，正在同步聊天记录…',
-        })
-        const updated: StoredAssistantRow = {
-          ...row,
-          sessionId: typeof frame.sessionId === 'string' ? frame.sessionId : row.sessionId,
-          sessionEpoch: epoch,
-          sessionCursor: 0,
+    // 会话选择器：列表到手就通知 UI；选中成功要把“上次的会话”落盘（重启后恢复）。
+    if (frame.t === 'sessions') {
+      this.controller(assistantId).onFrame(frame)
+      this.notify()
+      return
+    }
+    if (frame.t === 'session/selected') {
+      this.controller(assistantId).onFrame(frame)
+      if (frame.ok !== false) {
+        const row = this.rows.get(assistantId)
+        const sessionId = typeof frame.sessionId === 'string' && frame.sessionId ? frame.sessionId : row?.sessionId
+        const sessionEpoch = typeof frame.sessionEpoch === 'number' && Number.isFinite(frame.sessionEpoch)
+          ? frame.sessionEpoch
+          : row?.sessionEpoch
+        if (row) {
+          const updated: StoredAssistantRow = { ...row, sessionId, sessionEpoch, sessionCursor: 0 }
+          this.rows.set(assistantId, updated)
+          void upsertAssistant(updated)
         }
-        this.rows.set(assistantId, updated)
-        void upsertAssistant(updated)
+        // 下一次 hello 带上新会话 + 游标 0（让电脑端重新给快照）。
+        this.links.get(assistantId)?.setSessionCursor(0, sessionId)
       }
       this.notify()
       return
     }
-    if (frame.t === 'session/participants') this.notify()
+    // 权限请求：ask 要给用户看见（并启动倒计时节拍），resolved 要撤掉卡片。
+    if (frame.t === 'approval/ask' || frame.t === 'approval/resolved') {
+      this.controller(assistantId).onFrame(frame)
+      this.ensureApprovalTicker()
+      this.notify()
+      return
+    }
+    this.controller(assistantId).onFrame(frame)
   }
 
   private onStatus(assistantId: string, snapshot: LinkSnapshot): void {
@@ -1549,7 +1593,7 @@ export class AppStore {
       const previousEpoch = row.sessionEpoch
       const nextSession = typeof ack.sessionId === 'string' && ack.sessionId ? ack.sessionId : row.sessionId
       const nextEpoch = typeof ack.sessionEpoch === 'number' && Number.isFinite(ack.sessionEpoch) ? ack.sessionEpoch : row.sessionEpoch
-      // 会话切换：sessionId 变了，或纪元前进了（协作模式开关）。
+      // 会话切换：sessionId 变了，或纪元前进了（电脑端换了绑定会话）。
       const switched =
         previousSession !== undefined &&
         ((nextSession !== undefined && nextSession !== previousSession) ||
@@ -1566,7 +1610,7 @@ export class AppStore {
         ...row,
         name: row.name || ack.computerName,
         online: true,
-        // 展示插件版本（2.2.0），协议版本仍是 1.1.0，不要混。
+        // 展示插件版本（2.3.0），协议版本现在是 1.2.0，两者不要混。
         serverVersion: ack.serverVersion ?? ack.version ?? row.serverVersion,
         lastConnectedAt: new Date().toISOString(),
         endpoints: mergedEndpoints,
@@ -1581,9 +1625,7 @@ export class AppStore {
         this.controller(assistantId).onSessionSwitch({
           sessionId: nextSession,
           sessionEpoch: nextEpoch,
-          reason: ack.collaboration === false
-            ? '协作会话已切换回个人会话，正在同步聊天记录…'
-            : '协作会话已切换，正在同步聊天记录…',
+          reason: '会话已在电脑端切换，正在同步聊天记录…',
         })
       } else if (typeof ack.eventCursor === 'number') {
         // 同一会话重连：把电脑端的 head 记下来，下次 hello 的 cursor 直接用（快照/回放由电脑端决定）。
@@ -1620,6 +1662,27 @@ export class AppStore {
     if (!anyPending && this.powerTicker) {
       clearInterval(this.powerTicker)
       this.powerTicker = undefined
+    }
+  }
+
+  /**
+   * 权限请求的每秒节拍。
+   *
+   * 有两个作用，缺一不可：
+   *  1. 卡片上的倒计时（`0:42`）每秒要走动；
+   *  2. 到点后必须**自己消失**——电脑端超时会把提示交回桌面，不会再发帧告诉手机。
+   * 没有待答请求就停掉定时器，不空转耗电。
+   */
+  private ensureApprovalTicker(): void {
+    const anyPending = [...this.controllers.values()].some(controller => controller.chat.approvals.length > 0)
+    if (anyPending && !this.approvalTicker) {
+      this.approvalTicker = setInterval(() => {
+        for (const controller of this.controllers.values()) controller.tickApprovals()
+      }, 1000)
+    }
+    if (!anyPending && this.approvalTicker) {
+      clearInterval(this.approvalTicker)
+      this.approvalTicker = undefined
     }
   }
 

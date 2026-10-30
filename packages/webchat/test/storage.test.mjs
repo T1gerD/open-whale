@@ -126,6 +126,15 @@ test('createStorage：绑定 / 设置 / 会话 / outbox 完整往返', () => {
   storage.clearOutbox('web_123')
   assert.deepEqual(storage.loadOutbox('web_123'), [])
 
+  // 上次选中的会话按设备分开存：换一台电脑不会误用另一台的 sessionId。
+  assert.equal(storage.loadLastSession('web_123'), '')
+  assert.equal(storage.saveLastSession('web_123', 'sess_a'), true)
+  assert.equal(storage.loadLastSession('web_123'), 'sess_a')
+  assert.equal(storage.loadLastSession('web_999'), '')
+  storage.saveLastSession('web_123', '')
+  assert.equal(storage.loadLastSession('web_123'), '')
+  assert.equal(storage.saveLastSession('', 'sess_a'), false)
+
   storage.clearBinding()
   assert.equal(storage.loadBinding(), undefined)
 })

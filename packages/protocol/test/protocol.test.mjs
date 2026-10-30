@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import {
   ACTIVITY_KIND,
   ALL_CAPABILITIES,
+  APPROVAL_REPLY_OUTCOMES,
+  APPROVAL_TIMEOUT_MS,
   CAPABILITIES,
   CLIENT_FRAME,
   CONNECTION_MODE,
@@ -12,6 +14,7 @@ import {
   PAIR_SECRET_TTL_MS,
   PROTOCOL_VERSION,
   SERVER_FRAME,
+  SESSION_LIST_LIMIT,
   SessionEventLog,
   classifyEndpoint,
   clampAssistantText,
@@ -361,3 +364,50 @@ test('clampAssistantText never splits a surrogate pair', () => {
 test('activity kinds are stable identifiers the app can switch on', () => {
   assert.deepEqual(Object.values(ACTIVITY_KIND), ['thinking', 'tool-start', 'tool-end'])
 })
+
+// ---------------------------------------------------------------------------
+// v1.2.0 / 2.3.0: "remote control only" — collaboration out, sessions + approval in
+// ---------------------------------------------------------------------------
+
+test('2.3.0 keeps the protocol at 1.x so a 2.2 phone still connects', () => {
+  assert.equal(PROTOCOL_VERSION.split('.')[0], '1')
+  assert.equal(PROTOCOL_VERSION, '1.2.0')
+})
+
+test('collaboration capabilities are gone and the two new ones are present', () => {
+  const caps = new Set(ALL_CAPABILITIES)
+  assert.equal(caps.has('collab-v1'), false)
+  assert.equal(caps.has('participants-v1'), false)
+  assert.equal(CAPABILITIES.SESSIONS, 'sessions-v1')
+  assert.equal(CAPABILITIES.APPROVAL, 'approval-v1')
+})
+
+test('the session picker and approval frames exist in the right direction', () => {
+  assert.equal(CLIENT_FRAME.SESSION_LIST, 'session/list')
+  assert.equal(CLIENT_FRAME.SESSION_SELECT, 'session/select')
+  assert.equal(CLIENT_FRAME.SESSION_CREATE, 'session/create')
+  assert.equal(CLIENT_FRAME.APPROVAL_REPLY, 'approval/reply')
+  assert.equal(SERVER_FRAME.SESSIONS, 'sessions')
+  assert.equal(SERVER_FRAME.SESSION_SELECTED, 'session/selected')
+  assert.equal(SERVER_FRAME.APPROVAL_ASK, 'approval/ask')
+  assert.equal(SERVER_FRAME.APPROVAL_RESOLVED, 'approval/resolved')
+  // The removed collaboration frames must not come back by accident.
+  assert.equal(Object.values(CLIENT_FRAME).includes('collab/set'), false)
+  assert.equal(Object.values(SERVER_FRAME).includes('session/participants'), false)
+  assert.equal(Object.values(SERVER_FRAME).includes('collab/state'), false)
+})
+
+test('only the two approval outcomes a phone may send are accepted', () => {
+  assert.deepEqual([...APPROVAL_REPLY_OUTCOMES], ['allowed-once', 'rejected'])
+})
+
+test('the approval timeout is short enough to hand back to the desktop', () => {
+  assert.ok(APPROVAL_TIMEOUT_MS >= 15_000)
+  assert.ok(APPROVAL_TIMEOUT_MS <= 120_000)
+})
+
+test('the session list is bounded so one frame cannot grow without limit', () => {
+  assert.ok(Number.isInteger(SESSION_LIST_LIMIT))
+  assert.ok(SESSION_LIST_LIMIT > 0 && SESSION_LIST_LIMIT <= 500)
+})
+

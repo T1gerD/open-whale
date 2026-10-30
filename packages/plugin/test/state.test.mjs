@@ -170,19 +170,14 @@ test('a device signature is only accepted for a bound key', () => {
   assert.equal(store.verifyDeviceSignature('dev_1', 'nonce', 'not-base64url!'), false)
 })
 
-test('session ids are deterministic per device and differ between devices', () => {
+test('2.3.0 no longer invents conversation ids in the store', () => {
   const { store } = makeStore()
-  const a = store.sessionIdFor('dev_1')
-  const b = store.sessionIdFor('dev_2')
-  assert.equal(store.sessionIdFor('dev_1'), a, 'same device must keep one conversation')
-  assert.notEqual(a, b)
-  assert.match(a, /^ow-[0-9a-f]{32}$/)
-})
-
-test('session ids differ between computers for the same device', () => {
-  const a = makeStore().store
-  const b = makeStore().store
-  assert.notEqual(a.sessionIdFor('dev_1'), b.sessionIdFor('dev_1'))
+  // v2.3.0: a conversation is a real DSH session that the phone picks, so the
+  // store must not keep a per-device/shared conversation id of its own. The
+  // device → session binding is ordinary preference state owned by the gateway.
+  assert.equal(typeof store.sessionIdFor, 'undefined')
+  assert.equal(typeof store.sharedSessionId, 'undefined')
+  assert.deepEqual(store.getPreference('deviceSession', {}), {})
 })
 
 test('preferences round-trip and survive reload', () => {

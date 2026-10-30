@@ -114,11 +114,32 @@ function makeBridge({ config = {}, fire } = {}) {
     emit: event => events.push(event),
     log: () => {},
     defaultCwd: () => WORKDIR,
+    // v2.3.0: conversation ids are minted by the bridge (production: random
+    // UUID). Tests pin them to the old fixture names so the rest of the file
+    // keeps reading like a real per-device conversation.
+    newSessionId: deviceId => `ow-${deviceId ?? 'x'}`,
     // Mirrors `createUserMessage` from @deepseek-ai/dsh-llm: it freezes the
     // message and attaches the unique id the agent inbox deduplicates on.
     createUserMessage: input => Object.freeze({ ...input, role: 'user', id: `msg_${++idCounter}` }),
   })
   bridge.start()
+  // v2.3.0: the gateway owns the device→session binding and passes `sessionId`
+  // on every send. Unit tests here drive the bridge directly, so this fixture
+  // stands in for the gateway: first send for a device creates its conversation,
+  // later sends reuse it.
+  const bound = new Map()
+  const rawSend = bridge.send.bind(bridge)
+  bridge.send = async input => {
+    if (!input.sessionId) {
+      let sessionId = bound.get(input.deviceId)
+      if (!sessionId) {
+        sessionId = (await bridge.createSession(input.deviceId)).sessionId
+        bound.set(input.deviceId, sessionId)
+      }
+      input = { ...input, sessionId }
+    }
+    return rawSend(input)
+  }
   return { bridge, fake, events, fire: fake.fire }
 }
 
@@ -170,7 +191,16 @@ test('voice can be turned off entirely', async () => {
 test('auto-approval is off by default and opt-in', async () => {
   const off = makeBridge()
   await off.bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
-  assert.equal(off.fake.scopedEvents.length, 0, 'tools must follow the normal DSH policy by default')
+  // By default a phone-forwarding answerer is registered, but it must never
+  // claim a request nobody can answer: with no phone online it delegates.
+  const forwarding = off.fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  assert.ok(forwarding, 'the phone approval forwarder must be registered')
+  assert.equal(forwarding.opts?.prepend, true, 'it must see the request before the desktop answerer')
+  assert.equal(
+    await forwarding.listener({ toolName: 'bash' }, async () => 'unavailable'),
+    'unavailable',
+    'no phone online → fall through to the desktop UI',
+  )
 
   const on = makeBridge({ config: { autoApproveTools: true } })
   await on.bridge.send({ deviceId: 'dev_b', callId: 'c2', text: 'hi', attachments: [] })
@@ -201,7 +231,8 @@ test('a new conversation inherits the harness model selection', async () => {
     modelSelection: () => ({ provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'high' }),
   })
   bridge.start()
-  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const { sessionId } = await bridge.createSession('dev_a')
+  await bridge.send({ deviceId: 'dev_a', sessionId, callId: 'c1', text: 'hi', attachments: [] })
   // Without these the harness assembles a prompt whose {{model}} variable is
   // empty and the very first message fails.
   assert.deepEqual(fake.created[0].agentOptions, {
@@ -227,7 +258,8 @@ test('explicit agent options win over the inherited selection', async () => {
     modelSelection: () => ({ provider: 'other', model: 'other-model' }),
   })
   bridge.start()
-  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const { sessionId } = await bridge.createSession('dev_a')
+  await bridge.send({ deviceId: 'dev_a', sessionId, callId: 'c1', text: 'hi', attachments: [] })
   assert.deepEqual(fake.created[0].agentOptions, { provider: 'pinned', model: 'pinned-model' })
 })
 
@@ -247,7 +279,8 @@ test('a missing model selection is reported rather than silently ignored', async
     modelSelection: () => undefined,
   })
   bridge.start()
-  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const { sessionId } = await bridge.createSession('dev_a')
+  await bridge.send({ deviceId: 'dev_a', sessionId, callId: 'c1', text: 'hi', attachments: [] })
   assert.equal(logs.some(line => /默认模型/.test(line)), true, 'the user must be told why replies would fail')
 })
 
@@ -469,20 +502,11 @@ test('dispose releases the subscription and every agent it created', async () =>
   await assert.rejects(() => bridge.send({ deviceId: 'dev_a', callId: 'c2', text: 'x', attachments: [] }), /已关闭/)
 })
 
-test('forgetting a device disposes only that device conversation', async () => {
-  const { bridge, fake } = makeBridge()
-  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'a', attachments: [] })
-  await bridge.send({ deviceId: 'dev_b', callId: 'c2', text: 'b', attachments: [] })
-  await bridge.forgetDevice('dev_a')
-  assert.equal(fake.live.has('ow-dev_a'), false)
-  assert.equal(fake.live.has('ow-dev_b'), true)
-})
-
 test('a reconnecting device reuses a still-live agent', async () => {
   const { bridge, fake } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'a', attachments: [] })
   // Simulate a bridge restart with the agent still registered on the host.
-  bridge.entries.clear()
+  bridge.agents.clear()
   await bridge.send({ deviceId: 'dev_a', callId: 'c2', text: 'b', attachments: [] })
   assert.equal(fake.created.length, 1, 'the live agent must be adopted, not replaced')
 })
@@ -580,16 +604,15 @@ test('an attempt and the committed message for the same step are counted once', 
   assert.equal(events.find(event => event.kind === 'done').text, '答案')
 })
 
-test('two devices sharing one collaborative session do not multiply the answer', async () => {
-  const { bridge, fake, events } = makeBridge({
-    config: { sessionIdFor: () => 'ow-shared', isCollaboration: () => true },
-  })
-  await bridge.send({ deviceId: 'dev_a', callId: 'ca', text: 'a', attachments: [], speaker: 'A' })
-  await bridge.send({ deviceId: 'dev_b', callId: 'cb', text: 'b', attachments: [], speaker: 'B' })
-  const session = { id: 'ow-shared' }
+test('two devices explicitly bound to the same conversation share one answer', async () => {
+  const { bridge, fake, events } = makeBridge()
+  // v2.3.0: two phones can still land on one DSH conversation — the user simply
+  // picks the same session on both. It must be reduced once, not once per device.
+  const { sessionId } = await bridge.createSession('dev_a')
+  await bridge.send({ deviceId: 'dev_a', sessionId, callId: 'ca', text: 'a', attachments: [] })
+  await bridge.send({ deviceId: 'dev_b', sessionId, callId: 'cb', text: 'b', attachments: [] })
+  const session = { id: sessionId }
 
-  // The exact production bug: the shared session's event is reduced once, not
-  // once per device — otherwise done.text became "答案\n\n答案".
   fake.fire(session, { type: 'turn/start', data: { turn: 1 } })
   fake.fire(session, {
     type: 'assistant/message',
@@ -604,11 +627,14 @@ test('two devices sharing one collaborative session do not multiply the answer',
   assert.equal(done[0].callId, 'ca', 'the turn belongs to the message that started it')
 })
 
-test('a device is registered in its conversation before it ever speaks', () => {
-  const { bridge } = makeBridge({ config: { sessionIdFor: () => 'ow-shared' } })
-  bridge.attachDevice('dev_b')
-  assert.equal(bridge.entries.get('dev_b')?.sessionId, 'ow-shared')
-  assert.equal(bridge.bySession.has('ow-shared'), true)
+test('selecting a conversation that is already live adopts the existing agent', async () => {
+  const { bridge, fake } = makeBridge()
+  const { sessionId } = await bridge.createSession('dev_a')
+  const created = fake.created.length
+  const picked = await bridge.selectSession(sessionId)
+  assert.equal(picked.ok, true)
+  assert.equal(picked.sessionId, sessionId)
+  assert.equal(fake.created.length, created, 'a live conversation must never be created twice')
 })
 
 test('bridge.send is idempotent for the same device and call id', async () => {
@@ -646,15 +672,3 @@ test('attachments are described with a path relative to the working directory', 
   assert.match(text, /read/, 'the model must be told it can read the file')
 })
 
-test('switching collaboration disposes the old mapping so sessions are rebuilt', async () => {
-  const { bridge, fake } = makeBridge()
-  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
-  bridge.attachDevice('dev_b')
-  assert.equal(bridge.entries.size, 2)
-
-  await bridge.resetSessionMapping()
-
-  assert.equal(bridge.entries.size, 0)
-  assert.equal(bridge.bySession.size, 0)
-  assert.equal(fake.live.size, 0, 'per-device conversations are retired when the session layout changes')
-})

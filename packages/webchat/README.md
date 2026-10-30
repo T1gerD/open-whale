@@ -10,7 +10,7 @@ packages/webchat/
 ├── app.js                 # 入口：UI、连接生命周期、附件、设置
 ├── styles.css             # 移动优先样式，深/浅色
 ├── manifest.webmanifest   # PWA 清单（添加到主屏幕）
-├── sw.js                  # 离线壳 Service Worker（不缓存聊天）
+├── sw.js                  # 离线壳 Service Worker（module worker，按协议版本分缓存，不缓存聊天）
 ├── lib/                   # 纯逻辑，可在 node --test 里直接 import
 │   ├── bytes.mjs          # base64 / base64url / utf8 / 体积格式化
 │   ├── protocol.mjs       # 协议常量镜像（由测试与真实 protocol 比对）
@@ -57,7 +57,10 @@ packages/webchat/
 - [ ] `#p=` 链接自动绑定；二维码过期时提示「二维码已过期」而不是静默失败
 - [ ] 绑定成功后刷新页面能自动重连（签名 hello，不再用配对 secret）
 - [ ] 断网再恢复：横幅显示重连，消息离线排队，恢复后自动发出且电脑端只收到一条
-- [ ] 另开一台设备（或手机 App）在同一会话发消息：网页版能看到带昵称的 `chat/echo`
+- [ ] 顶部会话胶囊能列出电脑上的 DSH 会话（标题 / 相对时间 / 在线 / 当前），
+      切换后整页换成该会话的历史；「新建会话」会新建并切过去；刷新后仍回到上次选的会话
+- [ ] 电脑上触发权限请求：网页出现审批卡片（工具名 / 原因 / 允许一次 / 拒绝），
+      作答后卡片消失；带 `expiresAt` 时有倒计时，超时提示交回电脑；连续两条请求会排队
 - [ ] 电脑端 AI 回复流式显示，结束后全文与电脑端一致（无重复拼接）
 - [ ] 发送 3 MB 图片：进度条上升、电脑端落盘到会话工作目录、模型能读到
 - [ ] 电脑推文件到手机（`file/offered`）：出现文件卡片，点击能下载
@@ -83,9 +86,10 @@ packages/webchat/
 - 假网关用仓库里 `packages/plugin/src/ws.mjs` 提供真实 WebSocket 端点，
   用 `node:crypto` 扮演电脑端，**严格校验浏览器 hello 里的 Ed25519 签名并回带 proof**；
 - 浏览器侧（Chrome headless）用 `#p=` 链接完成首次绑定，并验证：
-  连接状态变「已连接」、`session/state` 快照渲染、`chat/echo` 带昵称显示、
+  连接状态变「已连接」、`session/state` 快照渲染、
   `chat/message` 同 messageId 全文替换（无重复拼接）、`chat/done` 覆盖、
-  `file/offered` 文件卡片、`session/participants` 头像条；
+  `file/offered` 文件卡片、`sessions` → `session/selected` → `session/state` 的会话切换
+  与 `approval/ask` 审批卡片；
 - 再用**同一个浏览器 profile 去掉 `#p=` 刷新**，验证「签名 hello 重连 + 快照补齐」；
 - 控制台零未捕获异常。
 
@@ -101,8 +105,8 @@ packages/webchat/
 > 竞速加固：同一 deviceId 的两条竞速 socket 都会完成 hello/ack。连接管理器在收到第一个
 > ack 后等 400ms「确认窗口」再定 winner；若窗口内 winner 被服务端以
 > `replaced by a newer connection` 顶掉，就改用另一条已 ack 的 socket，而不是整轮重连。
-> 已在线后若再被同一设备的新连接替换，则**不自动重连**（避免两个窗口互相顶掉死循环），
-> 改为横幅提示 + 手动「重试」。
+> 已在线后若再被同一设备的新连接替换，则按**更长的指数退避自动重连**（不会每秒互相顶掉），
+> 横幅同时给出提示；`stop()`（用户主动断开）之后不再自动重连。
 
 真机（鸿蒙/iOS）联调仍需按上面的手动验证清单执行。
 
@@ -111,6 +115,9 @@ packages/webchat/
 - **Service Worker / 安装提示需要安全上下文**：通过 `http://<局域网IP>:8787` 打开时
   浏览器不注册 SW（没有离线壳，manifest 安装提示也可能不出现），但聊天、附件、
   相册识图（jsQR 路径）都正常；用 Tailscale Serve 的 https 地址或 localhost 才完整。
+- **离线壳需要 module worker 支持**（Chromium 91+ / Safari 16.4+ / Firefox 114+）：
+  `sw.js` 直接 import `lib/protocol.mjs` 的版本号来给缓存命名，避免版本号写死后与新
+  前端混用。更老的浏览器注册会失败（被 catch 掉），在线聊天不受影响，只是没有离线壳。
 - iOS 的「添加到主屏幕」在 http 上可用，但独立窗口模式下 localStorage 可能被系统清理，
   需要重新扫码；公共电脑不要绑定。
 - 网页版没有系统级推送；页面在后台时 iOS 会冻结 JS，回到前台自动重连。

@@ -18,10 +18,9 @@ import { join } from 'node:path'
 
 import { CONNECTION_MODES, DEFAULT_PORT, WEB_CLIENT_PATH } from './protocol.mjs'
 import { DshBridge } from './dsh-bridge.mjs'
-import { Gateway, PLUGIN_VERSION, connectionModeLabel } from './gateway.mjs'
+import { Gateway } from './gateway.mjs'
 import { PowerManager, sendWakeOnLan } from './power.mjs'
 import { StateStore } from './state.mjs'
-import { renderPairingQr } from './pairer.mjs'
 
 export const name = 'openwhale'
 
@@ -44,14 +43,15 @@ export const name = 'openwhale'
  * returns `undefined` when the service is not provided. That matches what the rest
  * of this file and the README's fault-tolerance table already assume:
  *   · `webServer`         → falls back to this plugin's own listener
- *   · `commands`          → `/openwhale` is simply not registered
+ *   · `sessionQuery`      → session list/select falls back to the live agent list
  *   · `agentDefaultModel` → `resolveModelSelection` falls back to profile config,
  *                           then to the live agent list
  *
  * Historical note: this list used to carry six services (`agents`, `commands`,
  * `webServer`, `systemPrompt`, `tools`, `agentDefaultModel`). `systemPrompt` and
  * `tools` were never read anywhere in the package, and the other three were
- * already handled defensively — so all five were pure mount risk.
+ * already handled defensively — so all five were pure mount risk. v2.3.0 also
+ * removed the `/openwhale` command, so `commands` is no longer a candidate at all.
  */
 export const inject = ['agents']
 
@@ -72,7 +72,6 @@ export const DEFAULT_CONFIG = Object.freeze({
   allowRemoteShutdown: true,
   shutdownDelaySeconds: 30,
   autoApproveTools: false,
-  collaboration: false,
   connectionMode: 'auto',
   tunnelMode: 'off',
   cloudflaredPath: '',
@@ -102,7 +101,6 @@ async function buildConfigSchema() {
       allowRemoteShutdown: z.boolean().default(true).description('允许手机远程关机/重启（取消始终可用）'),
       shutdownDelaySeconds: z.number().default(30).description('远程关机的宽限秒数，期间可取消'),
       autoApproveTools: z.boolean().default(false).description('手机会话是否自动批准所有工具调用（默认关闭，走 DSH 原有审批策略）'),
-      collaboration: z.boolean().default(false).description('多人协作：多台手机共用同一个对话并互相可见（默认关闭，各设备各自独立）'),
       connectionMode: z.string().default('auto').description('连接方式偏好：auto（Tailscale→局域网→隧道）| lan | tailscale | tunnel'),
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
@@ -142,7 +140,7 @@ export const Config = await buildConfigSchema()
 function volatilize(schema) {
   const dict = schema?.dict ?? {}
   const patches = {}
-  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'collaboration', 'connectionMode', 'tunnelMode']) {
+  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'connectionMode', 'tunnelMode']) {
     if (dict[key]?.volatile) patches[key] = dict[key].volatile()
   }
   return patches
@@ -165,7 +163,6 @@ export async function apply(ctx, config) {
     allowRemoteShutdown: config.allowRemoteShutdown !== false,
     shutdownDelaySeconds: config.shutdownDelaySeconds ?? 30,
     autoApproveTools: config.autoApproveTools === true,
-    collaboration: config.collaboration === true,
     connectionMode: config.connectionMode ?? 'auto',
     tunnelMode: config.tunnelMode ?? 'off',
     cloudflaredPath: config.cloudflaredPath ?? '',
@@ -214,14 +211,15 @@ export async function apply(ctx, config) {
     return [...new Set([...lan, ...(address ? [address] : [])])]
   }
 
-  // 每次调用都重新读 preference：改协作开关不必重启插件。
-  const collaborationOn = () => store.getPreference('collaboration', settings.collaboration) === true
   // 连接方式偏好：首次启动用配置值播种，之后由配对页/手机端修改并持久化。
   if (!CONNECTION_MODES.includes(/** @type {any} */ (store.getPreference('connectionMode')))) {
     store.setPreference('connectionMode', CONNECTION_MODES.includes(/** @type {any} */ (settings.connectionMode))
       ? settings.connectionMode
       : 'auto')
   }
+
+  /** @type {Gateway | null} 网关在桥之后构造，回调里按需取用。 */
+  let gateway = null
 
   const bridge = new DshBridge({
     ctx,
@@ -230,14 +228,11 @@ export async function apply(ctx, config) {
       assistantName: settings.assistantName,
       cwd: settings.cwd,
       autoApproveTools: settings.autoApproveTools,
-      collaboration: settings.collaboration,
       agentOptions: {},
-      // 协作模式下所有设备落到同一个 shared session，否则按设备隔离。
-      sessionIdFor: deviceId => (collaborationOn() ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
-      // 协作开关做成了运行时读取：改设置不必重启插件。
-      isCollaboration: () => collaborationOn(),
     },
-    emit: event => gateway.pushEvent(event),
+    emit: event => gateway?.pushEvent(event),
+    // 审批转发前先问网关「这个会话有没有在线手机」；没有就交回桌面。
+    devicesInSession: sessionId => (gateway ? gateway.approvalDevicesFor(sessionId) : []),
     log,
     defaultCwd: () => process.cwd(),
     modelSelection: () => resolveModelSelection(ctx, log, settings.agentOptions ?? {}),
@@ -248,16 +243,19 @@ export async function apply(ctx, config) {
     log,
   })
 
-  const gateway = new Gateway({
+  gateway = new Gateway({
     store,
     bridge: {
       send: input => bridge.send(input),
       cancel: (callId, deviceId) => bridge.cancel(callId, deviceId),
       fileFor: fileId => bridge.fileFor(fileId),
-      forgetDevice: deviceId => bridge.forgetDevice(deviceId),
-      // 认证成功即登记会话归属：没发过言的设备也要能收到广播和在线成员。
-      attachDevice: deviceId => bridge.attachDevice(deviceId),
-      resetSessions: () => bridge.resetSessionMapping(),
+      // v2.3.0：手机的会话列表 / 选择 / 新建、会话历史与审批作答。
+      listSessions: () => bridge.listSessions(),
+      selectSession: sessionId => bridge.selectSession(sessionId),
+      createSession: () => bridge.createSession(),
+      historyMessages: sessionId => bridge.historyMessages(sessionId),
+      answerApproval: input => bridge.answerApproval(input),
+      releaseSession: sessionId => bridge.releaseSession(sessionId),
       renameAssistant: async ({ label }) => {
         store.setComputerName(label)
       },
@@ -273,9 +271,6 @@ export async function apply(ctx, config) {
     lanUrls,
     tunnelUrls: () => tunnelUrls,
     log,
-    // 会话身份：协作模式所有设备共享同一个对话，否则每台手机一个。
-    sessionIdFor: deviceId => (collaborationOn() ? store.sharedSessionId() : store.sessionIdFor(deviceId)),
-    collaboration: collaborationOn,
     // 附件落盘与电脑→手机发文件的根目录，必须是该会话的工作目录，
     // 否则 DSH 的文件沙箱读不到（「手机发的图片模型看不到」的根因）。
     cwd: () => bridge.workingDirectory(),
@@ -296,7 +291,6 @@ export async function apply(ctx, config) {
     // 手动解除绑定：手机没连上时它的 device/forget 发不出去，电脑端会一直占着绑定，
     // 配对页又不再出二维码 —— 这个入口用来打破那个死锁。
     unbind: '/openwhale/unbind',
-    collaboration: '/openwhale/collaboration',
     deviceRename: '/openwhale/device-rename',
     download: '/openwhale/download',
     // v2.2.0：连接方式偏好 + 电脑→手机发文件（写操作仅本机）。
@@ -348,45 +342,6 @@ export async function apply(ctx, config) {
   // Optional public tunnel.
   if (settings.tunnelMode && settings.tunnelMode !== 'off') {
     tunnel = await startTunnel({ ctx, settings, gateway, log, onUrl: url => { tunnelUrls = url ? [url] : [] } })
-  }
-
-  // The `/openwhale` command shows the binding QR inside the GUI/CLI.
-  const commands = ctx.get('commands')
-  if (commands?.register) {
-    ctx.effect(() => commands.register({
-      name: 'openwhale',
-      description: '显示 Open Whale 绑定二维码 / 查看已绑定手机',
-      handler: async invocation => {
-        const payload = gateway.pairingPayload()
-        if (!payload.ok) {
-          const labels = store.devices.map(d => d.label ?? d.deviceName).join('、')
-          if (payload.reason === 'too-many-devices') {
-            return { kind: 'success', text: `Open Whale 已绑定手机：${labels}\n如需重新绑定，请先在电脑端配对页移除不用的设备。` }
-          }
-          return { kind: 'error', text: `Open Whale：${payload.message}` }
-        }
-        const qr = await renderPairingQr(payload.payload)
-        const report = gateway.connectionModeReport()
-        const webUrl = report.web
-        const text = [
-          '用手机上的 Open Whale 应用扫描下面的二维码完成绑定：',
-          '',
-          qr.terminal,
-          '',
-          `电脑名称：${store.computerName}（插件 v${PLUGIN_VERSION}）`,
-          `公钥指纹：${store.fingerprint.slice(0, 32).toUpperCase().match(/.{1,4}/g)?.join(' ') ?? ''}`,
-          `连接方式：${connectionModeLabel(report.mode)}`,
-          `可用地址：${payload.payload.endpoints.join('、')}`,
-          `二维码有效期至：${new Date(payload.payload.expires).toLocaleString('zh-CN')}`,
-          '',
-          '二维码含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。',
-          `也可以在浏览器打开：http://127.0.0.1:${gateway.port || settings.port}/openwhale`,
-          ...(webUrl ? [`手机浏览器（网页版，无需装 App）：${webUrl}`] : []),
-          ...(report.detected?.tailscale?.length ? [`Tailscale 地址：${report.detected.tailscale.join('、')}`] : []),
-        ].join('\n')
-        return { kind: 'success', text }
-      },
-    }), 'openwhale: command')
   }
 
   ctx.on('dispose', async () => {

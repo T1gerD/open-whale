@@ -1,0 +1,91 @@
+// Open Whale — DSH Web 客户端插件（插件页）。
+//
+// 这是聊天输入框「+」里那个 `/openwhale` 命令的替代品：v2.3.0 删掉了命令，
+// 绑定二维码改在「DSH 设置 → 插件 → Open Whale」的插件页里显示。页面内容复用
+// 宿主侧的 `/openwhale`（同一份配对页：二维码、已绑定设备、解绑、连接方式、
+// 发送文件），所以这里只负责把它嵌进来，不重复实现任何逻辑。
+//
+// 加载格式由 DSH 的客户端模块加载器（`window.__ModuleLoader__`）规定，与官方
+// 客户端插件一致：工厂返回 `{apply, inject}`，宿主用客户端根 ctx 调用 `apply`。
+// 组件注册进 `plugins.bundle.config` 槽——该槽由插件管理页声明为 keyed/root，
+// key 用包名（与渲染时的 `entryKey: pkg.name` 对齐）。
+window.__ModuleLoader__.load({
+  id: 'dsh-openwhale',
+  factory: require => {
+    var module = { exports: {} }
+    var exports = module.exports
+    Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
+
+    var React = require('react')
+
+    /** 插件页槽位名（插件管理页按包名 key 渲染）。 */
+    var SLOT = 'plugins.bundle.config'
+    /** 宿主侧配对页路径，与 gateway.mjs 的路由表一致。 */
+    var PAIRING_PATH = '/openwhale'
+
+    var styles = {
+      root: { display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' },
+      hint: { margin: 0, fontSize: '12px', lineHeight: '18px', opacity: 0.7 },
+      frame: {
+        width: '100%',
+        height: 'calc(100vh - 260px)',
+        minHeight: '480px',
+        border: '1px solid var(--dsw-alias-border-secondary, rgba(128, 128, 128, 0.24))',
+        borderRadius: '12px',
+        background: '#0b1220',
+      },
+      actions: { display: 'flex', justifyContent: 'flex-end', margin: 0 },
+      link: { fontSize: '13px', textDecoration: 'underline' },
+    }
+
+    /**
+     * 插件页内容：内嵌宿主配对页 + 「在浏览器中打开」。
+     * 不读取任何 slot props，因此槽位渲染参数变化也不会影响它。
+     */
+    function OpenWhalePluginPage() {
+      return React.createElement(
+        'div',
+        { style: styles.root, 'data-plugin': 'dsh-openwhale' },
+        React.createElement(
+          'p',
+          { style: styles.hint },
+          '用手机上的 Open Whale 应用扫描下面的二维码完成绑定；已绑定的设备可以在这里改名或移除。',
+        ),
+        React.createElement('iframe', {
+          src: PAIRING_PATH,
+          style: styles.frame,
+          title: 'Open Whale 配对页',
+          loading: 'lazy',
+        }),
+        React.createElement(
+          'p',
+          { style: styles.actions },
+          React.createElement(
+            'a',
+            { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
+            '在浏览器中打开',
+          ),
+        ),
+      )
+    }
+
+    /**
+     * 注册插件页。等待槽位就绪再注册（`slots.inject` 与官方插件同款），
+     * 槽位不存在时静默等待，绝不抛错把整个客户端带崩。
+     * @param {any} ctx 客户端根上下文
+     */
+    function apply(ctx) {
+      var slots = ctx && ctx.slots
+      if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
+        if (typeof console !== 'undefined') console.warn('[openwhale] 客户端没有 slots 服务，插件页不可用')
+        return
+      }
+      slots.inject(SLOT, function () {
+        return slots.register({ name: SLOT, key: 'dsh-openwhale' }, OpenWhalePluginPage)
+      })
+    }
+
+    exports.apply = apply
+    return module.exports
+  },
+})

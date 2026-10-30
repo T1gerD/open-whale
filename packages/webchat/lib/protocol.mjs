@@ -7,22 +7,29 @@
 //
 // 规则：本文件只放常量与纯函数；任何字段疑问一律以 protocol 源码为准。
 
-/** 协议 wire 版本（v2.2.0 仍是 1.x，只增不改）。 */
-export const PROTOCOL_VERSION = '1.1.0'
+/**
+ * 协议 wire 版本。
+ *
+ * 1.2.0（v2.3.0「纯远程遥控器」）删掉协作，新增会话选择（`sessions-v1`）与
+ * 审批转发（`approval-v1`）。老客户端不认新帧会自动忽略，反之亦然。
+ */
+export const PROTOCOL_VERSION = '1.2.0'
 
 /** 网页版客户端自身的版本号（与产品版本一致，显示在「关于」里）。 */
-export const WEBCHAT_VERSION = '2.2.1'
+export const WEBCHAT_VERSION = '2.3.0'
 
 /** 能力协商标记（hello / hello/ack 的 capabilities）。 */
 export const CAPABILITIES = Object.freeze({
   CHAT_ECHO: 'chat-echo-v1',
   CHAT_MESSAGE: 'chat-message-v1',
   SESSION_SYNC: 'session-sync-v1',
-  PARTICIPANTS: 'participants-v1',
   UPLOAD: 'upload-v1',
-  COLLAB: 'collab-v1',
   FILE_OFFER: 'file-offer-v1',
   ENDPOINT_KINDS: 'endpoint-kinds-v1',
+  /** 手机/网页可以列出、切换、新建电脑上的 DSH 会话。 */
+  SESSIONS: 'sessions-v1',
+  /** 手机/网页可以回答电脑转发的权限请求。 */
+  APPROVAL: 'approval-v1',
 })
 
 /** 本客户端理解的全部能力，握手时全量声明。 */
@@ -46,7 +53,14 @@ export const CLIENT_FRAME = Object.freeze({
   UPLOAD_CHUNK: 'upload/chunk',
   UPLOAD_END: 'upload/end',
   UPLOAD_CANCEL: 'upload/cancel',
-  COLLAB_SET: 'collab/set',
+  /** 列出电脑上的 DSH 会话（会话选择器）。 */
+  SESSION_LIST: 'session/list',
+  /** 绑定这台设备到其中一个会话并拉取快照。 */
+  SESSION_SELECT: 'session/select',
+  /** 新建一个 DSH 会话并绑定到它。 */
+  SESSION_CREATE: 'session/create',
+  /** 回答一条 `approval/ask`（outcome 为 allowed-once / rejected）。 */
+  APPROVAL_REPLY: 'approval/reply',
 })
 
 /** 电脑 → 客户端 的帧名。 */
@@ -71,8 +85,14 @@ export const SERVER_FRAME = Object.freeze({
   CHAT_MESSAGE: 'chat/message',
   SESSION_STATE: 'session/state',
   SESSION_EVENTS: 'session/events',
-  PARTICIPANTS: 'session/participants',
-  COLLAB_STATE: 'collab/state',
+  /** `session/list` 的回复：电脑上的会话列表。 */
+  SESSIONS: 'sessions',
+  /** `session/select` / `session/create` 的结果；成功后紧跟一条 `session/state`。 */
+  SESSION_SELECTED: 'session/selected',
+  /** 一条 DSH 权限请求，等待本设备作答。 */
+  APPROVAL_ASK: 'approval/ask',
+  /** 该权限请求已被处理（手机/电脑/超时）。 */
+  APPROVAL_RESOLVED: 'approval/resolved',
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
   UPLOAD_DONE: 'upload/done',
@@ -173,6 +193,19 @@ export const SESSION_EVENT_LOG_LIMIT = 400
 
 /** 快照消息条数。 */
 export const SESSION_SNAPSHOT_LIMIT = 60
+
+/** 一次 `sessions` 帧最多列出多少个会话（电脑端截断后带 `truncated`）。 */
+export const SESSION_LIST_LIMIT = 200
+
+/**
+ * 电脑端等手机回答审批的最长时间。超时后电脑把请求交回桌面 UI，
+ * 并给手机补一条 `approval/resolved {outcome:'cancelled', source:'timeout'}`。
+ * 客户端只用来做倒计时文案，真正的裁决在电脑端。
+ */
+export const APPROVAL_TIMEOUT_MS = 60_000
+
+/** `approval/reply` 唯一允许的两种结果；其它值电脑端按 `rejected` 处理。 */
+export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
 
 /** 网页版客户端在插件上的路径。 */
 export const WEB_CLIENT_PATH = '/openwhale/app'

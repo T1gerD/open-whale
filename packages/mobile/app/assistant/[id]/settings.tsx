@@ -1,11 +1,14 @@
-// 助理详情：连接方式、协作、备注名、远程电源、唤醒引导、诊断信息、解绑。
+// 助理详情：连接方式、备注名、远程电源、唤醒引导、诊断信息、解绑。
 //
-// 这一屏回答“这台电脑怎么连、连得好不好、谁在跟我一起用”：
+// 这一屏回答“这台电脑怎么连、连得好不好、怎么给它改名”：
 //  * 连接方式四选一（自动 / 局域网 / Tailscale / 公网隧道），切换后立即重连；
 //  * 手动地址兜底：先做 health 预检，确认能通再保存；
-//  * 协作模式开关 + 参与者列表 + 我的昵称；
+//  * 备注名（只改这台手机上的显示名，与电脑端无关）；
 //  * 远程电源的“二次确认 + 倒计时 + 取消”；
 //  * “远程开机”只做唤醒入口与引导（关机后手机连不上它，协议里也没有 WOL 帧）。
+//
+// v2.3.0 删掉了协作模式、参与者列表与「我在对话里的昵称」：每台手机只驱动它
+// 当前绑定的那个会话，那个会话在聊天页的胶囊里切换。
 
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
 import { useEffect, useState } from 'react'
@@ -13,14 +16,13 @@ import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from 'react-nati
 
 import { connectionModeNotice, endpointKindLabel } from '../../../src/core/endpoint.mts'
 import { cancelCopy, confirmCopy, formatCountdown, refusalMessage } from '../../../src/core/power.mts'
+import { sessionTitleOf } from '../../../src/core/sessions.mts'
 import { wakeGuidance } from '../../../src/core/wake.mts'
 import { DEFAULT_PORT, PROTOCOL_VERSION } from '../../../src/protocol/runtime'
 import type { AssistantView } from '../../../src/state/app-store'
 import { useAppStore, useAssistantView } from '../../../src/state/store'
 import {
-  Avatar,
   Chip,
-  Divider,
   InlineBanner,
   KeyValue,
   Muted,
@@ -30,7 +32,6 @@ import {
   SectionTitle,
   SegmentedControl,
   StatusPill,
-  SwitchRow,
   Toast,
   useToast,
 } from '../../../src/ui/components'
@@ -59,20 +60,14 @@ export default function AssistantSettingsScreen() {
   const { toast, showToast } = useToast()
 
   const [name, setName] = useState(view?.assistant.name ?? '')
-  const [nickname, setNickname] = useState('')
   const [wakeUrl, setWakeUrl] = useState(view?.assistant.wakeProxyUrl ?? '')
   const [wakeMac, setWakeMac] = useState(view?.assistant.wakeMac ?? '')
   const [notice, setNotice] = useState<Notice | undefined>()
-  const [collabBusy, setCollabBusy] = useState(false)
 
   const [manualAddress, setManualAddress] = useState('')
   const [probing, setProbing] = useState(false)
   const [probe, setProbe] = useState<ProbeResult | undefined>()
   const [connectingManual, setConnectingManual] = useState(false)
-
-  useEffect(() => {
-    void store.getMyNickname().then(setNickname)
-  }, [store])
 
   useEffect(() => {
     if (view && !name) setName(view.assistant.name)
@@ -87,42 +82,19 @@ export default function AssistantSettingsScreen() {
     )
   }
 
-  const { assistant, link, power, participants, collaboration } = view
+  const { assistant, link, power } = view
   const allowed = assistant.powerAllowed
   const connectionMode = view.connectionMode ?? assistant.connectionMode ?? 'auto'
-  const onlineCount = participants.filter(person => person.online).length
+  const sessionTitle = sessionTitleOf(view.sessions, view.chat.sessionId)
 
   const saveName = async () => {
     await store.rename(assistantId, name)
     showToast('备注名已保存', 'success')
   }
 
-  const saveNickname = async () => {
-    await store.setMyNickname(assistantId, nickname)
-    showToast(nickname.trim() ? '昵称已保存' : '昵称已清空', 'success')
-  }
-
   const changeMode = async (mode: ConnectionMode) => {
     await store.setConnectionMode(assistantId, mode)
     setNotice({ tone: 'info', text: connectionModeNotice(mode, assistant.endpoints) })
-  }
-
-  const toggleCollaboration = async (value: boolean) => {
-    setCollabBusy(true)
-    try {
-      const result = await store.setCollaboration(assistantId, value)
-      if (!result.ok) {
-        setNotice({
-          tone: 'warning',
-          title: '协作模式没有打开',
-          text: [result.error ?? '电脑端暂不支持协作模式', result.hint].filter(Boolean).join('\n'),
-        })
-      }
-    } catch (error) {
-      setNotice({ tone: 'error', text: `切换协作模式失败：${(error as Error).message}` })
-    } finally {
-      setCollabBusy(false)
-    }
   }
 
   const runProbe = async () => {
@@ -292,52 +264,13 @@ export default function AssistantSettingsScreen() {
         <Muted style={styles.hint}>手动地址只影响本机保存的这台电脑，不会改电脑上的设置。</Muted>
       </SectionCard>
 
-      {/* 协作 ------------------------------------------------------------- */}
-      <SectionCard title="协作模式" subtitle="打开后，同一会话里的其他人也能看到并回复；消息会带发送者昵称。">
-        <SwitchRow
-          label="和他人一起使用这个会话"
-          description={link.online ? '切换后电脑端会广播给同一会话的所有设备。' : '连上电脑后才能切换。'}
-          value={collaboration}
-          onValueChange={value => void toggleCollaboration(value)}
-          disabled={!link.online || collabBusy}
-        />
-        <Divider />
-        <Text style={styles.fieldLabel}>我在对话里的昵称</Text>
-        <TextInput
-          value={nickname}
-          onChangeText={setNickname}
-          placeholder="例如“小明”，协作时消息会带这个前缀"
-          placeholderTextColor={theme.colors.textFaint}
-          style={styles.input}
-          maxLength={24}
-        />
-        <SecondaryButton label="保存昵称" onPress={() => void saveNickname()} />
-        <Muted style={styles.hint}>昵称保存在电脑端；留空则使用设备默认名。</Muted>
-
-        <Divider />
-        <View style={styles.participantsHead}>
-          <Text style={styles.fieldLabel}>参与者</Text>
-          {participants.length > 0 ? <Chip label={`${onlineCount}/${participants.length} 人在线`} tone={onlineCount > 0 ? 'success' : 'neutral'} /> : null}
-        </View>
-        {participants.length === 0 ? (
-          <Muted style={styles.hint}>还没有参与者信息。开启协作并连上电脑后，同一会话的成员会显示在这里。</Muted>
-        ) : (
-          <View style={styles.participantsList}>
-            {participants.map(person => (
-              <View key={person.deviceId} style={styles.participantRow}>
-                <Avatar name={person.name} size={34} online={person.online} isMe={person.isMe} />
-                <View style={styles.participantBody}>
-                  <Text style={styles.participantName} numberOfLines={1}>
-                    {person.name}
-                    {person.isMe ? '（我）' : ''}
-                  </Text>
-                  <Text style={styles.participantMeta}>{person.online ? '在线' : '离线'}</Text>
-                </View>
-                <StatusPill label={person.online ? '在线' : '离线'} tone={person.online ? 'online' : 'offline'} />
-              </View>
-            ))}
-          </View>
-        )}
+      {/* 当前会话 --------------------------------------------------------- */}
+      <SectionCard title="当前会话" subtitle="这台手机现在驱动的是电脑上的哪个 DSH 会话。要换会话，回聊天页点输入栏上方的会话胶囊。">
+        <KeyValue label="会话" value={sessionTitle ?? (view.chat.sessionId ? '已绑定（标题未同步）' : '还没绑定')} />
+        <KeyValue label="会话 ID" value={view.chat.sessionId ? view.chat.sessionId.slice(0, 18) : '—'} />
+        <Muted style={styles.hint}>
+          会话在电脑上创建和保存；手机上只负责发送消息、切会话和回答权限请求，不会复制电脑上的历史文件。
+        </Muted>
       </SectionCard>
 
       {/* 备注名 ----------------------------------------------------------- */}
@@ -468,7 +401,6 @@ const createSettingsStyles = (theme: Theme) =>
     content: { padding: spacing.lg, paddingBottom: spacing.xxxl },
     missing: { padding: spacing.lg },
     hint: { lineHeight: 18, marginTop: spacing.sm },
-    fieldLabel: { color: theme.colors.text, fontSize: font.small, fontWeight: '600', marginBottom: spacing.xs },
     statusRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap', marginBottom: spacing.sm },
     modeControl: { marginTop: spacing.sm },
     buttonRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md },
@@ -486,11 +418,5 @@ const createSettingsStyles = (theme: Theme) =>
     probeBox: { marginTop: spacing.md, padding: spacing.md, borderRadius: radius.md, backgroundColor: theme.colors.surfaceAlt },
     probeTitle: { color: theme.colors.text, fontWeight: '700', fontSize: font.small },
     probeLine: { color: theme.colors.textMuted, fontSize: font.tiny, lineHeight: 17, marginTop: 4 },
-    participantsHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: spacing.sm },
-    participantsList: { gap: spacing.sm, marginTop: spacing.sm },
-    participantRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, paddingVertical: spacing.xs },
-    participantBody: { flex: 1 },
-    participantName: { color: theme.colors.text, fontSize: font.small, fontWeight: '600' },
-    participantMeta: { color: theme.colors.textMuted, fontSize: font.tiny, marginTop: 1 },
     footer: { textAlign: 'center', marginTop: spacing.xl },
   })

@@ -95,7 +95,9 @@ const dom = {
   statusDot: document.getElementById('status-dot'),
   computerName: document.getElementById('computer-name'),
   connectionDetail: document.getElementById('connection-detail'),
-  participants: document.getElementById('participants'),
+  sessionChip: document.getElementById('session-chip'),
+  sessionChipLabel: document.getElementById('session-chip-label'),
+  sessionSheet: document.getElementById('session-sheet'),
   menuBtn: document.getElementById('menu-btn'),
   statusBanner: document.getElementById('status-banner'),
   statusBannerText: document.getElementById('status-banner-text'),
@@ -159,6 +161,15 @@ const state = {
   download: undefined,
   installPrompt: undefined,
   settingsOpen: false,
+  sessionSheetOpen: false,
+  sessionListLoading: false,
+  sessionSelectPending: false,
+  /** 刚由本页发起的会话选择：随后到的 session/state 不再重复提示。 */
+  justSelectedSession: false,
+  /** 这台设备上次选中的会话（localStorage，按助手分开存）。 */
+  lastSessionId: '',
+  /** 审批倒计时定时器（有带 expiresAt 的待办审批时才跑）。 */
+  approvalTicker: null,
   lastRenderSignature: '',
   connectionWarned: false,
 }
@@ -206,6 +217,56 @@ function daySeparatorText(iso) {
 function fileExtension(name) {
   const match = /\.([A-Za-z0-9]{1,6})$/.exec(String(name ?? ''))
   return match ? match[1].toUpperCase() : 'FILE'
+}
+
+/**
+ * 会话列表里的相对时间（电脑端只给 Unix ms，这里只做展示）。
+ * @param {number} value
+ * @returns {string}
+ */
+function relativeTime(value) {
+  const time = Number(value)
+  if (!Number.isFinite(time) || time <= 0) return ''
+  const delta = Date.now() - time
+  if (delta < 60_000) return '刚刚'
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`
+  if (delta < 7 * 86_400_000) return `${Math.floor(delta / 86_400_000)} 天前`
+  const date = new Date(time)
+  if (Number.isNaN(date.getTime())) return ''
+  return `${date.getMonth() + 1} 月 ${date.getDate()} 日`
+}
+
+/**
+ * 审批卡片正文：优先本地化文案，其次机器原因，最后按工具名兜底。
+ * @param {any} approval
+ * @returns {string}
+ */
+function approvalReasonText(approval) {
+  const text = approval?.displayReason || approval?.reason
+  if (typeof text === 'string' && text.trim() !== '') return text.trim()
+  return `「${approval?.toolName ?? '工具'}」请求执行`
+}
+
+/**
+ * 审批卡片倒计时文案（电脑端超时后会补一条 resolved，这里只负责让用户看到期限）。
+ * @param {any} approval
+ * @param {number} [now]
+ * @returns {string}
+ */
+function approvalCountdownText(approval, now = Date.now()) {
+  const expiresAt = Number(approval?.expiresAt)
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return ''
+  const left = Math.max(0, expiresAt - now)
+  if (left <= 0) return '已超时，电脑会自行处理'
+  const seconds = Math.ceil(left / 1000)
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} 后交回电脑处理`
+}
+
+/** @param {any} approval @param {number} [now] */
+function approvalExpired(approval, now = Date.now()) {
+  const expiresAt = Number(approval?.expiresAt)
+  return Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= now
 }
 
 /** @param {string} raw */
@@ -333,9 +394,14 @@ function setupServiceWorker() {
   }
   window.addEventListener('load', () => {
     const url = new URL('sw.js', document.baseURI)
-    navigator.serviceWorker.register(url, { scope: './' }).catch(() => {
-      /* 失败不影响使用 */
-    })
+    // sw.js 是 module worker：它 import lib/protocol.mjs 的版本号来给缓存命名，
+    // 这样缓存名不会像 v2.2.0 那样写死在文件里（写死就会和 app.js 版本对不上）。
+    // 浏览器不支持 module worker 时注册会失败：在线功能不受影响，只是没有离线壳。
+    navigator.serviceWorker
+      .register(url, { scope: './', type: 'module', updateViaCache: 'none' })
+      .catch(() => {
+        /* 失败不影响使用 */
+      })
   })
 }
 
@@ -585,6 +651,15 @@ function startSession(options = {}) {
   state.attachments = []
   state.uploader = undefined
   state.sending = false
+  // 会话选择器：记住这台设备上次选中的会话（按助手分开存在 localStorage）。
+  state.lastSessionId = storage.loadLastSession(state.identity.deviceId)
+  state.sessionSheetOpen = false
+  state.sessionListLoading = false
+  state.sessionSelectPending = false
+  state.justSelectedSession = false
+  stopApprovalTicker()
+  closeSettings()
+  closeSessionSheet()
 
   showView('chat')
   renderAttachmentsTray()
@@ -686,14 +761,15 @@ function handleOnline(ack, context) {
   state.verified = context.verified === true
   state.serverCaps = new Set(Array.isArray(ack.capabilities) ? ack.capabilities : [])
   state.syncReceived = false
+  state.sessionListLoading = false
+  state.sessionSelectPending = false
 
-  // 协作模式切过会话：本地旧消息作废，等 session/state 快照。
-  if (
-    state.model.sessionId &&
-    Number.isFinite(Number(ack.sessionEpoch)) &&
-    Number(ack.sessionEpoch) !== state.model.sessionEpoch
-  ) {
-    state.model.clearConversation()
+  // 电脑端换了这台设备的绑定会话（插件重启 / 另一个窗口切过）：本地旧消息作废，
+  // 等随后到达的 session/state 快照整页替换。老电脑端不带宽带这两个字段时保持现状。
+  const ackSessionId = typeof ack.sessionId === 'string' ? ack.sessionId : ''
+  const ackSessionEpoch = Number.isFinite(Number(ack.sessionEpoch)) ? Number(ack.sessionEpoch) : undefined
+  if (state.model.sessionId && (ackSessionId !== '' || ackSessionEpoch !== undefined)) {
+    state.model.adoptServerSession(ackSessionId || state.model.sessionId, ackSessionEpoch ?? state.model.sessionEpoch)
   }
 
   // hello/ack 带回电脑当下认为可达的地址：并进候选列表（并保留二维码里的类型判断）。
@@ -711,6 +787,7 @@ function handleOnline(ack, context) {
   persistNow()
   flushOutbox()
   scheduleSessionSync()
+  maybeRestoreSession(ack)
   renderHeader()
   renderStatusBanner()
   renderMessages({ forceScroll: true })
@@ -722,6 +799,27 @@ function handleOnline(ack, context) {
     showToast('已连接', 'ok', 1800)
   }
   state.firstOnlineShown = true
+}
+
+/**
+ * 重连后把「上次选中的会话」选回来。
+ *
+ * 电脑端把「这台设备在哪个会话」存在插件进程内存里：插件重启 / 换个地址重连后就
+ * 忘了，会给这台设备新建一个会话。网页版因此把上次的选择存在 localStorage，
+ * 连上后发现电脑端的绑定不是它，就重新 `session/select` 一次。选的会话已被删除时
+ * 电脑会回 `session/selected {ok:false}`，那时再清掉本地记录。
+ * @param {any} ack
+ */
+function maybeRestoreSession(ack) {
+  if (!state.model || !state.connection?.online) return
+  if (!state.serverCaps.has(CAPABILITIES.SESSIONS)) return
+  const saved = state.lastSessionId
+  if (!saved) return
+  if (state.sessionSelectPending) return
+  const serverSession = typeof ack?.sessionId === 'string' ? ack.sessionId : ''
+  if (serverSession === saved) return
+  sendSessionFrame(CLIENT_FRAME.SESSION_SELECT, { sessionId: saved })
+  state.sessionSelectPending = true
 }
 
 /** @param {any} status */
@@ -766,6 +864,270 @@ function requestSessionSync() {
 }
 
 // ---------------------------------------------------------------------------
+// 会话选择器
+// ---------------------------------------------------------------------------
+
+/** 电脑端是否支持会话选择（老插件没有 sessions-v1）。 */
+function sessionsSupported() {
+  return state.serverCaps.has(CAPABILITIES.SESSIONS)
+}
+
+/**
+ * 发一条会话相关帧；离线 / 老电脑端时给出可操作提示而不是静默失败。
+ * @param {string} type
+ * @param {object} [extra]
+ * @returns {boolean}
+ */
+function sendSessionFrame(type, extra = {}) {
+  if (!sessionsSupported()) {
+    showToast('电脑端版本较旧，不支持在网页里切换会话；请升级电脑端插件', 'error', 4600)
+    return false
+  }
+  if (!state.connection?.online) {
+    showToast('还没连上电脑，暂时不能切换会话', 'error')
+    return false
+  }
+  return Boolean(state.connection.send({ t: type, rid: uid('sess'), ...extra }))
+}
+
+/** 打开会话面板时拉一次列表。 */
+function requestSessionList({ force = false } = {}) {
+  if (!sessionsSupported()) {
+    showToast('电脑端版本较旧，不支持会话列表；请升级电脑端插件', 'error', 4600)
+    return
+  }
+  if (!state.connection?.online) {
+    // 离线时面板还能显示缓存里的列表；不弹 toast（否则每次点开都提示一次）。
+    state.sessionListLoading = false
+    renderSessionSheet()
+    return
+  }
+  if (state.sessionListLoading && !force) return
+  state.sessionListLoading = true
+  renderSessionSheet()
+  state.connection.send({ t: CLIENT_FRAME.SESSION_LIST, rid: uid('list') })
+}
+
+/** @param {string} sessionId */
+function selectSession(sessionId) {
+  const id = String(sessionId ?? '')
+  if (id === '' || id === state.model?.sessionId) {
+    closeSessionSheet()
+    return
+  }
+  if (!sendSessionFrame(CLIENT_FRAME.SESSION_SELECT, { sessionId: id })) return
+  state.sessionSelectPending = true
+  state.justSelectedSession = true
+  renderSessionSheet()
+}
+
+function createSession() {
+  if (!sendSessionFrame(CLIENT_FRAME.SESSION_CREATE)) return
+  state.sessionSelectPending = true
+  state.justSelectedSession = true
+  renderSessionSheet()
+}
+
+/** 记住这台设备选中的会话（按助手 = 设备身份分开存）。 */
+function rememberSession(sessionId) {
+  const value = String(sessionId ?? '')
+  const deviceId = state.identity?.deviceId ?? ''
+  if (!deviceId) return
+  if (value !== '' && value === state.lastSessionId) return
+  storage.saveLastSession(deviceId, value)
+  state.lastSessionId = value
+}
+
+/** 当前会话标题：会话快照的 title 优先，其次会话列表里的标题。 */
+function currentSessionTitle() {
+  const model = state.model
+  if (!model) return ''
+  const id = model.sessionId
+  const fromList = Array.isArray(model.sessions) ? model.sessions.find(item => item.id === id) : undefined
+  return model.sessionTitle || fromList?.title || ''
+}
+
+function openSessionSheet() {
+  state.sessionSheetOpen = true
+  if (state.settingsOpen) closeSettings()
+  dom.sessionSheet.hidden = false
+  syncSheetBackdrop()
+  renderSessionSheet()
+  requestSessionList()
+}
+
+function closeSessionSheet() {
+  state.sessionSheetOpen = false
+  dom.sessionSheet.hidden = true
+  syncSheetBackdrop()
+}
+
+/** 两个底部面板共用一层遮罩；只有都关掉时才隐藏。 */
+function syncSheetBackdrop() {
+  dom.sheetBackdrop.hidden = !(state.settingsOpen || state.sessionSheetOpen)
+}
+
+/** 会话面板内容（标题 + 相对时间 + live / 当前徽标 + 新建会话）。 */
+function renderSessionSheet() {
+  if (!state.sessionSheetOpen || !dom.sessionSheet) return
+  const model = state.model
+  const sessions = Array.isArray(model?.sessions) ? model.sessions : []
+  // 「当前」以电脑端的绑定为准（sessions.current），本地 sessionId 兜底。
+  const currentId = model?.sessionsCurrent || model?.sessionId || ''
+  const rows = sessions
+    .map(session => {
+      const badges = []
+      if (session.live) badges.push('<span class="badge is-live">在线</span>')
+      if (session.id === currentId) badges.push('<span class="badge is-current">当前</span>')
+      const time = relativeTime(session.updatedAt ?? session.createdAt)
+      const meta = [time, session.cwd ? session.cwd : ''].filter(Boolean).map(escapeHtml).join(' · ')
+      const busy = state.sessionSelectPending && session.id !== currentId ? ' is-busy' : ''
+      return `<button class="session-row${busy}" type="button" data-action="select-session" data-session-id="${escapeHtml(session.id)}">
+        <span class="session-row-main">
+          <span class="session-row-title">${escapeHtml(session.title)}</span>
+          <span class="session-row-meta">${meta}</span>
+        </span>
+        <span class="session-badges">${badges.join('')}</span>
+      </button>`
+    })
+    .join('')
+  const empty = sessions.length === 0
+    ? `<p class="session-empty">${
+      state.sessionListLoading
+        ? '正在读取电脑上的会话…'
+        : state.connection?.online
+          ? '还没有会话，点下面「新建会话」开始。'
+          : '还没连上电脑：连上后这里会列出电脑上的会话。'
+    }</p>`
+    : ''
+  const truncated = model?.sessionsTruncated
+    ? '<p class="session-note">会话太多，这里只显示最近的一部分。</p>'
+    : ''
+  dom.sessionSheet.innerHTML = `
+    <div class="sheet-grip" aria-hidden="true"></div>
+    <h2>会话</h2>
+    <p class="sheet-row-note">每台设备只驱动一个 DSH 会话；切换后这里会换成该会话的历史。</p>
+    <div class="session-list" role="list">${rows}${empty}</div>
+    ${truncated}
+    <button class="btn btn-secondary btn-block session-new" type="button" data-action="new-session" ${state.sessionSelectPending ? 'disabled' : ''}>新建会话</button>
+  `
+}
+
+// ---------------------------------------------------------------------------
+// 审批卡片
+// ---------------------------------------------------------------------------
+
+/** 没有待办 / 用户已答复 / 已过期时，倒计时定时器就该停。 */
+function stopApprovalTicker() {
+  if (state.approvalTicker !== null) {
+    clearInterval(state.approvalTicker)
+    state.approvalTicker = null
+  }
+}
+
+function syncApprovalTicker() {
+  const approvals = state.model?.approvals ?? []
+  // 只有「带 expiresAt 且还没回答」的卡片需要每秒刷新倒计时。
+  const need = approvals.some(
+    item => !item.replied && Number.isFinite(Number(item.expiresAt)) && !approvalExpired(item),
+  )
+  if (!need) {
+    stopApprovalTicker()
+    return
+  }
+  if (state.approvalTicker === null) {
+    state.approvalTicker = setInterval(updateApprovalCountdowns, 1000)
+  }
+}
+
+/** 只改倒计时文本和按钮可用态，不整表重绘（避免每秒钟闪一次）。 */
+function updateApprovalCountdowns() {
+  const model = state.model
+  if (!model) {
+    stopApprovalTicker()
+    return
+  }
+  let live = false
+  for (const node of dom.messageList.querySelectorAll('[data-countdown-for]')) {
+    const approval = model.approvalsById.get(node.dataset.countdownFor ?? '')
+    if (!approval) continue
+    const expired = approvalExpired(approval)
+    if (!approval.replied && !expired) live = true
+    node.textContent = approvalCountdownText(approval)
+    const card = node.closest('.approval-card')
+    if (card) {
+      card.classList.toggle('is-expired', expired)
+      for (const button of card.querySelectorAll('button')) button.disabled = expired || approval.replied === true
+    }
+  }
+  if (!live) stopApprovalTicker()
+}
+
+/** @param {string} approvalId @param {'allowed-once'|'rejected'} outcome */
+function replyApproval(approvalId, outcome) {
+  const model = state.model
+  if (!model) return
+  if (!state.connection?.online) {
+    showToast('还没连上电脑，无法回答这条请求', 'error')
+    return
+  }
+  if (!model.markApprovalReplied(approvalId, outcome)) return
+  state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
+  scheduleRender()
+  syncApprovalTicker()
+  showToast(outcome === 'allowed-once' ? '已允许这一次调用' : '已拒绝这次调用', 'ok', 2200)
+}
+
+/**
+ * 待处理审批卡片（一道请求一张卡，多条排队纵向排列）。
+ * @param {any} approval
+ * @returns {string}
+ */
+function approvalCardHtml(approval) {
+  const expired = approvalExpired(approval)
+  const replied = approval.replied === true
+  const disabled = expired || replied
+  const classes = ['approval-card']
+  if (expired) classes.push('is-expired')
+  if (replied) classes.push('is-replied')
+  const reason = escapeHtml(approvalReasonText(approval))
+  const tool = escapeHtml(approval.toolName ?? '工具')
+  let foot = ''
+  if (replied) {
+    foot = `<p class="approval-state">${
+      approval.repliedOutcome === 'allowed-once' ? '已允许（等待电脑确认）' : '已拒绝（等待电脑确认）'
+    }</p>`
+  } else if (approval.expiresAt) {
+    foot = `<p class="approval-countdown" data-countdown-for="${escapeHtml(approval.approvalId)}">${escapeHtml(
+      approvalCountdownText(approval),
+    )}</p>`
+  }
+  return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
+    <div class="approval-head">
+      <span class="approval-tool">${tool}</span>
+      <span class="approval-request">请求执行</span>
+    </div>
+    <p class="approval-reason">${reason}</p>
+    ${foot}
+    <div class="approval-actions">
+      <button class="btn btn-primary approval-allow" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}" data-outcome="allowed-once" ${disabled ? 'disabled' : ''}>允许一次</button>
+      <button class="btn btn-danger approval-deny" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
+    </div>
+  </div>`
+}
+
+/** 所有待处理审批的卡片栈（没有则返回空串）。 */
+function approvalCardsHtml() {
+  const approvals = state.model?.approvals ?? []
+  if (approvals.length === 0) return ''
+  return `<div class="approval-stack" aria-live="polite">${approvals.map(approvalCardHtml).join('')}</div>`
+}
+
+// ---------------------------------------------------------------------------
 // 帧处理
 // ---------------------------------------------------------------------------
 
@@ -799,6 +1161,7 @@ function handleFrame(frame) {
     }
   }
 
+  const approvalsBefore = state.model.approvals.length
   const result = state.model.applyFrame(frame)
 
   if (frame.t === SERVER_FRAME.CHAT_ACK) {
@@ -812,15 +1175,97 @@ function handleFrame(frame) {
     }
     persistSoon(200)
   }
-  if (frame.t === SERVER_FRAME.ERROR) showToast(String(frame.message ?? '电脑端返回错误'), 'error')
+  if (frame.t === SERVER_FRAME.ERROR) {
+    showToast(String(frame.message ?? '电脑端返回错误'), 'error')
+    if (state.sessionListLoading) {
+      // 会话列表请求被拒时不能一直显示「正在读取…」。
+      state.sessionListLoading = false
+      if (state.sessionSheetOpen) renderSessionSheet()
+    }
+  }
   if (frame.t === SERVER_FRAME.CHAT_ERROR) renderComposerState()
   if (frame.t === SERVER_FRAME.CHAT_DONE) renderComposerState()
+
+  if (frame.t === SERVER_FRAME.SESSIONS) {
+    state.sessionListLoading = false
+    if (state.sessionSheetOpen) renderSessionSheet()
+    renderHeader()
+  }
+  if (frame.t === SERVER_FRAME.SESSION_SELECTED) handleSessionSelected()
+  if (frame.t === SERVER_FRAME.APPROVAL_ASK) {
+    syncApprovalTicker()
+    if (state.model.approvals.length > approvalsBefore) {
+      showToast('电脑在请求权限，请在上面这张卡片里作答', '', 3200)
+    }
+  }
+  if (frame.t === SERVER_FRAME.APPROVAL_RESOLVED) handleApprovalResolved(result.resolved)
+
   if (result.changed) {
-    scheduleRender({ forceScroll: frame.t === SERVER_FRAME.SESSION_STATE })
+    scheduleRender({
+      forceScroll:
+        frame.t === SERVER_FRAME.SESSION_STATE ||
+        frame.t === SERVER_FRAME.APPROVAL_ASK ||
+        frame.t === SERVER_FRAME.SESSION_EVENTS,
+    })
     persistSoon()
   }
-  if (result.sessionChanged) showToast('协作会话已切换，已同步新会话', 'ok', 2600)
-  if (result.needsSync) requestSessionSync()
+  if (result.sessionChanged) handleSessionChanged(frame)
+}
+
+/**
+ * 会话确实换了（本页选的，或电脑端通知的）：整页换成新会话的快照。
+ * @param {any} frame
+ */
+function handleSessionChanged(frame) {
+  state.lastRenderSignature = ''
+  if (state.model.sessionId) rememberSession(state.model.sessionId)
+  renderHeader()
+  renderMessages({ forceScroll: true })
+  renderComposerState()
+  if (state.sessionSheetOpen) renderSessionSheet()
+  if (state.justSelectedSession) {
+    // 选择结果已经在 session/selected 里提示过了。
+    state.justSelectedSession = false
+  } else if (frame.t === SERVER_FRAME.SESSION_STATE) {
+    showToast('已切换到电脑上的新会话', 'ok', 2400)
+  }
+}
+
+/** `session/selected`：成功就关面板并记住选择，失败留在面板里说明原因。 */
+function handleSessionSelected() {
+  const selection = state.model?.lastSessionSelection
+  state.sessionSelectPending = false
+  if (!selection) return
+  if (selection.ok) {
+    // justSelectedSession 留给紧随其后的 session/state 消费，避免连报两次「已切换」。
+    if (selection.sessionId) rememberSession(selection.sessionId)
+    closeSessionSheet()
+    showToast(selection.title ? `已切换到「${selection.title}」` : '已切换会话', 'ok', 2400)
+  } else {
+    state.justSelectedSession = false
+    renderSessionSheet()
+    // not-found：记住的会话可能已经在电脑上消失了，别再每次重连都重选它。
+    if (selection.error === 'not-found') {
+      rememberSession('')
+      state.lastSessionId = ''
+    }
+    showToast(selection.message || selection.error || '切换会话失败', 'error', 4600)
+  }
+}
+
+/** `approval/resolved`：卡片由 reducer 移出队列；这里只补充用户看得懂的提示。 */
+function handleApprovalResolved(resolved) {
+  syncApprovalTicker()
+  if (!resolved) return
+  if (resolved.outcome === 'cancelled') {
+    showToast(
+      resolved.source === 'timeout' ? '这条权限请求已超时，交回电脑处理' : '这条权限请求已在电脑上取消',
+      '',
+      3200,
+    )
+  } else if (resolved.source === 'desktop') {
+    showToast('这条权限请求已在电脑上回答', '', 2400)
+  }
 }
 
 /** 下载（file/*）帧：优先用 file/meta 的 downloadPath 走 HTTP，其次拼分块。 */
@@ -1072,7 +1517,6 @@ function flushOutbox() {
       msgId: entry.msgId,
       callId: entry.msgId,
       text: entry.text,
-      speaker: currentDeviceName(),
     }
     if (state.connection.send(frame)) state.model.resetUserMessageForRetry(entry.msgId)
   }
@@ -1119,7 +1563,6 @@ async function sendComposer() {
     state.model.addLocalUserMessage({
       msgId,
       text,
-      speaker: currentDeviceName(),
       files: files.map(file => ({ name: file.name, size: file.size, mime: file.mime, uploadId: file.uploadId })),
     })
     /** @type {any} */
@@ -1129,7 +1572,6 @@ async function sendComposer() {
       msgId,
       callId: msgId,
       text,
-      speaker: currentDeviceName(),
     }
     if (files.length > 0) frame.files = files
 
@@ -1162,7 +1604,6 @@ function retryMessage(msgId) {
     msgId,
     callId: msgId,
     text: String(message.text ?? ''),
-    speaker: currentDeviceName(),
   }
   queueOutbox(frame)
   const sent = Boolean(state.connection?.online && state.connection.send(frame))
@@ -1204,35 +1645,20 @@ function renderHeader() {
     detail = '已断开'
   }
   dom.connectionDetail.textContent = detail
-  renderParticipants()
+  renderSessionChip()
 }
 
-function renderParticipants() {
-  const participants = state.model?.participants ?? []
-  const show = state.model?.collaboration === true && participants.length > 0
-  dom.participants.hidden = !show
-  if (!show) {
-    dom.participants.innerHTML = ''
-    return
-  }
-  dom.participants.innerHTML = participants
-    .slice(0, 5)
-    .map(participant => {
-      const initial = escapeHtml(String(participant.name ?? '?').slice(0, 1).toUpperCase())
-      const hue = hashHue(participant.deviceId)
-      const classes = ['avatar']
-      if (participant.self === true) classes.push('is-self')
-      if (participant.online === false) classes.push('is-offline')
-      return `<span class="${classes.join(' ')}" title="${escapeHtml(participant.name)}" style="background: hsl(${hue} 72% 72%)">${initial}</span>`
-    })
-    .join('')
-}
-
-/** @param {string} value */
-function hashHue(value) {
-  let hash = 0
-  for (const char of String(value ?? '')) hash = (hash * 31 + char.charCodeAt(0)) % 360
-  return hash
+/** 顶部会话胶囊：显示当前会话标题，点开是会话列表。 */
+function renderSessionChip() {
+  if (!dom.sessionChip) return
+  const supported = sessionsSupported()
+  // 老电脑端没有 sessions-v1：不显示一个点了只会报错的按钮。
+  dom.sessionChip.hidden = !supported
+  dom.sessionChip.title = '切换会话'
+  if (!supported) return
+  const title = currentSessionTitle()
+  dom.sessionChipLabel.textContent = title || '会话'
+  dom.sessionChip.classList.toggle('is-known', title !== '')
 }
 
 function renderStatusBanner() {
@@ -1267,7 +1693,12 @@ function messageSignature() {
     if (message.tools?.length) hash = (hash * 31 + message.tools.length) % 1_000_000_007
   }
   hash = (hash * 31 + state.model.typing.size) % 1_000_000_007
-  hash = (hash * 31 + (state.model.collaboration ? 1 : 0)) % 1_000_000_007
+  // 审批卡片与当前会话标题也在同一份 DOM 里，必须进入签名，否则状态变化不会重绘。
+  hash = (hash * 31 + state.model.approvals.length) % 1_000_000_007
+  for (const approval of state.model.approvals) {
+    hash = (hash * 31 + approval.approvalId.length + (approval.replied ? 7 : 3)) % 1_000_000_007
+  }
+  hash = (hash * 31 + state.model.sessionTitle.length) % 1_000_000_007
   return String(hash)
 }
 
@@ -1297,8 +1728,11 @@ function renderMessages({ forceScroll = false } = {}) {
   }
   state.lastRenderSignature = signature
   const messages = state.model.messages
+  const approvals = approvalCardsHtml()
   if (messages.length === 0) {
-    dom.messageList.innerHTML = emptyStateHtml()
+    dom.messageList.innerHTML = `${approvals}${emptyStateHtml()}`
+    updateApprovalCountdowns()
+    syncApprovalTicker()
     maybeScrollToLatest(true)
     return
   }
@@ -1321,7 +1755,9 @@ function renderMessages({ forceScroll = false } = {}) {
       parts.push('<div class="typing-row" aria-label="助理正在输入"><span></span><span></span><span></span></div>')
     }
   }
-  dom.messageList.innerHTML = parts.join('')
+  dom.messageList.innerHTML = `${parts.join('')}${approvals}`
+  updateApprovalCountdowns()
+  syncApprovalTicker()
   maybeScrollToLatest(forceScroll)
 }
 
@@ -1353,10 +1789,6 @@ function messageHtml(message, isFirst) {
   if (message.kind === 'assistant' && !message.text && (!message.tools || message.tools.length === 0)) return ''
   const classes = ['msg', message.kind === 'user' ? 'is-user' : 'is-assistant']
   if (isFirst) classes.push('is-first')
-  const speaker =
-    message.kind === 'user' && message.mine !== true && message.speaker
-      ? `<p class="msg-speaker">${escapeHtml(message.speaker)}</p>`
-      : ''
   const tools = message.kind === 'assistant' ? toolRowsHtml(message.tools) : ''
   const bubbleClasses = ['bubble']
   if (message.status === MESSAGE_STATUS.ERROR) bubbleClasses.push('is-error')
@@ -1368,7 +1800,6 @@ function messageHtml(message, isFirst) {
   const attachments = attachmentChipsHtml(message.files)
   const foot = messageFootHtml(message)
   return `<div class="${classes.join(' ')}">
-    ${speaker}
     <div class="${bubbleClasses.join(' ')}">
       ${tools}
       <div class="bubble-text">${text}${cursor}</div>
@@ -1511,15 +1942,16 @@ function renderComposerState() {
 
 function openSettings() {
   state.settingsOpen = true
+  if (state.sessionSheetOpen) closeSessionSheet()
   renderSettings()
   dom.settingsSheet.hidden = false
-  dom.sheetBackdrop.hidden = false
+  syncSheetBackdrop()
 }
 
 function closeSettings() {
   state.settingsOpen = false
   dom.settingsSheet.hidden = true
-  dom.sheetBackdrop.hidden = true
+  syncSheetBackdrop()
 }
 
 function renderSettings() {
@@ -1546,16 +1978,6 @@ function renderSettings() {
             return `<li class="endpoint-item${used ? ' is-used' : ''}"><span class="endpoint-kind">${escapeHtml(ENDPOINT_KIND_LABEL[item.kind] ?? '其他')}</span><span class="endpoint-url">${escapeHtml(item.url)}</span>${used ? '<span>使用中</span>' : ''}</li>`
           })
           .join('')
-  const participants = state.model?.participants ?? []
-  const participantItems =
-    participants.length === 0
-      ? '<p class="sheet-row-note">协作模式开启后，这里会显示同时连在这台电脑上的设备。</p>'
-      : participants
-          .map(
-            participant =>
-              `<div class="sheet-row"><span class="sheet-row-label">${escapeHtml(participant.name)}${participant.self ? '（本机）' : ''}</span><span class="sheet-row-note">${participant.online ? '在线' : '离线'}</span></div>`,
-          )
-          .join('')
   const themeButtons = [
     ['auto', '跟随系统'],
     ['light', '浅色'],
@@ -1567,10 +1989,22 @@ function renderSettings() {
     )
     .join('')
   const binding = state.binding
-  const collabSupported = state.serverCaps.has(CAPABILITIES.COLLAB)
+  const sessionTitle = currentSessionTitle()
+  const sessionsNote = sessionsSupported()
+    ? '每台设备只驱动一个 DSH 会话；切换后网页会换成该会话的历史。'
+    : '电脑端版本较旧，暂不支持在网页里切换会话。'
   dom.settingsSheet.innerHTML = `
     <div class="sheet-grip" aria-hidden="true"></div>
     <h2>设置</h2>
+
+    <section class="sheet-section">
+      <h3 class="sheet-section-title">会话</h3>
+      <div class="sheet-row">
+        <span class="sheet-row-label">${escapeHtml(sessionTitle || '未选择')}</span>
+        <button class="btn btn-secondary btn-sm" type="button" data-action="open-sessions" ${sessionsSupported() ? '' : 'disabled'}>切换会话</button>
+      </div>
+      <p class="sheet-row-note">${escapeHtml(sessionsNote)}</p>
+    </section>
 
     <section class="sheet-section">
       <h3 class="sheet-section-title">连接</h3>
@@ -1589,22 +2023,12 @@ function renderSettings() {
     </section>
 
     <section class="sheet-section">
-      <h3 class="sheet-section-title">协作</h3>
-      <div class="switch-row">
-        <div>
-          <div class="sheet-row-label">协作模式</div>
-          <p class="sheet-row-note">${collabSupported ? '开启后，同一台电脑上的多台设备共用一个会话。' : '电脑端版本较旧，暂不支持在这里切换。'}</p>
-        </div>
-        <label class="switch">
-          <input type="checkbox" id="collab-toggle" ${state.model?.collaboration ? 'checked' : ''} ${collabSupported ? '' : 'disabled'} />
-          <span class="switch-track" aria-hidden="true"></span>
-        </label>
-      </div>
+      <h3 class="sheet-section-title">设备</h3>
       <div class="settings-input-row">
         <input class="input" id="device-name-input" maxlength="24" value="${escapeHtml(normalizeDeviceName(state.settings.deviceName) || '')}" placeholder="${escapeHtml(currentDeviceName())}" />
-        <button class="btn btn-secondary" type="button" data-action="save-name">保存昵称</button>
+        <button class="btn btn-secondary" type="button" data-action="save-name">保存名称</button>
       </div>
-      ${participantItems}
+      <p class="sheet-row-note">这个名字只用于电脑端的设备列表，不会出现在聊天消息里。</p>
     </section>
 
     <section class="sheet-section">
@@ -1709,21 +2133,8 @@ async function saveDeviceName(input) {
     storage.saveBinding(state.binding)
   }
   state.connection?.send({ t: CLIENT_FRAME.DEVICE_RENAME, label: name })
-  settingsFeedback('昵称已保存（重连后对电脑端生效）', 'ok')
+  settingsFeedback('名称已保存（重连后对电脑端生效）', 'ok')
   renderSettings()
-}
-
-function toggleCollaboration(on) {
-  if (!state.serverCaps.has(CAPABILITIES.COLLAB)) {
-    showToast('电脑端版本较旧，不支持从网页切换协作模式', 'error')
-    return
-  }
-  if (!state.connection?.online) {
-    showToast('还没连上电脑', 'error')
-    return
-  }
-  state.connection.send({ t: CLIENT_FRAME.COLLAB_SET, rid: uid('collab'), on })
-  showToast(on ? '正在开启协作模式…' : '正在关闭协作模式…', '', 2200)
 }
 
 async function unbindDevice() {
@@ -1745,6 +2156,7 @@ async function unbindDevice() {
   if (state.identity) {
     storage.clearConversation(state.identity.deviceId)
     storage.clearOutbox(state.identity.deviceId)
+    storage.clearLastSession(state.identity.deviceId)
   }
   storage.clearBinding()
   state.binding = undefined
@@ -1754,7 +2166,13 @@ async function unbindDevice() {
   state.pairSecret = ''
   state.serverCaps = new Set()
   state.status = { state: CONNECTION_STATE.STOPPED }
+  state.lastSessionId = ''
+  state.sessionListLoading = false
+  state.sessionSelectPending = false
+  state.lastRenderSignature = ''
+  stopApprovalTicker()
   closeSettings()
+  closeSessionSheet()
   showView('bind')
   resetBindUI()
   setBindStatus('已解除绑定。需要重新扫码或粘贴绑定链接。', 'ok')
@@ -1835,7 +2253,26 @@ function setupBindEvents() {
 
 function setupChatEvents() {
   dom.menuBtn.addEventListener('click', openSettings)
-  dom.sheetBackdrop.addEventListener('click', closeSettings)
+  dom.sessionChip.addEventListener('click', () => {
+    if (!sessionsSupported()) {
+      showToast('电脑端版本较旧，不支持切换会话；请升级电脑端插件', 'error', 4600)
+      return
+    }
+    openSessionSheet()
+  })
+  dom.sheetBackdrop.addEventListener('click', () => {
+    closeSettings()
+    closeSessionSheet()
+  })
+  dom.sessionSheet.addEventListener('click', event => {
+    const target = event.target.closest('[data-action]')
+    if (!target) return
+    if (target.dataset.action === 'select-session') {
+      selectSession(target.dataset.sessionId ?? '')
+      return
+    }
+    if (target.dataset.action === 'new-session') createSession()
+  })
   dom.settingsSheet.addEventListener('click', async event => {
     const target = event.target.closest('[data-action], [data-mode], [data-theme-choice]')
     if (!target) return
@@ -1850,6 +2287,9 @@ function setupChatEvents() {
       return
     }
     switch (action) {
+      case 'open-sessions':
+        openSessionSheet()
+        break
       case 'reconnect':
         if (state.connection) state.connection.reconnect()
         settingsFeedback('正在重新连接…')
@@ -1889,6 +2329,7 @@ function setupChatEvents() {
         if (ok) {
           state.model?.clearConversation()
           state.lastRenderSignature = ''
+          stopApprovalTicker()
           if (state.identity) storage.clearConversation(state.identity.deviceId)
           renderMessages({ forceScroll: true })
           closeSettings()
@@ -1902,10 +2343,6 @@ function setupChatEvents() {
       default:
         break
     }
-  })
-  dom.settingsSheet.addEventListener('change', event => {
-    const target = /** @type {HTMLInputElement} */ (event.target)
-    if (target?.id === 'collab-toggle') toggleCollaboration(target.checked)
   })
   dom.statusBanner.addEventListener('click', event => {
     const button = event.target.closest('[data-action]')
@@ -1933,6 +2370,11 @@ function setupChatEvents() {
     }
     if (target.dataset.action === 'download-file') {
       downloadFile(target.dataset.fileId ?? '')
+      return
+    }
+    if (target.dataset.action === 'approval-reply') {
+      const outcome = target.dataset.outcome === 'allowed-once' ? 'allowed-once' : 'rejected'
+      replyApproval(target.dataset.approvalId ?? '', outcome)
     }
   })
   dom.installHintAction.addEventListener('click', () => {

@@ -24,7 +24,14 @@ export const CLIENT_FRAME = {
   UPLOAD_CHUNK: 'upload/chunk',
   UPLOAD_END: 'upload/end',
   UPLOAD_CANCEL: 'upload/cancel',
-  COLLAB_SET: 'collab/set',
+  /** 会话选择器（2.3.0）：列出电脑上的 DSH 会话。 */
+  SESSION_LIST: 'session/list',
+  /** 选中其中一个会话（电脑端可能 resume 它）。 */
+  SESSION_SELECT: 'session/select',
+  /** 新建一个会话并绑定这台设备。 */
+  SESSION_CREATE: 'session/create',
+  /** 回答电脑端转发来的 DSH 权限请求（2.3.0）。 */
+  APPROVAL_REPLY: 'approval/reply',
 } as const
 
 export const SERVER_FRAME = {
@@ -48,8 +55,14 @@ export const SERVER_FRAME = {
   CHAT_MESSAGE: 'chat/message',
   SESSION_STATE: 'session/state',
   SESSION_EVENTS: 'session/events',
-  PARTICIPANTS: 'session/participants',
-  COLLAB_STATE: 'collab/state',
+  /** 会话列表（session/list 的回复）。 */
+  SESSIONS: 'sessions',
+  /** session/select / session/create 的结果；成功后紧跟一条 session/state 快照。 */
+  SESSION_SELECTED: 'session/selected',
+  /** 电脑端转发来的一条 DSH 权限请求。 */
+  APPROVAL_ASK: 'approval/ask',
+  /** 那条请求已经在别处（手机/电脑/超时）被处理。 */
+  APPROVAL_RESOLVED: 'approval/resolved',
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
   UPLOAD_DONE: 'upload/done',
@@ -67,11 +80,13 @@ export const CAPABILITIES = {
   CHAT_ECHO: 'chat-echo-v1',
   CHAT_MESSAGE: 'chat-message-v1',
   SESSION_SYNC: 'session-sync-v1',
-  PARTICIPANTS: 'participants-v1',
   UPLOAD: 'upload-v1',
-  COLLAB: 'collab-v1',
   FILE_OFFER: 'file-offer-v1',
   ENDPOINT_KINDS: 'endpoint-kinds-v1',
+  /** 会话选择器（2.3.0）。 */
+  SESSIONS: 'sessions-v1',
+  /** 权限请求转发（2.3.0）。 */
+  APPROVAL: 'approval-v1',
 } as const
 
 /** 本 build 理解的全部能力（hello 时整包声明）。 */
@@ -104,7 +119,7 @@ export const DEFAULT_PORT = 8787
 export const UPLOAD_IDLE_TIMEOUT_MS = 3 * 60 * 1000
 
 /** 协议版本，镜像 `PROTOCOL_VERSION`（由 frames 测试核对）。 */
-export const PROTOCOL_VERSION = '1.1.0'
+export const PROTOCOL_VERSION = '1.2.0'
 
 /** 心跳默认值，镜像 `DEFAULT_HEARTBEAT_MS`。 */
 export const DEFAULT_HEARTBEAT_MS = 25_000
@@ -126,6 +141,15 @@ export const MAX_UPLOAD_ATTACHMENTS = 8
 
 /** 单个文件上限，镜像 `MAX_FILE_BYTES`。 */
 export const MAX_FILE_BYTES = 512 * 1024 * 1024
+
+/** 一次 `sessions` 帧里最多列出的会话数，镜像 `SESSION_LIST_LIMIT`。 */
+export const SESSION_LIST_LIMIT = 200
+
+/** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
+export const APPROVAL_TIMEOUT_MS = 60_000
+
+/** 手机端唯一允许的审批答复，镜像 `APPROVAL_REPLY_OUTCOMES`。 */
+export const APPROVAL_REPLY_OUTCOMES: readonly string[] = Object.freeze(['allowed-once', 'rejected'])
 
 /** 电源拒绝原因，镜像 `POWER_REFUSAL`。 */
 export const POWER_REFUSAL = {

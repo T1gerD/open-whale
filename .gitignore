@@ -8,8 +8,9 @@ node_modules/
 package-lock.json
 
 # Test runner scratch output (one log per suite when run through
-# scripts/run-tests.mjs).
+# scripts/run-tests.mjs) and the writable TEMP used by sandboxed runs.
 .test-logs/
+.test-tmp/
 
 # Native build output for the mobile app
 packages/mobile/android/

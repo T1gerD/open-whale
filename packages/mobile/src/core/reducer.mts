@@ -5,17 +5,20 @@
 //     写数据库都在服务层按 effects 执行。这样网络与磁盘都没法让状态机变得不可测。
 //  2. 消息 id 是**确定性**的：用户消息 `usr_<msgId>`（msgId=rid），助手消息
 //     `msg_<messageId>`（没有 messageId 的老协议回落到 `msg_<callId>`），文件卡片
-//     `file_<fileId>`。所以断线重连、多端回显、事件日志回放都不会造出第二条消息。
+//     `file_<fileId>`。所以断线重连、同一设备的其它窗口回显、事件日志回放都不会造出第二条消息。
 //  3. `chat/tool` 只累积成 assistant 消息里的**活动行**（activity），永远不写进
 //     `text`：工具调用不是助理在说话，语义混了以后 UI 就没法正确渲染。
 //  4. delta 按 `seq` 聚合：重复/迟到的丢弃，缺口先缓存、补齐后连续 flush；
 //     `chat/message` 是**全文替换**（messageId upsert），`chat/done` 是权威全文。
-//  5. v2.2.0 多端同步：`chat/echo`（会话内所有人的消息）、`session/state`（快照）、
-//     `session/events`（按 seq 追赶）、`session/participants`、`collab/state`、
-//     `file/offered` 都在这里归约；会话游标 `sessionCursor` 由服务层持久化。
+//  5. v2.3.0「纯粹的远程遥控器」：没有协作/在线成员，`chat/echo` 只用于同一设备的
+//     其它窗口；新增两条链路在这里归约——会话选择器（`sessions` / `session/selected`
+//     + 紧随其后的 `session/state` 快照要**整页替换**）和权限请求队列
+//     （`approval/ask` / `approval/resolved`，多条并存，按 approvalId 去重）。
 
+import { enqueueApproval, normalizeApprovalAsk, pruneExpiredApprovals, resolveApproval, type ApprovalPrompt } from './approvals.mts'
 import { base64ByteLength } from './files.mts'
 import { MAX_FILE_BYTES, SERVER_FRAME } from './frames.mts'
+import { normalizeSessionsFrame, type SessionListState } from './sessions.mts'
 
 export type MessageKind = 'user' | 'assistant' | 'system'
 export type MessageSendState = 'pending' | 'sent' | 'failed'
@@ -45,12 +48,6 @@ export interface ActivityItem {
   at: number
 }
 
-/** 消息发送者（多端协作时 UI 用它显示昵称/头像色块）。 */
-export interface MessageSender {
-  deviceId: string
-  name: string
-}
-
 export interface ChatMessage {
   id: string
   kind: MessageKind
@@ -67,14 +64,12 @@ export interface ChatMessage {
   state?: MessageSendState
   /** 用户消息：附件回显（只留元信息，不留 base64）。 */
   files?: FileRef[]
-  /** 发送者（他人消息才有 sender；自己的消息 mine=true）。 */
-  sender?: MessageSender
-  /** 发送者 deviceId（chat/echo 里的原始字段；判断 mine 用）。 */
-  deviceId?: string
-  /** 这条用户消息是不是本机发的（协作模式气泡对齐用）。 */
+  /**
+   * 这条用户消息是不是本机发的。
+   * v2.3.0 起每台手机只驱动自己绑定的会话，用户消息永远是自己发的；
+   * 字段保留只为兼容旧版本存下来的历史行（迁移时会补成 true）。
+   */
   mine?: boolean
-  /** 协作模式下发送者昵称（老字段，等价 sender.name）。 */
-  speaker?: string
   /** 助手消息是否还在流式输出。 */
   streaming?: boolean
   /** 断线时把还在流的消息标记为中断，UI 提示“内容可能不完整”。 */
@@ -124,13 +119,6 @@ export interface Transfer {
   updatedAt: number
 }
 
-/** 在线成员（session/participants）。 */
-export interface Participant {
-  deviceId: string
-  name: string
-  online: boolean
-}
-
 /** 上传进度视图（uploadId → 状态；UI 也可以直接读 message.files[] 里的字段）。 */
 export interface UploadView {
   uploadId: string
@@ -158,25 +146,28 @@ export interface ChatState {
   /** 累计缺口次数，用来在 UI 上提示“内容可能不完整”。 */
   gapCount: number
   lastEventAt: number
-  // ---- 2.2.0 多端同步 ----
-  /** 当前会话 id（协作模式切换会变）。 */
+  // ---- 2.3.0 会话选择器 / 权限请求 ----
+  /** 当前会话 id（会话选择器切换会变）。 */
   sessionId?: string
   /** 会话纪元：每次切换 +1。 */
   sessionEpoch?: number
   /** 已应用到的会话事件序号（断点续传游标）。 */
   sessionCursor: number
-  /** 协作模式开关（来自 session/state 或 collab/state）。 */
-  collaboration: boolean
-  /** 会话内在线成员。 */
-  participants: Participant[]
+  /** 电脑端给的会话列表（session/list 的回复）。 */
+  sessionList?: SessionListState
+  /**
+   * 会话选择器刚成功切换过，下一条 `session/state` 必须**整页替换**消息。
+   * 不能只靠快照合并：两个会话的历史里可能出现同名/同 id 的气泡。
+   */
+  resetOnNextSnapshot: boolean
+  /** 等待手机回答的权限请求（按到达顺序，多条的不能互相覆盖）。 */
+  approvals: ApprovalPrompt[]
   /** messageId → 助手消息 id（chat/message upsert 索引）。 */
   messageIndex: Record<string, string>
   /** callId → 助手消息 id 列表（同一回合可能有多条 messageId 消息）。 */
   turnMessages: Record<string, string[]>
   /** uploadId → 上传进度。 */
   uploads: Record<string, UploadView>
-  /** 本机 deviceId（判断消息 mine，由服务层在启动/连接时注入）。 */
-  selfDeviceId?: string
 }
 
 export type ChatEffect =
@@ -220,8 +211,8 @@ export type WireEvent =
       msgId: string
       rid?: string
       callId?: string
+      /** 发送设备 id（v2.3.0 起只可能等于本机：协作语义已删除）。 */
       deviceId?: string
-      speaker?: string
       text?: string
       files?: FileRef[]
       seq?: number
@@ -243,7 +234,6 @@ export type WireEvent =
       sessionEpoch?: number
       head?: number
       snapshot?: { messages?: SnapshotMessage[]; activeCall?: { callId?: string; text?: string; typing?: boolean } | null }
-      collaboration?: boolean
       /** 会话切换时置 true：清空本地聊天后接快照。 */
       reset?: boolean
       at?: number
@@ -257,13 +247,43 @@ export type WireEvent =
       at?: number
     }
   | {
-      t: 'session/participants'
-      sessionId?: string
-      collaboration?: boolean
-      participants?: Array<{ deviceId?: unknown; name?: unknown; online?: unknown }>
+      /** `session/list` 的回复：电脑上的会话列表。 */
+      t: 'sessions'
+      current?: string
+      sessions?: unknown
+      truncated?: boolean
       at?: number
     }
-  | { t: 'collab/state'; on: boolean; sessionId?: string; sessionEpoch?: number; at?: number }
+  | {
+      /** `session/select` / `session/create` 的结果；ok 时紧跟一条 session/state 快照。 */
+      t: 'session/selected'
+      ok?: boolean
+      sessionId?: string
+      title?: string
+      sessionEpoch?: number
+      error?: string
+      message?: string
+      at?: number
+    }
+  | {
+      /** 电脑端转发来的一条 DSH 权限请求。 */
+      t: 'approval/ask'
+      approvalId: string
+      toolName?: string
+      reason?: string
+      displayReason?: { en: string; [locale: string]: string }
+      callId?: string
+      expiresAt?: number
+      at?: number
+    }
+  | {
+      /** 那条请求已经在手机/电脑/超时处被处理，卡片要撤掉。 */
+      t: 'approval/resolved'
+      approvalId: string
+      outcome?: string
+      source?: string
+      at?: number
+    }
   | { t: 'file/offered'; fileId: string; name: string; size: number; mime?: string; url?: string; from?: string; seq?: number; at?: number }
   | { t: 'file/meta'; fileId: string; name: string; size: number; mime?: string; at?: number }
   | { t: 'file/chunk'; fileId: string; seq: number; dataBase64: string; at?: number }
@@ -283,15 +303,12 @@ export interface SnapshotMessage {
   callId?: string
   msgId?: string
   messageId?: string
-  speaker?: string
-  deviceId?: string
   files?: FileRef[]
 }
 
 /** 本地事件：用户操作与连接生命周期。 */
 export type LocalEvent =
   | { t: 'state/hydrate'; messages: ChatMessage[]; transfers?: Transfer[]; at: number }
-  | { t: 'state/identity'; deviceId: string; at?: number }
   | {
       t: 'user/send'
       rid: string
@@ -306,6 +323,8 @@ export type LocalEvent =
   | { t: 'conn/disconnected'; at: number; reason?: string }
   | { t: 'conn/connected'; at: number }
   | { t: 'session/reset'; sessionId?: string; sessionEpoch?: number; reason?: string; at: number }
+  /** 每秒一次的本地节拍：裁掉已经过期的权限请求（电脑端已交回桌面）。 */
+  | { t: 'approval/tick'; at: number }
   | { t: 'message/remove'; messageId: string; at: number }
   | { t: 'user/stop'; callId?: string; at: number }
   | { t: 'transfer/request'; fileId: string; at: number }
@@ -343,8 +362,10 @@ const KNOWN_SERVER_FRAMES = [
   SERVER_FRAME.CHAT_MESSAGE,
   SERVER_FRAME.SESSION_STATE,
   SERVER_FRAME.SESSION_EVENTS,
-  SERVER_FRAME.PARTICIPANTS,
-  SERVER_FRAME.COLLAB_STATE,
+  SERVER_FRAME.SESSIONS,
+  SERVER_FRAME.SESSION_SELECTED,
+  SERVER_FRAME.APPROVAL_ASK,
+  SERVER_FRAME.APPROVAL_RESOLVED,
   SERVER_FRAME.UPLOAD_READY,
   SERVER_FRAME.UPLOAD_PROGRESS,
   SERVER_FRAME.UPLOAD_DONE,
@@ -366,12 +387,12 @@ export function emptyChatState(assistantId: string): ChatState {
     sessionId: undefined,
     sessionEpoch: undefined,
     sessionCursor: 0,
-    collaboration: false,
-    participants: [],
+    sessionList: undefined,
+    resetOnNextSnapshot: false,
+    approvals: [],
     messageIndex: {},
     turnMessages: {},
     uploads: {},
-    selfDeviceId: undefined,
   }
 }
 
@@ -386,7 +407,6 @@ export function hydrateChat(
   messages: ChatMessage[],
   transfers: Transfer[] = [],
   now: number = Date.now(),
-  options: { selfDeviceId?: string } = {},
 ): ChatState {
   const state = emptyChatState(assistantId)
   const callIndex: Record<string, string> = {}
@@ -402,7 +422,9 @@ export function hydrateChat(
         }
         if (next.streaming) next.interrupted = true
       }
-      if (next.kind === 'user' && next.mine === undefined) next.mine = true
+      // v2.3.0 起用户消息永远是自己发的：老库里 mine=false 的行也一并纠正，
+      // 否则升级后历史消息会一直靠右/靠左错位。
+      if (next.kind === 'user') next.mine = true
       return next
     })
     .sort((a, b) => a.at - b.at)
@@ -415,7 +437,7 @@ export function hydrateChat(
         ? { ...transfer, status: 'failed', error: '应用重启，传输已中断' }
         : transfer
   }
-  const base = { ...state, messages: restored, transfers: transferMap, selfDeviceId: options.selfDeviceId }
+  const base = { ...state, messages: restored, transfers: transferMap }
   const withIndexes = rebuildIndexes(base, restored)
   return { ...withIndexes, lastSeq, lastEventAt: now, sessionCursor: state.sessionCursor }
 }
@@ -425,23 +447,17 @@ export function serializeChatState(state: ChatState): string {
   return JSON.stringify(state)
 }
 
-export function deserializeChatState(
-  text: string,
-  assistantId: string,
-  now: number = Date.now(),
-  options: { selfDeviceId?: string } = {},
-): ChatState {
+export function deserializeChatState(text: string, assistantId: string, now: number = Date.now()): ChatState {
   try {
     const parsed = JSON.parse(text) as ChatState
     if (!parsed || !Array.isArray(parsed.messages)) return emptyChatState(assistantId)
-    const state = hydrateChat(assistantId, parsed.messages, Object.values(parsed.transfers ?? {}), now, options)
+    const state = hydrateChat(assistantId, parsed.messages, Object.values(parsed.transfers ?? {}), now)
     return {
       ...state,
       sessionId: parsed.sessionId,
       sessionEpoch: parsed.sessionEpoch,
       sessionCursor: typeof parsed.sessionCursor === 'number' ? parsed.sessionCursor : 0,
-      collaboration: parsed.collaboration === true,
-      participants: Array.isArray(parsed.participants) ? parsed.participants : [],
+      sessionList: parsed.sessionList,
       uploads: parsed.uploads && typeof parsed.uploads === 'object' ? parsed.uploads : {},
     }
   } catch {
@@ -457,12 +473,6 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
     case 'state/hydrate':
       return { state: hydrateChat(state.assistantId, event.messages, event.transfers ?? [], at), effects: none }
 
-    case 'state/identity': {
-      const deviceId = typeof event.deviceId === 'string' ? event.deviceId : ''
-      if (!deviceId) return { state, effects: none }
-      return { state: { ...state, selfDeviceId: deviceId, messages: applyOwnership(state.messages, deviceId) }, effects: none }
-    }
-
     case 'conn/connected':
       return { state: { ...state, lastEventAt: at }, effects: none }
 
@@ -472,13 +482,15 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
       const messages = state.messages.map(message =>
         message.kind === 'assistant' && message.streaming ? { ...message, interrupted: true } : message,
       )
-      return { state: { ...state, messages, typing: null, lastEventAt: at }, effects: none }
+      // 断线后这条请求已经不可能由手机作答（电脑端超时会把提示交回桌面），
+      // 卡片留着只会让用户点一个永远发不出去的按钮。
+      return { state: { ...state, messages, typing: null, approvals: [], lastEventAt: at }, effects: none }
     }
 
     case 'session/reset': {
-      // 协作模式切换 / 会话纪元变化：本地旧会话立即清空，等待 session/state 快照。
+      // 会话纪元变化（电脑端切换了绑定）：本地旧会话立即清空，等待 session/state 快照。
       const cleared = clearConversation(state, at)
-      const reason = event.reason ?? '协作会话已切换，正在同步聊天记录…'
+      const reason = event.reason ?? '会话已切换，正在同步聊天记录…'
       return {
         state: {
           ...appendSystem(cleared, reason, at, 'info'),
@@ -838,23 +850,60 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
       }
     }
 
-    case 'session/participants': {
-      const participants = normalizeParticipants(event.participants)
+    case 'sessions': {
+      // 列表本身不改消息；解析失败（没有 sessions 数组）时保持原列表不被清空。
+      const list = normalizeSessionsFrame(event, at)
+      if (!list) return { state: { ...state, lastEventAt: at }, effects: none }
+      return { state: { ...state, sessionList: list, lastEventAt: at }, effects: none }
+    }
+
+    case 'session/selected': {
+      const ok = event.ok !== false
+      const sessionId = typeof event.sessionId === 'string' && event.sessionId ? event.sessionId : state.sessionId
+      const title = typeof event.title === 'string' && event.title ? event.title : undefined
+      if (!ok) {
+        // 失败要如实说清楚：电脑端可能给人类可读的 message，没有就退回 error 码。
+        const detail = event.message ?? event.error ?? '电脑端没能切换到这个会话'
+        return { state: { ...appendSystem(state, `切换会话失败：${detail}`, at, 'error'), lastEventAt: at }, effects: none }
+      }
+      // 成功：先清空本地视图并立一个“正在切换”的系统行；紧随其后的 session/state
+      // 快照会**整页替换**消息（resetOnNextSnapshot）。保留不了旧消息是对的——
+      // 那是另一个会话的历史，混排会让用户以为消息串了。
+      const cleared = clearConversation(state, at)
+      const label = title ? `「${title}」` : '新会话'
+      const sessionEpoch = typeof event.sessionEpoch === 'number' && Number.isFinite(event.sessionEpoch)
+        ? event.sessionEpoch
+        : state.sessionEpoch
       return {
         state: {
-          ...state,
-          participants,
-          collaboration: typeof event.collaboration === 'boolean' ? event.collaboration : state.collaboration,
+          ...appendSystem(cleared, `正在打开${label}…`, at, 'info'),
+          sessionId,
+          sessionEpoch,
+          sessionCursor: 0,
+          resetOnNextSnapshot: true,
           lastEventAt: at,
         },
-        effects: none,
+        effects: [{ kind: 'persist-cursor', cursor: 0 }],
       }
     }
 
-    case 'collab/state': {
-      const next: ChatState = { ...state, collaboration: event.on === true, lastEventAt: at }
-      const system = appendSystem(next, event.on ? '已开启协作模式' : '已关闭协作模式', at, 'info')
-      return { state: system, effects: none }
+    case 'approval/ask': {
+      const prompt = normalizeApprovalAsk(event, at)
+      if (!prompt) return { state: { ...state, lastEventAt: at }, effects: none }
+      const approvals = enqueueApproval(pruneExpiredApprovals(state.approvals, at), prompt)
+      return { state: { ...state, approvals, lastEventAt: at }, effects: none }
+    }
+
+    case 'approval/resolved': {
+      const approvals = resolveApproval(state.approvals, event.approvalId)
+      if (approvals === state.approvals) return { state: { ...state, lastEventAt: at }, effects: none }
+      return { state: { ...state, approvals, lastEventAt: at }, effects: none }
+    }
+
+    case 'approval/tick': {
+      const approvals = pruneExpiredApprovals(state.approvals, at)
+      if (approvals === state.approvals) return { state, effects: none }
+      return { state: { ...state, approvals, lastEventAt: at }, effects: none }
     }
 
     case 'transfer/offered': {
@@ -911,7 +960,7 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
 }
 
 // ---------------------------------------------------------------------------
-// chat/echo（多端回显）
+// chat/echo（同一设备的其它窗口回显；协作语义已删除）
 // ---------------------------------------------------------------------------
 
 function applyEcho(
@@ -924,9 +973,6 @@ function applyEcho(
   const id = userMessageId(msgId)
   const existing = state.messages.find(message => message.id === id)
   const echoFiles = normalizeFileRefs(event.files)
-  const deviceId = typeof event.deviceId === 'string' && event.deviceId ? event.deviceId : undefined
-  // 自己的消息：本机 deviceId 已知时直接比；未知时沿用本地已有的 mine。
-  const mine = deviceId !== undefined && state.selfDeviceId !== undefined ? deviceId === state.selfDeviceId : existing?.mine ?? false
   const files = existing?.files && existing.files.length > 0
     ? // 自己上传的附件：本地 ref 带 uploadId/进度，比 echo 里的电脑端元信息更有用，保留本地的。
       existing.files.map(file => ({ ...file, uploadStatus: file.uploadStatus ?? 'done' }))
@@ -940,9 +986,7 @@ function applyEcho(
         state: 'sent',
         callId: typeof event.callId === 'string' ? event.callId : existing.callId,
         msgId,
-        speaker: typeof event.speaker === 'string' ? event.speaker : existing.speaker,
-        deviceId,
-        mine,
+        mine: true,
         files,
         at: existing.at,
       }
@@ -955,10 +999,7 @@ function applyEcho(
         msgId,
         callId: typeof event.callId === 'string' ? event.callId : undefined,
         state: 'sent',
-        speaker: typeof event.speaker === 'string' ? event.speaker : undefined,
-        sender: deviceId ? { deviceId, name: typeof event.speaker === 'string' && event.speaker ? event.speaker : deviceId } : undefined,
-        deviceId,
-        mine,
+        mine: true,
         files,
       }
   const messages = existing ? state.messages.map(item => (item.id === id ? message : item)) : [...state.messages, message]
@@ -1136,7 +1177,8 @@ function applySessionSnapshot(
     .map(item => messageFromSnapshot(item, at))
     .filter((message): message is ChatMessage => Boolean(message))
   const incomingIds = new Set(incoming.map(message => message.id))
-  const reset = event.reset === true
+  // 会话选择器刚切换过：这一份快照就是新会话的全部历史，必须整页替换。
+  const reset = event.reset === true || state.resetOnNextSnapshot === true
   let messages: ChatMessage[]
   if (reset) {
     messages = incoming
@@ -1180,20 +1222,21 @@ function applySessionSnapshot(
     ? event.sessionEpoch
     : state.sessionEpoch
   const head = typeof event.head === 'number' && Number.isFinite(event.head) ? Math.max(0, Math.floor(event.head)) : state.sessionCursor
-  const collaboration = typeof event.collaboration === 'boolean' ? event.collaboration : state.collaboration
   const activeCall = snapshot.activeCall
   let typing: ChatState['typing'] = reset ? null : state.typing
   if (activeCall && activeCall.typing === true && typeof activeCall.callId === 'string') {
     typing = { callId: activeCall.callId, active: true }
   }
-  const rebuilt = rebuildIndexes({ ...state, sessionId, sessionEpoch, collaboration }, messages)
+  const rebuilt = rebuildIndexes({ ...state, sessionId, sessionEpoch, resetOnNextSnapshot: false }, messages)
   // 进行中的回合：快照里带 activeCall 时把已生成的文本补成一条 streaming 消息，
   // 这样中途加入的设备也能看到“半个回答”，而不是等 done 才出现。
   let next: ChatState = rebuilt
   if (activeCall && typeof activeCall.callId === 'string' && typeof activeCall.text === 'string' && activeCall.text !== '') {
     next = patchAssistant(next, activeCall.callId, message => ({ ...message, text: activeCall.text as string, streaming: true }), at)
   }
-  return { ...next, sessionCursor: Math.max(state.sessionCursor, head), typing }
+  // 整页替换后游标要从 head 重新起算（不能沿用旧会话的游标）。
+  const sessionCursor = reset ? head : Math.max(state.sessionCursor, head)
+  return { ...next, sessionCursor, typing, approvals: reset ? [] : next.approvals }
 }
 
 /** 快照消息 → 本地消息（id 缺失时按协议约定推导，保证幂等）。 */
@@ -1222,7 +1265,6 @@ function messageFromSnapshot(item: SnapshotMessage, at: number): ChatMessage | u
     messageId,
     msgId,
     rid: msgId,
-    speaker: typeof item.speaker === 'string' ? item.speaker : undefined,
     files: normalizeFileRefs(item.files),
     state: kind === 'user' ? 'sent' : undefined,
     mine: kind === 'user' ? true : undefined,
@@ -1495,7 +1537,7 @@ function clearConversation(state: ChatState, at: number): ChatState {
     lastSeq: {},
     deltaBuffers: {},
     gapCount: 0,
-    participants: [],
+    approvals: [],
     uploads: {},
     sessionCursor: 0,
     lastEventAt: at,
@@ -1516,15 +1558,6 @@ function rebuildIndexes(state: ChatState, messages: ChatMessage[]): ChatState {
     if (message.messageId) messageIndex[message.messageId] = message.id
   }
   return { ...state, messages, callIndex, messageIndex, turnMessages }
-}
-
-/** 给用户消息补上 mine（本机 deviceId 晚于历史消息就绪时调用）。 */
-function applyOwnership(messages: ChatMessage[], deviceId: string): ChatMessage[] {
-  return messages.map(message => {
-    if (message.kind !== 'user') return message
-    if (message.deviceId) return { ...message, mine: message.deviceId === deviceId }
-    return message.mine === undefined ? { ...message, mine: true } : message
-  })
 }
 
 /** 把一批文件登记成可下载卡片；已有进度或已完成的条目不被元信息覆盖。 */
@@ -1567,26 +1600,6 @@ function upsertTransfer(state: ChatState, transfer: Omit<Transfer, 'updatedAt'>,
 function typingAfter(typing: ChatState['typing'], callId: string): ChatState['typing'] {
   if (!typing) return null
   return typing.callId === callId ? null : typing
-}
-
-function normalizeParticipants(list: unknown): Participant[] {
-  if (!Array.isArray(list)) return []
-  const out: Participant[] = []
-  const seen = new Set<string>()
-  for (const item of list) {
-    if (!item || typeof item !== 'object') continue
-    const raw = item as { deviceId?: unknown; name?: unknown; online?: unknown; deviceName?: unknown }
-    const deviceId = typeof raw.deviceId === 'string' ? raw.deviceId : ''
-    if (!deviceId || seen.has(deviceId)) continue
-    seen.add(deviceId)
-    const name = typeof raw.name === 'string' && raw.name
-      ? raw.name
-      : typeof raw.deviceName === 'string' && raw.deviceName
-        ? raw.deviceName
-        : deviceId
-    out.push({ deviceId, name, online: raw.online !== false })
-  }
-  return out
 }
 
 /** 事件里的 seq（用于 session/events 排序与去重）。 */

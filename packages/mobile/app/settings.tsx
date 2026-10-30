@@ -1,11 +1,14 @@
 // 全局设置 / 外观 / 关于 / 已知限制。
 //
-// 结构按 v2.2.0 的分组：连接 → 协作 → 外观 → 文件 → 高级（诊断）→ 关于。
+// 结构：本机设备 → 连接 → 外观 → 文件 → 高级（诊断）→ 已知限制 → 危险操作 → 关于。
 // 把限制写进 App 而不是只写在 README：用户看不到 README，而“为什么开不了机”
 // “为什么隧道地址会变”这类问题是必须要提前说清楚的。
+//
+// v2.3.0 起没有「协作」分组，也没有「我在对话里的昵称」：每台手机只驱动自己绑定的
+// 那个 DSH 会话，会话本身在聊天页的胶囊里切换。
 
 import { Stack, useRouter } from 'expo-router'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native'
 
 import { DEFAULT_CONNECTION_POLICY } from '../src/core/connection-policy.mts'
@@ -18,7 +21,6 @@ import type { AppStore, AssistantView } from '../src/state/app-store'
 import { useAppSnapshot, useAppStore } from '../src/state/store'
 import {
   Avatar,
-  AvatarBar,
   InlineBanner,
   KeyValue,
   ListRow,
@@ -36,7 +38,7 @@ import {
 import { font, radius, spacing, useTheme, useThemedStyles, type Theme } from '../src/ui/theme'
 
 /** 发版由 Lead 统一管理：这里与 app.json/package.json 的版本号保持一致。 */
-const APP_VERSION = '2.2.0'
+const APP_VERSION = '2.3.0'
 
 type AppearancePref = 'system' | 'light' | 'dark'
 type ConnectionMode = AssistantView['connectionMode']
@@ -68,18 +70,12 @@ export default function SettingsScreen() {
   const policy = snapshot.connectionPolicy ?? DEFAULT_CONNECTION_POLICY
   const appearance: AppearancePref = snapshot.appearance ?? 'system'
 
-  const [nickname, setNickname] = useState('')
   const [notice, setNotice] = useState<Notice | undefined>()
-  const [collabBusyId, setCollabBusyId] = useState<string | undefined>()
 
   const [manualAddress, setManualAddress] = useState('')
   const [probing, setProbing] = useState(false)
   const [probe, setProbe] = useState<ProbeResult | undefined>()
   const [connecting, setConnecting] = useState(false)
-
-  useEffect(() => {
-    void store.getMyNickname().then(value => setNickname(prev => (prev === '' ? value : prev)))
-  }, [store])
 
   const changeAllModes = async (mode: ConnectionMode) => {
     if (snapshot.assistants.length === 0) return
@@ -87,25 +83,6 @@ export default function SettingsScreen() {
       await store.setConnectionMode(view.assistant.id, mode)
     }
     showToast(`已把 ${snapshot.assistants.length} 台电脑切换为「${CONNECTION_MODE_OPTIONS.find(option => option.value === mode)?.label ?? mode}」`, 'success')
-  }
-
-  const saveNickname = async () => {
-    await store.setMyNickname(undefined, nickname)
-    showToast(nickname.trim() ? '昵称已保存（应用到所有电脑）' : '昵称已清空', 'success')
-  }
-
-  const toggleCollaboration = async (assistantId: string, value: boolean) => {
-    setCollabBusyId(assistantId)
-    try {
-      const result = await store.setCollaboration(assistantId, value)
-      if (!result.ok) {
-        setNotice({ tone: 'warning', title: '协作模式没有切换', text: [result.error ?? '电脑端暂不支持协作模式', result.hint].filter(Boolean).join('\n') })
-      }
-    } catch (error) {
-      setNotice({ tone: 'error', text: `切换协作模式失败：${(error as Error).message}` })
-    } finally {
-      setCollabBusyId(undefined)
-    }
   }
 
   const runProbe = async () => {
@@ -181,8 +158,6 @@ export default function SettingsScreen() {
       },
     ])
   }
-
-  const collaborating = snapshot.assistants.filter(view => view.collaboration && view.participants.length > 0)
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
@@ -280,51 +255,6 @@ export default function SettingsScreen() {
           </View>
         ) : null}
         <Muted style={styles.hint}>地址必须和某台已绑定的电脑对得上（按电脑 ID 匹配），未绑定的电脑仍需先扫码完成绑定。</Muted>
-      </SectionCard>
-
-      {/* 协作 ------------------------------------------------------------- */}
-      <SectionTitle>协作</SectionTitle>
-      <SectionCard
-        title="协作模式"
-        subtitle="打开后，同一会话里的其他人也能看到并回复。会话级开关，只影响对应的电脑。"
-      >
-        {snapshot.assistants.length === 0 ? (
-          <Muted style={styles.hint}>绑定电脑后可以在这里切换协作模式。</Muted>
-        ) : (
-          snapshot.assistants.map(view => (
-            <SwitchRow
-              key={view.assistant.id}
-              label={view.assistant.name}
-              description={view.link.online ? '切换后电脑端会广播给同一会话的所有设备。' : '连上电脑后才能切换。'}
-              value={view.collaboration}
-              onValueChange={value => void toggleCollaboration(view.assistant.id, value)}
-              disabled={!view.link.online || collabBusyId === view.assistant.id}
-            />
-          ))
-        )}
-        {collaborating.length > 0 ? (
-          <View style={styles.participantsBlock}>
-            <Text style={styles.fieldLabel}>当前参与者</Text>
-            {collaborating.map(view => (
-              <View key={view.assistant.id} style={styles.participantGroup}>
-                <Text style={styles.participantGroupLabel}>{view.assistant.name}</Text>
-                <AvatarBar people={view.participants} />
-              </View>
-            ))}
-          </View>
-        ) : null}
-      </SectionCard>
-
-      <SectionCard title="我的昵称" subtitle="协作时你的每条消息都会带这个昵称，方便区分谁在说话。">
-        <TextInput
-          value={nickname}
-          onChangeText={setNickname}
-          placeholder="例如“小明”；留空则用设备默认名"
-          placeholderTextColor={theme.colors.textFaint}
-          style={styles.input}
-          maxLength={24}
-        />
-        <PrimaryButton label="保存昵称（应用到所有电脑）" onPress={() => void saveNickname()} />
       </SectionCard>
 
       {/* 外观 ------------------------------------------------------------- */}
@@ -431,7 +361,6 @@ const createSettingsStyles = (theme: Theme) =>
     screen: { flex: 1, backgroundColor: theme.colors.background },
     content: { padding: spacing.lg, paddingBottom: spacing.xxxl },
     hint: { lineHeight: 18, marginTop: spacing.sm },
-    fieldLabel: { color: theme.colors.text, fontSize: font.small, fontWeight: '600', marginBottom: spacing.xs },
     input: {
       minHeight: 46,
       paddingHorizontal: spacing.md,
@@ -447,9 +376,6 @@ const createSettingsStyles = (theme: Theme) =>
     probeBox: { marginTop: spacing.md, padding: spacing.md, borderRadius: radius.md, backgroundColor: theme.colors.surfaceAlt },
     probeTitle: { color: theme.colors.text, fontWeight: '700', fontSize: font.small },
     probeLine: { color: theme.colors.textMuted, fontSize: font.tiny, lineHeight: 17, marginTop: 4 },
-    participantsBlock: { marginTop: spacing.md },
-    participantGroup: { marginBottom: spacing.sm },
-    participantGroupLabel: { color: theme.colors.textMuted, fontSize: font.tiny, marginBottom: 2 },
     limitTitle: { color: theme.colors.text, fontSize: font.small, fontWeight: '700', marginTop: spacing.md },
     footer: { marginTop: spacing.xl, alignItems: 'center' },
     footerText: { color: theme.colors.textFaint, fontSize: font.tiny, textAlign: 'center', lineHeight: 17 },

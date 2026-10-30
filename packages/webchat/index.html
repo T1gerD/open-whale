@@ -133,7 +133,16 @@
             </div>
           </div>
           <div class="chat-header-actions">
-            <div class="participants" id="participants" aria-label="会话参与者"></div>
+            <!-- 会话胶囊：显示当前 DSH 会话标题，点开是会话列表（切换 / 新建） -->
+            <button class="session-chip" type="button" id="session-chip" aria-haspopup="dialog" aria-controls="session-sheet">
+              <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
+                <path d="M5 7.5h14M5 12h14M5 16.5h9" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
+              </svg>
+              <span class="session-chip-label" id="session-chip-label">会话</span>
+              <svg viewBox="0 0 24 24" class="icon session-chip-caret" aria-hidden="true" focusable="false">
+                <path d="M8 10l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
             <button class="icon-btn" type="button" id="menu-btn" aria-label="打开菜单" aria-haspopup="dialog">
               <svg viewBox="0 0 24 24" class="icon" aria-hidden="true" focusable="false">
                 <circle cx="5" cy="12" r="1.7" fill="currentColor" />
@@ -201,6 +210,7 @@
       <!-- ================= 通用弹层 ================= -->
       <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
       <div class="sheet" id="settings-sheet" role="dialog" aria-modal="true" aria-label="设置" hidden></div>
+      <div class="sheet session-sheet" id="session-sheet" role="dialog" aria-modal="true" aria-label="会话列表" hidden></div>
       <div class="dialog" id="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" hidden>
         <h2 class="dialog-title" id="dialog-title"></h2>
         <p class="dialog-body" id="dialog-body"></p>

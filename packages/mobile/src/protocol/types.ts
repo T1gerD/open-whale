@@ -46,15 +46,15 @@ export interface HelloFrame {
   capabilities?: string[]
   /** 已应用到的会话事件序号（断点续传）。 */
   cursor?: number
-  /** 客户端认为自己在的会话 id（检测协作模式切换）。 */
+  /** 客户端认为自己在的会话 id（检测电脑端换了绑定会话）。 */
   sessionId?: string
 }
 
 export interface HelloAckFrame {
   t: 'hello/ack'
-  /** 协议版本（2.2.0 仍是 '1.1.0'）。 */
+  /** 协议版本（2.3.0 是 '1.2.0'）。 */
   version: string
-  /** 插件版本（例如 '2.2.0'）；展示用，缺失时回退 version。 */
+  /** 插件版本（例如 '2.3.0'）；展示用，缺失时回退 version。 */
   serverVersion?: string
   computerId: string
   computerName: string
@@ -69,12 +69,11 @@ export interface HelloAckFrame {
   endpoints?: string[]
   /** 电脑端理解的能力。 */
   capabilities?: string[]
-  /** 当前会话 id / 纪元（协作模式切换会变）。 */
+  /** 当前会话 id / 纪元（会话选择器切换时会变）。 */
   sessionId?: string
   sessionEpoch?: number
   /** 电脑端事件日志最大 seq（0 = 只能用快照）。 */
   eventCursor?: number
-  collaboration?: boolean
   connectionMode?: string
   /** 带网络类型的地址列表（2.2.0）。 */
   endpointList?: Array<{ url: string; kind?: string }>
@@ -118,7 +117,6 @@ export interface ChatSendFrame {
   /** 电脑端优先取 callId，取不到才回落到 rid；两个都发最稳。 */
   callId: string
   text: string
-  speaker?: string
   files?: ChatSendFile[]
 }
 
@@ -195,6 +193,10 @@ export interface ChatEchoFrame {
   rid?: string
   callId?: string
   deviceId: string
+  /**
+   * 老协议里是发送者昵称。2.3.0 删掉了协作与昵称，手机端**不再读取/显示**它；
+   * 字段留着只为镜像冻结的 protocol typedef（对端可能还带）。
+   */
   speaker?: string
   text: string
   files?: ChatEchoFile[]
@@ -219,7 +221,6 @@ export interface SessionSnapshotMessage {
   at: string
   callId?: string
   msgId?: string
-  speaker?: string
   files?: ChatEchoFile[]
 }
 
@@ -227,13 +228,14 @@ export interface SessionSnapshotMessage {
 export interface SessionStateFrame {
   t: 'session/state'
   sessionId: string
+  /** 会话标题（会话选择器也显示它）。 */
+  title?: string
   sessionEpoch: number
   head: number
   snapshot: {
     messages: SessionSnapshotMessage[]
     activeCall?: { callId: string; text: string; typing: boolean }
   }
-  collaboration: boolean
 }
 
 /** 断线追赶：seq > cursor 的持久事件回放。 */
@@ -256,18 +258,86 @@ export interface ChatToolFrame {
   seq?: number
 }
 
-export interface ParticipantsFrame {
-  t: 'session/participants'
-  sessionId: string
-  collaboration: boolean
-  participants: Array<{ deviceId: string; name: string; online: boolean; deviceName?: string }>
+/** 电脑上的一个 DSH 会话（会话选择器的一行）。 */
+export interface SessionSummary {
+  id: string
+  /** 日志里的标题；没有标题时电脑端给「新会话」这类兜底文案。 */
+  title: string
+  cwd?: string
+  /** Unix 毫秒。 */
+  createdAt: number
+  /** Unix 毫秒；电脑端拿不到时省略。 */
+  updatedAt?: number
+  /** 电脑上现在有 agent 在跑。 */
+  live: boolean
+  /** 这台手机当前绑定的那个会话。 */
+  current?: boolean
 }
 
-export interface CollabStateFrame {
-  t: 'collab/state'
-  on: boolean
+/** `session/list` 的回复。 */
+export interface SessionsFrame {
+  t: 'sessions'
+  rid?: string
+  current?: string
+  sessions: SessionSummary[]
+  truncated?: boolean
+}
+
+/** `session/select` / `session/create` 的结果；成功后紧跟一条 `session/state`。 */
+export interface SessionSelectedFrame {
+  t: 'session/selected'
+  rid?: string
+  ok: boolean
+  sessionId?: string
+  title?: string
+  sessionEpoch?: number
+  error?: string
+  message?: string
+}
+
+/** 一条转发到手机的 DSH 权限请求。 */
+export interface ApprovalAskFrame {
+  t: 'approval/ask'
+  approvalId: string
+  toolName: string
+  /** 电脑端记录的机器原因。 */
+  reason?: string
+  /** 本地化文案（至少有 `en`）。 */
+  displayReason?: { en: string; [locale: string]: string }
+  callId?: string
+  /** Unix 毫秒：到点电脑端把提示交回桌面。 */
+  expiresAt: number
+}
+
+/** 那条请求已经被处理（手机/电脑/超时）。 */
+export interface ApprovalResolvedFrame {
+  t: 'approval/resolved'
+  approvalId: string
+  outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+  source?: 'phone' | 'desktop' | 'timeout' | 'cancelled'
+}
+
+export interface SessionListFrame {
+  t: 'session/list'
+  rid: string
+}
+
+export interface SessionSelectFrame {
+  t: 'session/select'
+  rid: string
   sessionId: string
-  sessionEpoch: number
+}
+
+export interface SessionCreateFrame {
+  t: 'session/create'
+  rid: string
+}
+
+/** 手机对一条权限请求的答复（只允许这两种结果）。 */
+export interface ApprovalReplyFrame {
+  t: 'approval/reply'
+  approvalId: string
+  outcome: 'allowed-once' | 'rejected'
 }
 
 export interface FileOfferFrame {
@@ -355,12 +425,6 @@ export interface UploadCancelFrame {
   uploadId: string
 }
 
-export interface CollabSetFrame {
-  t: 'collab/set'
-  rid: string
-  on: boolean
-}
-
 export interface UploadReadyFrame {
   t: 'upload/ready'
   uploadId: string
@@ -401,7 +465,7 @@ export interface AssistantRenameFrame {
 
 export interface DeviceRenameFrame {
   t: 'device/rename'
-  /** 我在这台电脑上的昵称；多人协作时消息前缀用它。 */
+  /** 我在这台电脑上的显示名（设置页的设备名）。 */
   label: string
 }
 
@@ -453,8 +517,10 @@ export type ServerFrame =
   | ChatMessageFrame
   | SessionStateFrame
   | SessionEventsFrame
-  | ParticipantsFrame
-  | CollabStateFrame
+  | SessionsFrame
+  | SessionSelectedFrame
+  | ApprovalAskFrame
+  | ApprovalResolvedFrame
   | UploadReadyFrame
   | UploadProgressFrame
   | UploadDoneFrame
@@ -474,11 +540,14 @@ export type ClientFrame =
   | DeviceForgetFrame
   | PowerRequestFrame
   | SessionSyncFrame
+  | SessionListFrame
+  | SessionSelectFrame
+  | SessionCreateFrame
+  | ApprovalReplyFrame
   | UploadStartFrame
   | UploadChunkFrame
   | UploadEndFrame
   | UploadCancelFrame
-  | CollabSetFrame
 
 /** 连接状态（UI 直接渲染）。 */
 export type LinkStatus = 'idle' | 'connecting' | 'handshaking' | 'online' | 'reconnecting' | 'offline' | 'failed'
@@ -508,8 +577,6 @@ export interface LinkSnapshot {
   sessionEpoch?: number
   /** 电脑端事件日志 head。 */
   eventCursor?: number
-  /** 协作模式是否开启。 */
-  collaboration?: boolean
   /** 电脑端报告的连接方式偏好。 */
   serverConnectionMode?: string
 }

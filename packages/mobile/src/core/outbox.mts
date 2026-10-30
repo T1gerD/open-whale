@@ -37,8 +37,6 @@ export interface OutboxEntry {
   text: string
   /** 电脑端幂等键；老实现缺省时回落到 rid。 */
   msgId?: string
-  /** 协作模式下发送者昵称（电脑端据此在别的设备上显示是谁发的）。 */
-  speaker?: string
   files?: OutboxFile[]
   /** 已经上传完成的附件（重发时直接引用 uploadId，不重复上传）。 */
   uploads?: OutboxUploadRef[]
@@ -257,7 +255,6 @@ function normalizeEntry(entry: Partial<OutboxEntry> & { rid: string; text: strin
     callId: typeof entry.callId === 'string' ? entry.callId : entry.rid,
     text: entry.text,
     msgId: typeof entry.msgId === 'string' ? entry.msgId : undefined,
-    speaker: typeof entry.speaker === 'string' ? entry.speaker : undefined,
     files: Array.isArray(entry.files) ? entry.files : undefined,
     uploads: Array.isArray(entry.uploads) ? entry.uploads : undefined,
     createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now(),

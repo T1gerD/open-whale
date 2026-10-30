@@ -5,6 +5,8 @@
 //  * `chat/tool` 折成的**小活动行**（永远不是助理的正文）；
 //  * 文件卡片（点击落盘并交给系统打开）；附件上传进度；
 //  * 发送中 / 失败 / 需要重发的状态；
+//  * 会话胶囊（打开电脑上的会话列表，选中/新建后整页替换消息）；
+//  * 权限请求卡片（输入栏上方，多条排队，倒计时到点自动消失）；
 //  * 长按气泡弹 ActionSheet：复制、重新发送、删除；代码块长按只复制代码。
 //
 // 所有状态变化都来自 core/reducer.mts，组件里没有业务判断。
@@ -15,6 +17,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   FlatList,
+  Keyboard,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -25,17 +28,18 @@ import {
 } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
+import { approvalAvailability, approvalRemainingMs } from '../../../src/core/approvals.mts'
 import { endpointKindLabel } from '../../../src/core/endpoint.mts'
 import { describeTransfer, formatBytes, transferProgress } from '../../../src/core/files.mts'
 import { formatCountdown } from '../../../src/core/power.mts'
 import type { ChatMessage, Transfer } from '../../../src/core/reducer.mts'
+import { sessionAvailability, sessionTitleOf } from '../../../src/core/sessions.mts'
 import { pickAttachment, type PickedAttachment } from '../../../src/services/attachments'
 import type { AssistantView } from '../../../src/state/app-store'
 import { useAppStore, useAssistantView } from '../../../src/state/store'
+import { ApprovalCard } from '../../../src/ui/approval-card'
 import {
   ActionSheet,
-  Avatar,
-  AvatarBar,
   Chip,
   EmptyState,
   InlineBanner,
@@ -47,7 +51,16 @@ import {
   useToast,
   type ActionSheetOption,
 } from '../../../src/ui/components'
+import { SessionPickerSheet } from '../../../src/ui/session-picker'
 import { font, radius, spacing, useTheme, useThemedStyles, type Theme } from '../../../src/ui/theme'
+
+/**
+ * Stack 标题栏的内容高度（不含状态栏）。
+ * `keyboardVerticalOffset` 需要的是「屏幕顶 → 输入栏容器顶」的距离，也就是
+ * 状态栏 + 标题栏；RN 的 KeyboardAvoidingView 用它把键盘的窗口坐标换算成容器坐标。
+ * 和 @react-navigation 的默认值保持一致（Android 56 / iOS 44），不引新依赖去读它。
+ */
+const HEADER_CONTENT_HEIGHT = Platform.OS === 'android' ? 56 : 44
 
 export default function ChatScreen() {
   const params = useLocalSearchParams<{ id?: string }>()
@@ -67,6 +80,10 @@ export default function ChatScreen() {
   const [sheetMessage, setSheetMessage] = useState<ChatMessage | undefined>()
   const [sending, setSending] = useState(false)
   const [showJump, setShowJump] = useState(false)
+  const [showSessions, setShowSessions] = useState(false)
+  const [sessionBusy, setSessionBusy] = useState(false)
+  const [sessionError, setSessionError] = useState<string | undefined>()
+  const [keyboardShown, setKeyboardShown] = useState(false)
 
   const listRef = useRef<FlatList<ChatRow> | null>(null)
   // 首屏消息异步从数据库读出、FlatList 又虚拟化：只靠 onContentSizeChange 会停在半途。
@@ -81,6 +98,30 @@ export default function ChatScreen() {
   const transfers = view?.chat.transfers ?? {}
   const rows = useMemo(() => buildRows(messages), [messages])
   const streaming = Boolean(view?.chat.typing?.active) || messages.some(message => message.streaming === true)
+
+  // ---- 2.3.0：会话选择器 / 权限请求 ----
+  const sessions = view?.sessions
+  const approvals = view?.approvals ?? []
+  // 多条待答请求按队列显示：先显示最早的一条，其余用一行字提示，绝不互相覆盖。
+  const pendingApproval = approvals[0]
+  const sessionLabel = sessionTitleOf(sessions, view?.chat.sessionId) ?? (view?.chat.sessionId ? '当前会话' : '选择会话')
+  // 离线 / 电脑端没有 sessions-v1：面板里的行与「新建会话」都禁用，并明说原因。
+  const sessionGate = sessionAvailability(view?.link.online === true, view?.link.capabilities)
+  const sessionsDisabledHint = sessionGate.ok ? undefined : `${sessionGate.error}\n${sessionGate.hint}`
+  // 「屏幕顶 → 输入栏容器顶」的距离 = 状态栏 + 标题栏。Android 上窗口是 edge-to-edge 的，
+  // 没有这段偏移，KeyboardAvoidingView 会把键盘高度算少一个标题栏，输入栏就被盖住。
+  const keyboardOffset = insets.top + HEADER_CONTENT_HEIGHT
+
+  // 键盘是否弹起：占满可见区域时，只有键盘收起才需要让出 insets.bottom，
+  // 否则输入栏会被「导航栏 + 键盘」双重留白顶高一截。
+  useEffect(() => {
+    const shown = Keyboard.addListener('keyboardDidShow', () => setKeyboardShown(true))
+    const hidden = Keyboard.addListener('keyboardDidHide', () => setKeyboardShown(false))
+    return () => {
+      shown.remove()
+      hidden.remove()
+    }
+  }, [])
 
   // 进入会话就先清零；离开时只记状态（未读由收到的消息重新累计）。
   useFocusEffect(
@@ -248,6 +289,92 @@ export default function ChatScreen() {
     setShowJump(distance > 240)
   }, [])
 
+  // ---- 会话选择器 ---------------------------------------------------------
+
+  /** 拉一次会话列表；离线/电脑端太旧时不发帧，直接把原因显示在面板里。 */
+  const loadSessions = useCallback(
+    (force: boolean) => {
+      if (!view || !assistantId) return
+      setSessionError(undefined)
+      const gate = sessionAvailability(view.link.online, view.link.capabilities)
+      if (!gate.ok) {
+        setSessionError(`${gate.error}\n${gate.hint}`)
+        return
+      }
+      if (!force && view.chat.sessionList) return
+      setSessionBusy(true)
+      void store
+        .listSessions(assistantId)
+        .then(result => {
+          setSessionBusy(false)
+          if (!result.ok) setSessionError([result.error, result.hint].filter(Boolean).join('\n'))
+        })
+        .catch((error: Error) => {
+          setSessionBusy(false)
+          setSessionError(`读取会话列表失败：${error.message}`)
+        })
+    },
+    [assistantId, store, view],
+  )
+
+  const openSessions = useCallback(() => {
+    setShowSessions(true)
+    loadSessions(false)
+  }, [loadSessions])
+
+  /** 选中一个会话：面板先关掉，聊天页会显示「正在打开…」并在快照到达后整页替换。 */
+  const chooseSession = useCallback(
+    (sessionId: string) => {
+      if (!assistantId) return
+      setShowSessions(false)
+      setSessionError(undefined)
+      void store
+        .selectSession(assistantId, sessionId)
+        .then(result => {
+          if (!result.ok) {
+            setSessionError([result.error, result.hint].filter(Boolean).join('\n'))
+            setShowSessions(true)
+          }
+        })
+        .catch((error: Error) => setNotice(`切换会话失败：${error.message}`))
+    },
+    [assistantId, store],
+  )
+
+  const createSession = useCallback(() => {
+    if (!assistantId) return
+    setShowSessions(false)
+    setSessionError(undefined)
+    void store
+      .createSession(assistantId)
+      .then(result => {
+        if (!result.ok) {
+          setSessionError([result.error, result.hint].filter(Boolean).join('\n'))
+          setShowSessions(true)
+        }
+      })
+      .catch((error: Error) => setNotice(`新建会话失败：${error.message}`))
+  }, [assistantId, store])
+
+  // ---- 权限请求 -----------------------------------------------------------
+
+  /**
+   * 回答一条请求。成功发送后立刻撤掉卡片（电脑端的 `approval/resolved` 到达时是幂等的），
+   * 失败则把原因原样说清楚——绝不假装已经作答。
+   */
+  const answerApproval = useCallback(
+    (approvalId: string, outcome: 'allowed-once' | 'rejected') => {
+      if (!assistantId) return
+      const gate = approvalAvailability(view?.link.online === true, view?.link.capabilities)
+      if (!gate.ok) {
+        setNotice(`${gate.error}${gate.hint ? `\n${gate.hint}` : ''}`)
+        return
+      }
+      const result = store.replyApproval(assistantId, approvalId, outcome)
+      if (!result.sent) setNotice(result.error ?? '没能把答复发出去，请重试')
+    },
+    [assistantId, store, view],
+  )
   if (!view || !controller) {
     return (
       <View style={styles.screen}>
@@ -257,22 +384,11 @@ export default function ChatScreen() {
     )
   }
 
-  const { assistant, link, power, participants, collaboration } = view
-  const onlineCount = participants.filter(person => person.online).length
+  const { assistant, link, power } = view
   const settingsHref = `/assistant/${assistantId}/settings`
 
   const listHeader = (
     <View style={styles.listHeader}>
-      {collaboration ? (
-        <View style={styles.participantsCard}>
-          <View style={styles.participantsHead}>
-            <Text style={styles.participantsLabel}>协作中</Text>
-            <Chip label={`${onlineCount}/${participants.length} 人在线`} tone={onlineCount > 0 ? 'success' : 'neutral'} />
-          </View>
-          <AvatarBar people={participants} />
-        </View>
-      ) : null}
-
       {link.status !== 'online' ? (
         <>
           <InlineBanner
@@ -311,10 +427,14 @@ export default function ChatScreen() {
   )
 
   return (
+    // 聊天页必须正好占满可见区域：
+    //  * iOS 用 padding（内容被顶起，底部不被键盘盖住）；
+    //  * Android 用 height（edge-to-edge 下窗口不再自己 resize，必须由它压高度）；
+    //  * offset = 状态栏 + 标题栏，否则键盘高度会算少一段，输入栏仍会被盖住。
     <KeyboardAvoidingView
       style={styles.screen}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      keyboardVerticalOffset={Platform.OS === 'ios' ? 96 : 0}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={keyboardOffset}
     >
       <Stack.Screen
         options={{
@@ -412,7 +532,46 @@ export default function ChatScreen() {
         </Pressable>
       ) : null}
 
-      <View style={[styles.composerWrap, { backgroundColor: theme.colors.composer }, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}>
+      <View style={[styles.composerWrap, { backgroundColor: theme.colors.composer }, { paddingBottom: keyboardShown ? spacing.sm : Math.max(insets.bottom, spacing.sm) }]}>
+        {/* 会话胶囊：随时能看/换电脑上的会话，不用翻设置页。 */}
+        <View style={styles.sessionBar}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="切换会话"
+            onPress={openSessions}
+            hitSlop={6}
+            style={({ pressed }) => [
+              styles.sessionChip,
+              { backgroundColor: theme.colors.surfaceAlt, borderColor: theme.colors.border },
+              pressed && styles.pressed,
+            ]}
+          >
+            <Text style={styles.sessionGlyph}>🗂</Text>
+            <Text style={[styles.sessionLabel, { color: theme.colors.textSecondary }]} numberOfLines={1}>
+              {sessionLabel}
+            </Text>
+            <Text style={[styles.sessionChevron, { color: theme.colors.textMuted }]}>▾</Text>
+          </Pressable>
+          {sessions?.truncated ? <Chip label="仅最近" /> : null}
+          {link.online ? null : <Chip label="离线" tone="warning" />}
+        </View>
+
+        {/* 权限请求：多条排队，只有第一条展开（其余先计数），绝不互相覆盖。 */}
+        {pendingApproval ? (
+          <View style={styles.approvalWrap}>
+            <ApprovalCard
+              prompt={pendingApproval}
+              remainingMs={approvalRemainingMs(pendingApproval)}
+              disabled={!link.online}
+              onAllow={() => answerApproval(pendingApproval.approvalId, 'allowed-once')}
+              onReject={() => answerApproval(pendingApproval.approvalId, 'rejected')}
+            />
+            {approvals.length > 1 ? (
+              <Text style={styles.moreApprovals}>还有 {approvals.length - 1} 条请求在排队，处理完这条后显示。</Text>
+            ) : null}
+          </View>
+        ) : null}
+
         {attachment ? (
           <View style={styles.attachmentPreview}>
             <View style={[styles.attachmentGlyph, { backgroundColor: theme.colors.accentSoft }]}>
@@ -500,6 +659,18 @@ export default function ChatScreen() {
         options={sheetOptions}
         onClose={closeSheet}
       />
+      <SessionPickerSheet
+        visible={showSessions}
+        list={sessions}
+        currentId={view.chat.sessionId}
+        loading={sessionBusy}
+        error={sessionError}
+        disabledHint={sessionsDisabledHint}
+        onClose={() => setShowSessions(false)}
+        onRefresh={() => loadSessions(true)}
+        onSelect={chooseSession}
+        onCreate={createSession}
+      />
       <Toast message={toast?.message} tone={toast?.tone} />
     </KeyboardAvoidingView>
   )
@@ -519,7 +690,6 @@ type ChatRow =
       groupStart: boolean
       groupEnd: boolean
       showAvatar: boolean
-      senderName?: string
     }
 
 const GROUP_GAP_MS = 3 * 60_000
@@ -528,12 +698,8 @@ const SEPARATOR_GAP_MS = 10 * 60_000
 function sameSender(previous: ChatMessage, current: ChatMessage): boolean {
   if (previous.kind !== current.kind) return false
   if (current.kind === 'system') return false
-  const previousMine = previous.mine !== false
-  const currentMine = current.mine !== false
-  if (previousMine !== currentMine) return false
-  const previousSender = previous.sender?.deviceId ?? ''
-  const currentSender = current.sender?.deviceId ?? ''
-  return previousSender === currentSender
+  // v2.3.0 起不存在“他人消息”：只按“我发的 / 助手说的”分组即可。
+  return (previous.kind === 'user') === (current.kind === 'user')
 }
 
 function buildRows(messages: ChatMessage[]): ChatRow[] {
@@ -549,16 +715,14 @@ function buildRows(messages: ChatMessage[]): ChatRow[] {
     if (!previous || gap > SEPARATOR_GAP_MS || dateChanged) {
       rows.push({ kind: 'time', key: `time-${message.id}`, label: formatSeparator(message.at) })
     }
-    const mine = message.kind === 'user' ? message.mine !== false : false
     rows.push({
       kind: 'message',
       key: message.id,
       message,
-      mine,
+      mine: message.kind === 'user',
       groupStart,
       groupEnd,
       showAvatar: groupStart,
-      senderName: message.kind === 'user' && !mine && groupStart ? message.sender?.name ?? message.speaker ?? '伙伴' : undefined,
     })
   })
   return rows
@@ -599,7 +763,7 @@ function MessageRow({
 }) {
   const theme = useTheme()
   const styles = useThemedStyles(createChatStyles)
-  const { message, mine, groupStart, showAvatar, senderName } = row
+  const { message, mine, groupStart, showAvatar } = row
 
   if (message.kind === 'system') {
     return (
@@ -627,20 +791,15 @@ function MessageRow({
     <View style={[styles.messageRow, mine ? styles.messageRowMine : styles.messageRowOther, !groupStart && styles.messageRowTight]}>
       {!mine ? (
         showAvatar ? (
-          message.kind === 'assistant' ? (
-            <View style={[styles.aiAvatar, { backgroundColor: theme.colors.accentSoft }]}>
-              <Text style={[styles.aiAvatarText, { color: theme.colors.accent }]}>✦</Text>
-            </View>
-          ) : (
-            <Avatar name={senderName ?? '伙伴'} size={30} />
-          )
+          <View style={[styles.aiAvatar, { backgroundColor: theme.colors.accentSoft }]}>
+            <Text style={[styles.aiAvatarText, { color: theme.colors.accent }]}>✦</Text>
+          </View>
         ) : (
           <View style={styles.avatarSpacer} />
         )
       ) : null}
 
       <View style={[styles.bubbleColumn, mine ? styles.bubbleColumnMine : null]}>
-        {senderName ? <Text style={styles.senderName}>{senderName}</Text> : null}
         <Pressable
           onLongPress={() => onLongPress(message)}
           delayLongPress={320}
@@ -899,19 +1058,10 @@ const createChatStyles = (theme: Theme) =>
     headerTitle: { color: theme.colors.text, fontSize: font.callout + 1, fontWeight: '700' },
     headerSubtitle: { color: theme.colors.textMuted, fontSize: font.tiny, marginTop: 1 },
     headerLink: { fontSize: font.body, paddingHorizontal: spacing.sm, fontWeight: '500' },
+    // 列表底部只留一点呼吸感：输入栏自己占位（它下面的 insets.bottom 只在输入栏里用），
+    // 这里再加 insets.bottom 会让最后一条消息离输入栏空出一大截。
     list: { paddingHorizontal: spacing.lg, paddingTop: spacing.sm, paddingBottom: spacing.md },
     listHeader: { paddingTop: spacing.sm },
-    participantsCard: {
-      backgroundColor: theme.colors.surface,
-      borderRadius: radius.md,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: theme.colors.border,
-      paddingHorizontal: spacing.md,
-      paddingVertical: spacing.sm,
-      marginBottom: spacing.md,
-    },
-    participantsHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-    participantsLabel: { color: theme.colors.textMuted, fontSize: font.tiny, fontWeight: '600', letterSpacing: 0.8 },
     quickLink: { alignSelf: 'flex-start', marginTop: -spacing.xs, marginBottom: spacing.md, paddingVertical: spacing.xs },
     quickLinkText: { fontSize: font.tiny, fontWeight: '600' },
 
@@ -929,7 +1079,6 @@ const createChatStyles = (theme: Theme) =>
     avatarSpacer: { width: 30 },
     bubbleColumn: { maxWidth: '82%' },
     bubbleColumnMine: { alignItems: 'flex-end' },
-    senderName: { color: theme.colors.textMuted, fontSize: font.tiny, marginBottom: 3, marginLeft: spacing.xs },
     bubble: { borderRadius: radius.lg, paddingHorizontal: spacing.md + 2, paddingVertical: spacing.sm + 1 },
     bubbleBare: { gap: spacing.xs },
     bubbleMine: { backgroundColor: theme.colors.bubbleUser },
@@ -1000,6 +1149,22 @@ const createChatStyles = (theme: Theme) =>
       gap: spacing.sm,
       ...theme.shadow.composer,
     },
+    sessionBar: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs },
+    sessionChip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.xs,
+      maxWidth: '78%',
+      borderRadius: radius.pill,
+      borderWidth: StyleSheet.hairlineWidth,
+      paddingHorizontal: spacing.md,
+      paddingVertical: 5,
+    },
+    sessionGlyph: { fontSize: font.tiny },
+    sessionLabel: { fontSize: font.tiny, fontWeight: '600', flexShrink: 1 },
+    sessionChevron: { fontSize: font.tiny },
+    approvalWrap: { gap: 2 },
+    moreApprovals: { color: theme.colors.textMuted, fontSize: font.tiny, lineHeight: 16, marginBottom: spacing.xs },
     composerRow: { flexDirection: 'row', alignItems: 'flex-end', gap: spacing.sm },
     composerIcon: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
     composerIconGlyph: { fontSize: 17 },

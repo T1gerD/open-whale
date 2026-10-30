@@ -125,7 +125,7 @@ function AssistantCard({
 }) {
   const theme = useTheme()
   const styles = useThemedStyles(createListStyles)
-  const { assistant, link, pendingMessages, activeTransfers, unread } = view
+  const { assistant, link, pendingMessages, activeTransfers, unread, approvals } = view
   const status = describeStatus(view)
   const preview = lastMessagePreview(view)
   const endpointKind = link.endpointKind ? endpointKindLabel(link.endpointKind) : undefined
@@ -176,8 +176,9 @@ function AssistantCard({
           </Text>
         ) : null}
 
-        {pendingMessages > 0 || activeTransfers > 0 ? (
+        {approvals.length > 0 || pendingMessages > 0 || activeTransfers > 0 ? (
           <View style={styles.badges}>
+            {approvals.length > 0 ? <Chip label={`${approvals.length} 条权限待确认`} tone="warning" /> : null}
             {pendingMessages > 0 ? <Chip label={`${pendingMessages} 条待发送`} tone="warning" /> : null}
             {activeTransfers > 0 ? <Chip label={`${activeTransfers} 个文件传输中`} tone="accent" /> : null}
           </View>
@@ -224,7 +225,7 @@ function describeStatus(view: AssistantView): { label: string; tone: StatusTone 
   }
 }
 
-/** 最近一条消息的一句话预览（用户消息带“我/昵称”前缀）。 */
+/** 最近一条消息的一句话预览。 */
 function lastMessagePreview(view: AssistantView): string | undefined {
   const messages = view.chat.messages
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -238,9 +239,9 @@ function lastMessagePreview(view: AssistantView): string | undefined {
       continue
     }
     if (message.kind === 'user') {
-      const who = message.mine === false && message.sender ? message.sender.name : '我'
-      if (text) return `${who}：${text.slice(0, 80)}`
-      if (file) return `${who}发来附件：${file.name}`
+      // v2.3.0 起没有协作，用户消息永远是本机发的。
+      if (text) return `我：${text.slice(0, 80)}`
+      if (file) return `我发来附件：${file.name}`
       continue
     }
     if (text) return text

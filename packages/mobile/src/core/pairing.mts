@@ -66,7 +66,7 @@ export interface AssistantRecord {
    * 二维码里带了 `mode` 时以它作为初始值，否则 auto。
    */
   connectionMode?: string
-  /** 当前会话 id（协作模式切换会变）；hello 时带上去做断点续传。 */
+  /** 当前会话 id（会话选择器切换会变）；hello 时带上去做断点续传。 */
   sessionId?: string
   /** 会话纪元：每次切换 +1，切换回同一个 sessionId 也能被发现。 */
   sessionEpoch?: number
@@ -146,9 +146,9 @@ function normalizeConnectionModeInput(mode: unknown): string {
 /** `hello/ack` 里我们真正要用的字段（其余字段宽容忽略）。 */
 export interface HelloAckLike {
   t?: string
-  /** 协议版本（2.2.0 仍是 '1.1.0'，由 protocol 的 PROTOCOL_VERSION 决定）。 */
+  /** 协议版本（1.2.0，由 protocol 的 PROTOCOL_VERSION 决定）。 */
   version?: string
-  /** 插件版本（例如 '2.2.0'）；只用于展示，缺失时回退 version。 */
+  /** 插件版本（例如 '2.3.0'）；只用于展示，缺失时回退 version。 */
   serverVersion?: string
   computerId?: string
   computerName?: string
@@ -162,14 +162,12 @@ export interface HelloAckLike {
   endpoints?: unknown
   /** 电脑端声明的能力（2.2.0 新增）。 */
   capabilities?: unknown
-  /** 当前会话 id；协作模式切换会变。 */
+  /** 当前会话 id；会话选择器切换会变。 */
   sessionId?: string
   /** 会话纪元：每次切换 +1。 */
   sessionEpoch?: number
   /** 电脑端事件日志的最大 seq（0 = 没有日志，只能拿快照）。 */
   eventCursor?: number
-  /** 协作模式当前是否开启。 */
-  collaboration?: boolean
   /** 电脑端当前使用的连接方式（展示用）。 */
   connectionMode?: string
   /** 带网络类型的地址列表（2.2.0 新增）。 */
@@ -186,11 +184,10 @@ export type HelloAckOutcome =
       endpoints: string[]
       /** 电脑端理解的能力（缺省 = 没有能力，按老协议降级）。 */
       capabilities: string[]
-      /** 当前会话信息（会随协作模式切换）。 */
+      /** 当前会话信息（会话选择器切换会变）。 */
       sessionId?: string
       sessionEpoch?: number
       eventCursor?: number
-      collaboration?: boolean
       connectionMode?: string
       patch: Partial<AssistantRecord>
     }
@@ -264,13 +261,12 @@ export function interpretHelloAck(
     sessionId,
     sessionEpoch,
     eventCursor,
-    collaboration: typeof ack.collaboration === 'boolean' ? ack.collaboration : undefined,
     connectionMode: typeof ack.connectionMode === 'string' ? ack.connectionMode : undefined,
     patch: {
       online: true,
       lastConnectedAt: new Date(now).toISOString(),
       fingerprint: typeof ack.computerFingerprint === 'string' ? ack.computerFingerprint : expected.fingerprint,
-      // 展示用版本号：ack.serverVersion 是插件版本（2.2.0），ack.version 是协议版本（1.1.0）。
+      // 展示用版本号：ack.serverVersion 是插件版本（2.3.0），ack.version 是协议版本（1.2.0）。
       serverVersion:
         (typeof ack.serverVersion === 'string' && ack.serverVersion) ||
         (typeof ack.version === 'string' ? ack.version : undefined),
@@ -302,7 +298,7 @@ export interface HelloInput {
   capabilities?: string[]
   /** 已应用到的会话事件序号（断点续传）；0/缺省表示要快照。 */
   cursor?: number
-  /** 客户端认为自己在的会话 id（用于发现协作模式切换）。 */
+  /** 客户端认为自己在的会话 id（用于发现电脑端换了绑定会话）。 */
   sessionId?: string
 }
 

@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: 8b2de2d2dc93112ecff445bba1e2a1bb03b354b5889b5bf03f3026b12b3bbff5
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: 5de094cd20d1f4129fdf568679a4214bfd9effae4f210c20635f08ab2191164b
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -25,13 +25,21 @@
 /**
  * Bump when a breaking change is made. Both sides compare `major`.
  *
- * 2.2.0 keeps the wire format at **1.x on purpose**: every frame added here is
+ * 2.2.0 kept the wire format at **1.x on purpose**: every frame added there was
  * additive and both sides are required to ignore unknown frames (design rule 1),
  * so a v2.1.0 phone keeps working against a v2.2.0 computer and the other way
  * round. New behaviour is negotiated through `capabilities` instead of a version
  * check, which is what lets a user upgrade one side at a time.
+ *
+ * 1.2.0 (2.3.0 "remote control only") removes collaboration: no shared
+ * conversation, no participant list, no in-conversation nickname. A device now
+ * always drives the DSH session it is bound to, and may list/select/create those
+ * sessions (`sessions-v1`) and answer the computer's approval requests
+ * (`approval-v1`). A collaboration-era client that still sends `collab/set`
+ * simply gets nothing back — the frame is gone, which is exactly what "unknown
+ * frames are ignored" already promised.
  */
-export const PROTOCOL_VERSION = '1.1.0'
+export const PROTOCOL_VERSION = '1.2.0'
 
 /**
  * Feature flags exchanged in `hello` / `hello/ack`.
@@ -47,16 +55,16 @@ export const CAPABILITIES = /** @type {const} */ ({
   CHAT_MESSAGE: 'chat-message-v1',
   /** `session/sync` + `session/events`: snapshot and cursor-based catch-up. */
   SESSION_SYNC: 'session-sync-v1',
-  /** `session/participants`: who is in the conversation right now. */
-  PARTICIPANTS: 'participants-v1',
   /** `upload/*`: chunked, back-pressured attachment upload. */
   UPLOAD: 'upload-v1',
-  /** `collab/set` + `collab/state`: collaboration can be switched from the phone. */
-  COLLAB: 'collab-v1',
   /** `file/offered`: the computer can push a file card into the conversation. */
   FILE_OFFER: 'file-offer-v1',
   /** The pairing QR / hello-ack carry classified endpoints (`epk`). */
   ENDPOINT_KINDS: 'endpoint-kinds-v1',
+  /** `session/list` / `session/select` / `session/create`: the phone picks the conversation. */
+  SESSIONS: 'sessions-v1',
+  /** `approval/ask` / `approval/reply`: the phone answers DSH permission prompts. */
+  APPROVAL: 'approval-v1',
 })
 
 /** Every capability this build understands. */
@@ -82,8 +90,14 @@ export const CLIENT_FRAME = /** @type {const} */ ({
   UPLOAD_CHUNK: 'upload/chunk',
   UPLOAD_END: 'upload/end',
   UPLOAD_CANCEL: 'upload/cancel',
-  /** Switch collaboration mode from the phone. */
-  COLLAB_SET: 'collab/set',
+  /** List the DSH sessions on the computer (the phone's conversation picker). */
+  SESSION_LIST: 'session/list',
+  /** Bind this device to one of those sessions and take its snapshot. */
+  SESSION_SELECT: 'session/select',
+  /** Create a brand new DSH session and bind this device to it. */
+  SESSION_CREATE: 'session/create',
+  /** Answer a pending `approval/ask` (`outcome` is `allowed-once` or `rejected`). */
+  APPROVAL_REPLY: 'approval/reply',
 })
 
 /** Frames that the computer may send to a client. */
@@ -112,10 +126,14 @@ export const SERVER_FRAME = /** @type {const} */ ({
   SESSION_STATE: 'session/state',
   /** Durable events after the client's `cursor` (reconnect catch-up). */
   SESSION_EVENTS: 'session/events',
-  /** Who is in this conversation right now. */
-  PARTICIPANTS: 'session/participants',
-  /** Collaboration state changed (by the computer or another phone). */
-  COLLAB_STATE: 'collab/state',
+  /** The conversation list, in reply to `session/list`. */
+  SESSIONS: 'sessions',
+  /** A `session/select` / `session/create` finished (or failed) and the device moved. */
+  SESSION_SELECTED: 'session/selected',
+  /** A DSH permission prompt is waiting for this device. */
+  APPROVAL_ASK: 'approval/ask',
+  /** That prompt was settled (answered here, on the computer, or by a timeout). */
+  APPROVAL_RESOLVED: 'approval/resolved',
   /** Upload handshake replies. */
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
@@ -331,7 +349,6 @@ export class NonceReplayGuard {
  *                                     the same id are still detectable.
  * @property {number} [eventCursor]    Highest durable event `seq` the computer holds for this
  *                                     conversation. `0` means "no log yet, take the snapshot".
- * @property {boolean} [collaboration] Collaboration mode is currently ON for this computer.
  * @property {string} [connectionMode] Which connection mode the computer advertises
  *                                     (`auto|lan|tailscale|tunnel`), so the phone can show it.
  * @property {Array<{url: string, kind: string}>} [endpointList] Classified endpoints (2.2.0+).
@@ -358,7 +375,6 @@ export function helloAckProofMessage(nonce, deviceId) {
  *                                 still gets server-side duplicate suppression.
  * @property {string} [callId]     Legacy alias of `rid`.
  * @property {string} text
- * @property {string} [speaker]    Display name of the sender (collaboration mode).
  * @property {Array<{uploadId?: string, name: string, mime?: string, size?: number, dataBase64?: string}>} [files]
  *           Attachments. v2.2.0 clients upload through `upload/*` and send only `uploadId`s;
  *           inline `dataBase64` stays supported for a v2.1.0 client (bounded by the plugin).
@@ -397,13 +413,13 @@ export function helloAckProofMessage(nonce, deviceId) {
  * usable cursor (first connect, session switch) or in reply to `session/sync`.
  * @property {'session/state'} t
  * @property {string} sessionId
+ * @property {string} [title]      Human title of this DSH session (the picker shows it too).
  * @property {number} sessionEpoch
  * @property {number} head         Newest event `seq` included; client stores it as its cursor.
  * @property {{messages: Array<{id: string, kind: 'user'|'assistant', text: string, at: string,
- *            callId?: string, msgId?: string, speaker?: string,
+ *            callId?: string, msgId?: string,
  *            files?: Array<{fileId?: string, name: string, size: number, mime?: string}>}>,
  *            activeCall?: {callId: string, text: string, typing: boolean}}} snapshot
- * @property {boolean} collaboration
  */
 
 /**
@@ -418,19 +434,68 @@ export function helloAckProofMessage(nonce, deviceId) {
  */
 
 /**
- * @typedef {object} ParticipantsFrame
- * @property {'session/participants'} t
- * @property {string} sessionId
- * @property {boolean} collaboration
- * @property {Array<{deviceId: string, name: string, online: boolean, deviceName?: string}>} participants
+ * @typedef {object} SessionSummary
+ * One DSH session on the computer, as the phone's conversation picker shows it.
+ * @property {string} id           DSH session id (the thing `session/select` takes).
+ * @property {string} title        Log-backed title, or a fallback like "新会话".
+ * @property {string} [cwd]        Working directory the session runs in.
+ * @property {number} createdAt    Unix ms.
+ * @property {number} [updatedAt]  Unix ms of the newest event, when known.
+ * @property {boolean} live        True when an agent for it is running right now.
+ * @property {boolean} [current]   True for the session this device is bound to.
  */
 
 /**
- * @typedef {object} CollabStateFrame
- * @property {'collab/state'} t
- * @property {boolean} on
- * @property {string} sessionId
- * @property {number} sessionEpoch
+ * @typedef {object} SessionsFrame
+ * Reply to `session/list`.
+ * @property {'sessions'} t
+ * @property {string} [rid]
+ * @property {string} current      Session id this device is currently bound to.
+ * @property {SessionSummary[]} sessions  Newest first; root sessions only (no subagents).
+ * @property {boolean} [truncated] True when more sessions exist than were sent.
+ */
+
+/**
+ * @typedef {object} SessionSelectedFrame
+ * Reply to `session/select` / `session/create`. On success the computer follows it
+ * with a `session/state` snapshot for the new conversation.
+ * @property {'session/selected'} t
+ * @property {string} [rid]
+ * @property {boolean} ok
+ * @property {string} [sessionId]  The conversation this device is bound to now.
+ * @property {string} [title]
+ * @property {number} [sessionEpoch] Increments on every switch.
+ * @property {string} [error]      Machine-readable reason when `ok` is false.
+ * @property {string} [message]    Human-readable explanation for the phone UI.
+ */
+
+/**
+ * @typedef {object} ApprovalAskFrame
+ * One DSH permission prompt, forwarded to the phone. The phone answers with
+ * `approval/reply`; the computer also pushes `approval/resolved` when the prompt is
+ * settled elsewhere (desktop, timeout, cancellation) so the UI can dismiss it.
+ * @property {'approval/ask'} t
+ * @property {string} approvalId   Opaque id for this prompt (echoed in the reply).
+ * @property {string} toolName     Tool that wants to run (e.g. `bash`, `write`).
+ * @property {string} [reason]     Machine reason the computer logged.
+ * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
+ * @property {string} [callId]     The chat turn this prompt belongs to, when known.
+ * @property {number} expiresAt    Unix ms after which the computer falls back to the desktop.
+ */
+
+/**
+ * @typedef {object} ApprovalReplyFrame
+ * @property {'approval/reply'} t
+ * @property {string} approvalId
+ * @property {'allowed-once'|'rejected'} outcome  `allowed-once` grants exactly this one call.
+ */
+
+/**
+ * @typedef {object} ApprovalResolvedFrame
+ * @property {'approval/resolved'} t
+ * @property {string} approvalId
+ * @property {'allowed-once'|'rejected'|'cancelled'|'unavailable'} outcome
+ * @property {string} [source]     `phone` | `desktop` | `timeout` | `cancelled`.
  */
 
 /**
@@ -626,6 +691,19 @@ export const SESSION_EVENT_LOG_LIMIT = 400
 
 /** Messages included in a `session/sync` snapshot. */
 export const SESSION_SNAPSHOT_LIMIT = 60
+
+/** Sessions listed to the phone in one `sessions` frame (newest first). */
+export const SESSION_LIST_LIMIT = 200
+
+/**
+ * How long a forwarded approval waits for the phone before the computer hands the
+ * prompt back to its own UI. Short enough that a phone that is asleep cannot
+ * freeze a desktop turn; long enough to unlock a phone and tap.
+ */
+export const APPROVAL_TIMEOUT_MS = 60_000
+
+/** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
+export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
 
 /** Where the plugin serves the web/PWA client (HarmonyOS, iOS, any browser). */
 export const WEB_CLIENT_PATH = '/openwhale/app'

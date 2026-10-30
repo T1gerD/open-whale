@@ -18,7 +18,7 @@ DeepSeek Harness —— 口语化的回复、回复里的文件、远程关机/�
 │  安卓 / 网页版手机   │ ◀─────────────────── │   电脑上的插件        │
 │                    │                       │   dsh-openwhale     │
 │  多个助理           │   WebSocket 长连接     │                     │
-│  聊天 / 文件 / 协作  │ ◀───────────────────▶ │  DSH 会话（协作可共享）│
+│  聊天 / 文件 / 会话  │ ◀───────────────────▶ │  DSH 会话（可任选）  │
 └────────────────────┘                       └─────────────────────┘
         ▲                                              │
         └──── 局域网 · Tailscale · 公网隧道 ────────────┘
@@ -35,8 +35,9 @@ DeepSeek Harness —— 口语化的回复、回复里的文件、远程关机/�
 | 回复里有文件时也要拿到文件 | 助手产出的文件被登记，手机按分片拉取，聊天里渲染成可点开的文件卡片 |
 | **手机把照片/文件发给电脑** | **512 KiB 分块上传 + 背压 + 进度 + 断点重试，单附件上限 64 MiB**；落盘在会话工作目录内，AI 能直接读 |
 | **电脑把文件发给手机** | 配对页「发送到手机」→ 手机上出现一次性下载卡片 |
-| **多台手机同时用一个会话** | 协作模式：共享会话 + 消息回显 + 在线成员 + 断线追赶，谁说的都看得见 |
-| 第一次绑定要扫电脑展示的二维码 | 插件展示二维码（浏览器页 / `/openwhale` 命令 / PNG / SVG），二维码里是**一次性、10 分钟有效**的绑定密钥 |
+| **手机直接续上电脑上的会话** | 「会话」列表读到电脑上的全部 DSH 会话（标题 / 时间 / 是否正在运行），点一个就续聊，也可以新建；选中的会话在电脑端同步可见 |
+| **手机上处理权限请求** | 电脑上的 DSH 要审批某个工具调用时，请求会转到手机：允许一次 / 拒绝；60 秒没人答就交回电脑弹窗，不会把一轮卡死 |
+| 第一次绑定要扫电脑展示的二维码 | 二维码在 DSH **设置 → Open Whale** 插件页里（也可「在浏览器中打开」），里面是**一次性、10 分钟有效**的绑定密钥 |
 | **没法扫码时也能绑定** | 扫码页支持**相册识图**（选一张二维码截图）和**手动输入地址**（`host:port`，先探测 health 再保存） |
 | 之后打开应用无需再次绑定 | 手机保存自己的 Ed25519 私钥；重连时用该私钥签名完成认证 |
 | **连不上、连得慢** | 连接方式可选「自动 / 局域网 / Tailscale / 公网隧道」；自动模式顺序是**上次成功 → Tailscale → 局域网 → 公网隧道**，前两个候选并发竞速 |
@@ -52,10 +53,10 @@ DeepSeek Harness —— 口语化的回复、回复里的文件、远程关机/�
 ```
 open-whale/
 ├── packages/
-│   ├── protocol/          协议契约（唯一权威源，v1.1.0），含 31 项单测
+│   ├── protocol/          协议契约（唯一权威源，v1.2.0），含 37 项单测
 │   ├── plugin/            DSH 电脑端插件（纯 ESM、零运行时依赖）
 │   │   ├── src/
-│   │   │   ├── index.mjs        cordis 插件入口：装配各部件、命令、路由
+│   │   │   ├── index.mjs        cordis 插件入口：装配各部件、路由、插件页
 │   │   │   ├── dsh-bridge.mjs   手机 ↔ DSH 会话桥（会话、消息、事件、文件）
 │   │   │   ├── gateway.mjs      HTTP + WebSocket 服务、鉴权、帧路由、会话事件日志
 │   │   │   ├── upload.mjs       分块上传（背压、校验、落盘到工作目录）
@@ -90,16 +91,16 @@ open-whale/
 
 | 文件 | 装到哪 | 怎么装 |
 |---|---|---|
-| `dsh-openwhale-2.2.1.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-2.2.1.tgz`，然后重启 DSH |
+| `dsh-openwhale-2.3.0.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-2.3.0.tgz`，然后重启 DSH |
 | `dsh-openwhale.tgz` | 电脑 | 同上（固定名字的别名，脚本里用方便） |
-| `open-whale-2.2.1.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
+| `open-whale-2.3.0.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
 | `open-whale.apk` | 安卓手机 | 同上（固定名字的别名） |
 
-插件也发布在 npm 上，可以按包名安装（升级时 `dsh plugin` 的 `update` 同样适用）：
-
-```bash
-dsh plugin --profile desktop add dsh-openwhale
-```
+> npm 上的 `dsh-openwhale` **尚未发布**（v2.2.0 发布时 npm 网页注册被按出口 IP 拦截，见
+> [docs/PUBLISHING.md](docs/PUBLISHING.md)）。请用上面 Release 里的 tarball 安装，不要按包名装。
+>
+> 装好后打开 **DSH 设置 → 插件 → Open Whale**，插件页里就是绑定二维码；也可以在页面里点
+> 「在浏览器中打开」。聊天输入框的「+」菜单里不再有 openwhale 入口。
 
 APK 由 GitHub Actions 在发布时构建（本仓库作者的环境里没有 JDK 与 Android SDK），用 debug
 keystore 签名，**适合个人自用安装**；要出正式签名的包见 [docs/mobile-build.md](docs/mobile-build.md)。
@@ -107,7 +108,7 @@ keystore 签名，**适合个人自用安装**；要出正式签名的包见 [do
 自己打包插件：
 
 ```bash
-node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-2.2.1.tgz（含网页版）
+node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-2.3.0.tgz（含网页版与插件页）
 node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（npm publish 用）
 ```
 
@@ -117,12 +118,10 @@ node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（np
 
 ### 1. 电脑端：装插件
 
-从 Release 的 tarball 或 npm 安装：
+从 Release 的 tarball 安装：
 
 ```bash
-dsh plugin --profile desktop add ./dsh-openwhale-2.2.1.tgz
-# 或者
-dsh plugin --profile desktop add dsh-openwhale
+dsh plugin --profile desktop add ./dsh-openwhale-2.3.0.tgz
 ```
 
 开发时可以直接装源码目录（改动只需重启 DSH）：
@@ -209,7 +208,7 @@ dsh plugin --profile desktop add ./packages/plugin
 - 二维码携带电脑公钥，手机可据此验证 `hello/ack` 的签名，冒名顶替的隧道会被识别。
 - 重放的握手会被随机数防重放表拒绝。
 - 手机只能读取本次对话中产出（或电脑主动发送）的文件，不能请求电脑上任意路径。
-- **会改变电脑状态的 HTTP 接口**（协作开关、解绑、改名、发送文件、连接方式）只接受**本机
+- **会改变电脑状态的 HTTP 接口**（解绑、改名、发送文件、连接方式）只接受**本机
   loopback** 请求，因此即使配对页通过公网隧道打开，别人也无法远程改你的设置。
 - 详见 [docs/security.md](docs/security.md)（含威胁分析与已知限制）。
 
@@ -222,7 +221,7 @@ dsh plugin --profile desktop add ./packages/plugin
 
 ```bash
 cd open-whale
-node scripts/run-tests.mjs          # 全部：43 个测试文件 / 656 项测试（v2.2.1 基线）
+node scripts/run-tests.mjs          # 全部：46 个测试文件 / 712 项测试（v2.3.0 基线）
 node scripts/run-tests.mjs qr       # 只跑文件名含 "qr" 的
 node packages/mobile/scripts/check-syntax.mjs   # 手机端 TS 语法检查
 ```

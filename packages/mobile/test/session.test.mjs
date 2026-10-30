@@ -1,5 +1,8 @@
-// 多端同步 reducer：chat/echo、chat/message、session/state、session/events、
-// participants、collab/state、file/offered、upload/*、幂等 ack。
+// 多端同步 reducer：chat/echo（同一设备的其它窗口）、chat/message、session/state、
+// session/events、file/offered、upload/*、幂等 ack。
+//
+// v2.3.0 删掉了协作：这里额外钉住「协作相关的事件不再改变任何状态」，
+// 会话列表/选中、权限请求队列分别在 sessions.test.mjs / approval.test.mjs 里测。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -26,35 +29,36 @@ function run(events, state = emptyChatState(ASSISTANT), start = 1000) {
   return current
 }
 
-test('a message from another device appears as a user bubble with its sender', () => {
-  let state = run([{ t: 'state/identity', deviceId: SELF, at: 999 }])
+test('an echo from another window of the same device merges into my own bubble', () => {
+  let state = run([{ t: 'user/send', rid: 'msg_own_1', msgId: 'msg_own_1', text: '帮我看看', at: 1000 }])
   state = run(
     [
       {
         t: 'chat/echo',
         msgId: 'msg_remote_1',
-        deviceId: 'dev_other_123456789012',
-        speaker: '小王的手机',
-        text: '大家看一下这个报错',
+        deviceId: SELF,
+        text: '另一个窗口发的',
         at: '2026-10-26T10:00:00.000Z',
         seq: 1,
       },
     ],
     state,
   )
-  assert.equal(state.messages.length, 1)
-  const message = state.messages[0]
-  assert.equal(message.id, userMessageId('msg_remote_1'))
-  assert.equal(message.kind, 'user')
-  assert.equal(message.mine, false)
-  assert.equal(message.sender.deviceId, 'dev_other_123456789012')
-  assert.equal(message.sender.name, '小王的手机')
-  assert.equal(message.state, 'sent')
+  assert.equal(state.messages.length, 2)
+  const echoed = state.messages[1]
+  assert.equal(echoed.id, userMessageId('msg_remote_1'))
+  assert.equal(echoed.kind, 'user')
+  // 协作语义已删除：任何 echo 都是本机发的。
+  assert.equal(echoed.mine, true)
+  // 老的说话人字段不再往消息上挂。
+  assert.equal('speaker' in echoed, false)
+  assert.equal('sender' in echoed, false)
+  assert.equal(echoed.state, 'sent')
   assert.equal(state.sessionCursor, 1)
 })
 
 test('the echo of my own message merges into the local bubble instead of duplicating it', () => {
-  let state = run([{ t: 'state/identity', deviceId: SELF, at: 999 }])
+  let state = run([])
   state = run(
     [
       { t: 'user/send', rid: 'msg_own_1', msgId: 'msg_own_1', text: '帮我看看', at: 1000 },
@@ -127,7 +131,6 @@ test('session/state replaces the conversation on a session switch', () => {
         sessionId: 'sess_2',
         sessionEpoch: 2,
         head: 42,
-        collaboration: true,
         reset: true,
         snapshot: {
           messages: [
@@ -149,7 +152,7 @@ test('session/state replaces the conversation on a session switch', () => {
   )
   assert.equal(state.sessionId, 'sess_2')
   assert.equal(state.sessionEpoch, 2)
-  assert.equal(state.collaboration, true)
+  assert.equal('collaboration' in state, false, 'collaboration 状态已从 reducer 里删除')
   assert.equal(state.sessionCursor, 42)
   // 快照里的两条历史 + 进行中回合补出来的一条 streaming 消息
   assert.equal(state.messages.length, 3)
@@ -167,7 +170,6 @@ test('session/state is idempotent and drops empty assistant placeholder bubbles'
     sessionId: 'sess_1',
     sessionEpoch: 1,
     head: 10,
-    collaboration: false,
     snapshot: {
       messages: [{ id: 'usr_a', kind: 'user', text: '问题', at: '2026-10-26T09:00:00.000Z', msgId: 'a' }],
     },
@@ -192,7 +194,7 @@ test('session/state is idempotent and drops empty assistant placeholder bubbles'
 })
 
 test('session/events replays by seq and skips events already applied', () => {
-  let state = run([{ t: 'state/identity', deviceId: SELF, at: 999 }])
+  let state = run([])
   // 已经应用到 seq=2（重连前的游标）
   state = run([{ t: 'chat/echo', msgId: 'm2', deviceId: SELF, text: '2', seq: 2 }], state)
   assert.equal(state.sessionCursor, 2)
@@ -221,29 +223,18 @@ test('session/events replays by seq and skips events already applied', () => {
   assert.equal(state.sessionCursor, 4)
 })
 
-test('participants and collaboration state drive the presence UI', () => {
-  let state = run([
-    {
-      t: 'session/participants',
-      sessionId: 'sess_1',
-      collaboration: true,
-      participants: [
-        { deviceId: 'dev_a', name: '手机 A', online: true },
-        { deviceId: 'dev_b', name: '手机 B', online: false },
-        { deviceId: 'dev_a', name: '重复的 A', online: true },
-      ],
-    },
-  ])
-  assert.equal(state.collaboration, true)
-  assert.deepEqual(state.participants, [
-    { deviceId: 'dev_a', name: '手机 A', online: true },
-    { deviceId: 'dev_b', name: '手机 B', online: false },
-  ])
-
-  state = run([{ t: 'collab/state', on: false, sessionId: 'sess_1', sessionEpoch: 1 }], state)
-  assert.equal(state.collaboration, false)
-  assert.equal(state.messages[state.messages.length - 1].kind, 'system')
-  assert.match(state.messages[state.messages.length - 1].text, /关闭协作模式/)
+test('collaboration-era frames are gone: participants/collab no longer touch the state', () => {
+  const base = run([{ t: 'chat/delta', callId: 'c1', seq: 0, text: 'hi' }])
+  // 未知帧（含已经删掉的 session/participants、collab/state）必须被忽略，状态原样返回。
+  for (const frame of [
+    { t: 'session/participants', sessionId: 'sess_1', collaboration: true, participants: [{ deviceId: 'dev_a', name: 'A', online: true }] },
+    { t: 'collab/state', on: true, sessionId: 'sess_1', sessionEpoch: 2 },
+  ]) {
+    const result = reduceChat(base, frame, 5000)
+    assert.equal(result.state, base)
+    assert.deepEqual(result.effects, [])
+  }
+  assert.equal('participants' in base, false)
 })
 
 test('file/offered becomes a download card without touching the transcript', () => {
@@ -334,19 +325,18 @@ test('stopping generation and removing a local message work', () => {
   assert.equal(state.messages.some(message => message.id === 'msg_c1'), false)
 })
 
-test('hydrate restores ownership so peers messages render on the correct side', () => {
+test('hydrate marks every historical user message as mine (collaboration is gone)', () => {
   const state = hydrateChat(
     ASSISTANT,
     [
-      { id: 'usr_remote', kind: 'user', text: '别人的消息', at: 1, rid: 'remote', state: 'sent', deviceId: 'dev_other', sender: { deviceId: 'dev_other', name: 'B' } },
+      { id: 'usr_remote', kind: 'user', text: '老库里的消息', at: 1, rid: 'remote', state: 'sent', mine: false },
       { id: 'usr_local', kind: 'user', text: '我的消息', at: 2, rid: 'local', state: 'sent' },
     ],
     [],
     100,
-    { selfDeviceId: 'dev_other' },
   )
-  assert.equal(state.messages[0].mine, true)
-  assert.equal(state.messages[1].mine, true, 'legacy local messages default to mine')
+  assert.equal(state.messages[0].mine, true, 'legacy mine=false rows are corrected on upgrade')
+  assert.equal(state.messages[1].mine, true)
 })
 
 test('a snapshot aggregated bubble replaces local per-message bubbles of the same turn', () => {
@@ -367,7 +357,6 @@ test('a snapshot aggregated bubble replaces local per-message bubbles of the sam
         sessionId: 'sess_1',
         sessionEpoch: 1,
         head: 500,
-        collaboration: false,
         snapshot: {
           messages: [
             { id: 'usr_u1', kind: 'user', text: '问题', at: '2026-10-26T09:00:00.000Z', msgId: 'u1', callId: 'c1' },

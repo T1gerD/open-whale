@@ -212,6 +212,7 @@ async function startComputer(options = {}) {
   const received = []
   /** @type {any} */
   let gateway
+  let sessionCounter = 0
   const attachmentsSeen = []
 
   const bridge = {
@@ -219,6 +220,16 @@ async function startComputer(options = {}) {
       received.push(input)
       attachmentsSeen.push(...input.attachments.map(a => ({ name: a.name, path: a.path })))
     },
+    // v2.3.0: the gateway asks the bridge for conversations instead of inventing
+    // per-device ids. A predictable counter keeps the assertions readable.
+    createSession: async () => ({ ok: true, sessionId: `ow-e2e-${++sessionCounter}` }),
+    selectSession: async sessionId => ({ ok: true, sessionId }),
+    listSessions: async () => ({
+      sessions: [{ id: 'ow-shared', title: '共享演示', createdAt: 1, live: true }],
+      truncated: false,
+    }),
+    answerApproval: () => true,
+    historyMessages: async () => [],
     fileFor: async fileId => options.fileFor?.(fileId),
     power: async input => ({
       accepted: input.action !== 'shutdown' || options.allowShutdown !== false,
@@ -237,12 +248,6 @@ async function startComputer(options = {}) {
     lanUrls: () => [`http://192.168.1.50:${options.port ?? 8787}`],
     uploadDir,
     log: () => {},
-    // Mirror the production wiring: the conversation id comes from the persisted
-    // collaboration preference, and a device joins its conversation at hello.
-    sessionIdFor: deviceId => (store.getPreference('collaboration', false) === true
-      ? store.sharedSessionId()
-      : store.sessionIdFor(deviceId)),
-    collaboration: () => store.getPreference('collaboration', false) === true,
     cwd: () => dir,
   })
   const port = await gateway.listen(0, '127.0.0.1')
@@ -311,11 +316,16 @@ test('a phone scans the QR, is bound, chats, gets a streamed answer and unbinds'
   assert.equal(computer.received[0].deviceId, phone.deviceId)
 
   // 4. A streamed answer arrives as deltas, then an authoritative done frame.
-  computer.gateway.pushEvent({ kind: 'typing', deviceId: phone.deviceId, callId, active: true })
-  computer.gateway.pushEvent({ kind: 'delta', deviceId: phone.deviceId, callId, seq: 0, text: '今天上午' })
-  computer.gateway.pushEvent({ kind: 'delta', deviceId: phone.deviceId, callId, seq: 1, text: '有两件事。' })
+  // v2.3.0 routes every frame by the conversation the device is bound to, so the
+  // stand-in bridge events carry that session id.
+  const sessionId = computer.gateway.deviceSession.get(phone.deviceId)
+  assert.ok(sessionId, 'hello must bind the device to a conversation')
+  computer.gateway.pushEvent({ kind: 'typing', sessionId, deviceId: phone.deviceId, callId, active: true })
+  computer.gateway.pushEvent({ kind: 'delta', sessionId, deviceId: phone.deviceId, callId, seq: 0, text: '今天上午' })
+  computer.gateway.pushEvent({ kind: 'delta', sessionId, deviceId: phone.deviceId, callId, seq: 1, text: '有两件事。' })
   computer.gateway.pushEvent({
     kind: 'tool',
+    sessionId,
     deviceId: phone.deviceId,
     callId,
     phase: 'tool-start',
@@ -323,7 +333,7 @@ test('a phone scans the QR, is bound, chats, gets a streamed answer and unbinds'
     tool: 'read_file',
     summary: '正在读取文件：日程.md',
   })
-  computer.gateway.pushEvent({ kind: 'done', deviceId: phone.deviceId, callId, text: '今天上午有两件事。' })
+  computer.gateway.pushEvent({ kind: 'done', sessionId, deviceId: phone.deviceId, callId, text: '今天上午有两件事。' })
 
   assert.ok(await client.waitFor(f => f.t === SERVER_FRAME.TYPING))
   const deltas = client.frames.filter(f => f.t === SERVER_FRAME.CHAT_DELTA)
@@ -576,20 +586,14 @@ test('the health endpoint is enough to debug a failed connection', async t => {
 
 
 
-test('two phones in one collaborative conversation stay in sync and a retry never duplicates', async t => {
+test('two phones that pick the same conversation stay in sync and a retry never duplicates', async t => {
   const computer = await startComputer()
   t.after(() => computer.close())
   const phoneA = new FakePhone()
   phoneA.deviceName = '手机A'
   const phoneB = new FakePhone()
   phoneB.deviceName = '手机B'
-  const caps = [
-    CAPABILITIES.CHAT_ECHO,
-    CAPABILITIES.CHAT_MESSAGE,
-    CAPABILITIES.SESSION_SYNC,
-    CAPABILITIES.PARTICIPANTS,
-    CAPABILITIES.COLLAB,
-  ]
+  const caps = [CAPABILITIES.CHAT_ECHO, CAPABILITIES.CHAT_MESSAGE, CAPABILITIES.SESSION_SYNC, CAPABILITIES.SESSIONS]
 
   // 1. Both phones pair through their own single-use QR.
   const displayedA = await (await fetch(`http://127.0.0.1:${computer.port}/openwhale/pairing.json`)).json()
@@ -603,24 +607,28 @@ test('two phones in one collaborative conversation stay in sync and a retry neve
   const ackB = await b.pair({ capabilities: caps })
   assert.equal(ackB.capabilities.includes(CAPABILITIES.CHAT_ECHO), true)
 
-  // 2. Turn collaboration on (the same path the local page / phone toggle uses).
-  await computer.gateway.setCollaboration(true)
-  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.COLLAB_STATE && f.on === true))
-  assert.ok(await b.waitFor(f => f.t === SERVER_FRAME.COLLAB_STATE && f.on === true))
-  const sharedSession = computer.store.sharedSessionId()
+  // 2. v2.3.0: two phones land on one conversation by *picking* it, not by a
+  // collaboration switch. That is the remaining shared-conversation case.
+  a.send({ t: CLIENT_FRAME.SESSION_SELECT, rid: 'sel-a', sessionId: 'ow-shared' })
+  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.SESSION_SELECTED && f.ok === true))
+  b.send({ t: CLIENT_FRAME.SESSION_SELECT, rid: 'sel-b', sessionId: 'ow-shared' })
+  assert.ok(await b.waitFor(f => f.t === SERVER_FRAME.SESSION_SELECTED && f.ok === true))
+  const sharedSession = 'ow-shared'
 
   // 3. A sends one message with an idempotency key.
   const callId = randomUUID()
   a.send({ t: CLIENT_FRAME.CHAT, rid: callId, callId, msgId: 'msg_e2e_1', text: '大家好' })
   assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_ACK && f.msgId === 'msg_e2e_1'))
 
-  // Both devices receive the same user message echo — the sender included, so the
-  // client dedupes by msgId instead of relying on "did I send this?".
-  const echoForB = await b.waitFor(f => f.t === SERVER_FRAME.CHAT_ECHO && f.msgId === 'msg_e2e_1')
-  assert.ok(echoForB, 'the other phone must see the message')
-  assert.equal(echoForB.deviceId, phoneA.deviceId)
-  assert.equal(echoForB.speaker, '手机A')
-  assert.ok(await a.waitFor(f => f.t === SERVER_FRAME.CHAT_ECHO && f.msgId === 'msg_e2e_1'))
+  // v2.3.0: `chat/echo` is no longer a collaboration broadcast — it only reaches
+  // the sending device's other sockets. A second phone on the same conversation
+  // must not get someone else's bubble pushed at it.
+  await new Promise(resolve => setTimeout(resolve, 80))
+  assert.equal(
+    b.frames.some(f => f.t === SERVER_FRAME.CHAT_ECHO && f.msgId === 'msg_e2e_1'),
+    false,
+    'the other phone must not receive a device-scoped echo',
+  )
 
   const startedAt = Date.now()
   while (computer.received.length === 0 && Date.now() - startedAt < 2000) {

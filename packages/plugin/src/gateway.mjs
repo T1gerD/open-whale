@@ -33,6 +33,7 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   ALL_CAPABILITIES,
+  APPROVAL_REPLY_OUTCOMES,
   CAPABILITIES,
   CONNECTION_MODE,
   CONNECTION_MODES,
@@ -47,6 +48,7 @@ import {
   POWER_REFUSAL,
   PROTOCOL_VERSION,
   SERVER_FRAME,
+  SESSION_SNAPSHOT_LIMIT,
   SessionEventLog,
   UPLOAD_CHUNK_BYTES,
   WEB_CLIENT_PATH,
@@ -70,7 +72,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '2.2.1'
+export const PLUGIN_VERSION = '2.3.0'
 
 /**
  * How many concurrent sessions one device may hold.
@@ -98,20 +100,28 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
  * @typedef {object} Bridge
  * The DSH-facing half. The gateway never imports DSH packages directly, which
  * is what keeps the wire protocol testable without a harness.
- * @property {(input: {deviceId: string, callId: string, text: string, speaker?: string, attachments: Array<{name: string, mime?: string, size?: number, path?: string, dataBase64?: string, fileId?: string}>}) => Promise<void>} send
- *           Deliver a user message into the device's assistant conversation.
+ * @property {(input: {deviceId: string, sessionId: string, callId: string, text: string, attachments: Array<{name: string, mime?: string, size?: number, path?: string, dataBase64?: string, fileId?: string}>}) => Promise<void>} send
+ *           Deliver a user message into the session the device is bound to.
  * @property {(callId: string, deviceId?: string) => void} [cancel]
  * @property {() => Promise<Array<{fileId: string, name: string, size: number, mime?: string, path?: string}>>} [listFiles]
  *           Files the assistant produced that the phone may fetch.
  * @property {(fileId: string) => Promise<{name: string, mime?: string, path: string} | undefined>} [fileFor]
  * @property {(input: {deviceId: string, label: string}) => Promise<void>} [renameAssistant]
  * @property {(input: {deviceId: string, action: string, delaySeconds?: number, mac?: string}) => Promise<{accepted: boolean, delaySeconds?: number, cancelToken?: string, reason?: string, message?: string}>} [power]
- * @property {(deviceId: string) => void} [attachDevice] Register a freshly authenticated
- *           device in its conversation without waiting for it to speak.
- * @property {() => Promise<void>} [resetSessions] Rebuild device → conversation mapping
- *           after collaboration mode switched.
+ * @property {() => Promise<{sessions: Array<object>, truncated: boolean}>} [listSessions]
+ *           Root DSH sessions for the phone's picker (newest first, truncated).
+ * @property {(sessionId: string) => Promise<{ok: true, sessionId: string, title?: string} | {ok: false, error: string, message: string}>} [selectSession]
+ *           Bind-ready open of an existing session (resume unless it is live).
+ * @property {() => Promise<{ok: true, sessionId: string}>} [createSession]
+ *           Create a brand new DSH session for a device that has no binding yet.
+ * @property {(sessionId: string) => Promise<Array<{id: string, kind: 'user'|'assistant', text: string, at: string}>>} [historyMessages]
+ *           Log-backed history for `session/state` (degrades to `[]` on failure).
+ * @property {(input: {approvalId: string, deviceId?: string, outcome: string}) => boolean} [answerApproval]
+ *           Settle a forwarded approval with the phone's answer.
+ * @property {(sessionId: string) => Promise<void>} [releaseSession]
+ *           Tear down an agent no device is bound to any more.
  * @property {(listener: (event: object) => void) => () => void} [onEvent]
- *           Bridge events: {kind:'message'|'done'|'tool'|'typing'|'error', sessionId, deviceId, callId, ...}
+ *           Bridge events: {kind:'message'|'done'|'tool'|'typing'|'error'|'approval-ask'|'approval-resolved', sessionId, deviceId, callId, ...}
  */
 
 /**
@@ -221,8 +231,6 @@ export class Gateway {
    * @param {(message: string) => void} [options.log]
    * @param {string} [options.uploadDir] Override for phone attachment storage (tests).
    * @param {() => string} [options.cwd] Session working directory (uploads/file offers).
-   * @param {(deviceId: string) => string} [options.sessionIdFor] Conversation id of a device.
-   * @param {() => boolean} [options.collaboration] Current collaboration flag.
    * @param {string} [options.webClientDir] Explicit web-client directory (tests).
    * @param {() => number} [options.now]
    * @param {number} [options.uploadIdleTimeoutMs]
@@ -237,10 +245,17 @@ export class Gateway {
     this.cwd = options.cwd ?? (() => process.cwd())
     this.heartbeatMs = DEFAULT_HEARTBEAT_MS
     this.sessionEpoch = 1
-    /** Conversation id for a device. Collaboration mode maps every device to one shared id. */
-    this.sessionIdFor = options.sessionIdFor ?? (deviceId => this.store.sessionIdFor(deviceId))
-    /** Runtime collaboration flag (a preference, so it can change without a restart). */
-    this.collaboration = options.collaboration ?? (() => this.store.getPreference('collaboration', false) === true)
+    /**
+     * deviceId → sessionId（v2.3.0）：每台手机始终只驱动它当前绑定的那个 DSH
+     * 会话，取代旧的「每个设备一个固定会话 / 协作时共用一个会话」方案。
+     *
+     * 绑定会写进 state store 的偏好里，这样插件重启后手机连回来仍落到同一个
+     * 会话（否则每次重启都会新建一个会话，聊天记录看起来像是丢了）。
+     * @type {Map<string, string>}
+     */
+    this.deviceSession = new Map(Object.entries(
+      /** @type {Record<string, string>} */ (this.store.getPreference('deviceSession', {})) ?? {},
+    ).filter(([, sessionId]) => typeof sessionId === 'string' && sessionId !== ''))
     this.serverVersion = PLUGIN_VERSION
 
     /** @type {Set<Session>} */
@@ -302,6 +317,79 @@ export class Gateway {
   /** First live session for a device, if any (compatibility helper). */
   sessionFor(deviceId) {
     return this.byDevice.get(deviceId)?.values().next().value
+  }
+
+  /**
+   * 在线且绑定到某个会话的设备（桥用它决定审批能不能转发；没有手机时审批
+   * 必须交回桌面 UI，绝不能冒领）。
+   * @param {string} sessionId
+   * @returns {string[]}
+   */
+  devicesInSession(sessionId) {
+    if (!sessionId) return []
+    const devices = []
+    for (const [deviceId, bound] of this.deviceSession) {
+      if (bound !== sessionId) continue
+      if (this.deviceOnline(deviceId)) devices.push(deviceId)
+    }
+    return devices
+  }
+
+  /**
+   * 可以接收审批请求的设备：在线、绑定该会话、且声明了 `approval-v1`。
+   * @param {string} sessionId
+   * @returns {string[]}
+   */
+  approvalDevicesFor(sessionId) {
+    const capable = []
+    for (const deviceId of this.devicesInSession(sessionId)) {
+      const sessions = this.sessionsForDevice(deviceId)
+      if (sessions.some(session => session.authenticated && session.hasCap(CAPABILITIES.APPROVAL))) {
+        capable.push(deviceId)
+      }
+    }
+    return capable
+  }
+
+  /**
+   * 记录 deviceId → sessionId 绑定。写内存 Map 的同时落盘，插件重启后仍能回到
+   * 同一个会话（见 constructor 的 `deviceSession`）。
+   * @param {string} deviceId
+   * @param {string} sessionId
+   */
+  #bindDeviceSession(deviceId, sessionId) {
+    this.deviceSession.set(deviceId, sessionId)
+    try {
+      this.store.setPreference('deviceSession', Object.fromEntries(this.deviceSession))
+    } catch (error) {
+      this.log(`session: 保存设备会话绑定失败：${/** @type {Error} */ (error).message}`)
+    }
+    const sessions = this.sessionsForDevice(deviceId)
+    for (const session of sessions) session.sessionId = sessionId
+  }
+
+  /**
+   * 一台设备当前应绑定的会话：已有绑定直接用；新设备首次绑定则新建一个会话。
+   * 建会话失败时退化为一个本地生成的 id，下一次发送仍会尝试在 DSH 里创建。
+   * @param {string} deviceId
+   * @returns {Promise<string>}
+   */
+  async #ensureDeviceSession(deviceId) {
+    const existing = this.deviceSession.get(deviceId)
+    if (existing) return existing
+    try {
+      const created = await this.bridge.createSession?.(deviceId)
+      if (created?.sessionId) {
+        this.#bindDeviceSession(deviceId, created.sessionId)
+        this.log(`session: 新设备 ${deviceId} 绑定到新会话 ${created.sessionId}`)
+        return created.sessionId
+      }
+    } catch (error) {
+      this.log(`session: 为新设备新建会话失败（降级）：${/** @type {Error} */ (error).message}`)
+    }
+    const fallback = `ow-${randomBytes(16).toString('hex')}`
+    this.#bindDeviceSession(deviceId, fallback)
+    return fallback
   }
 
   /**
@@ -449,7 +537,6 @@ export class Gateway {
         computerId: this.store.computerId,
         computerName: this.store.computerName,
         paired: this.store.isPaired,
-        collaboration: this.collaboration(),
         connectionMode: this.#mode(),
         endpoints: this.#reachableEndpoints(),
         devices: this.store.devices.map(d => ({ id: d.id, label: d.label ?? d.deviceName })),
@@ -467,7 +554,6 @@ export class Gateway {
         computerId: this.store.computerId,
         computerName: this.store.computerName,
         fingerprint: this.store.fingerprint,
-        collaboration: this.collaboration(),
         connectionMode: this.#mode(),
         endpoints: this.#allEndpointList(),
         pairing: pairingAvailability(this.store),
@@ -519,19 +605,6 @@ export class Gateway {
       return true
     }
 
-    if (path === '/openwhale/collaboration') {
-      if (req.method === 'POST' && !this.#requireLocal(req, res)) return true
-      if (req.method === 'POST') {
-        const on = url.searchParams.get('on')
-        await this.setCollaboration(on === '1' || on === 'true')
-      }
-      return this.#json(res, 200, {
-        ok: true,
-        collaboration: this.collaboration(),
-        sessionEpoch: this.sessionEpoch,
-      })
-    }
-
     if (path === '/openwhale/device-rename') {
       if (req.method !== 'POST') {
         res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'POST' })
@@ -546,7 +619,6 @@ export class Gateway {
       const updated = this.store.updateDevice(deviceId, { label })
       if (!updated) return this.#json(res, 404, { ok: false, error: 'device-not-found' })
       this.log(`device: ${deviceId} 改名为「${label}」`)
-      this.#broadcastParticipants(this.sessionIdFor(deviceId))
       return this.#json(res, 200, { ok: true, device: { id: updated.id, label: updated.label } })
     }
 
@@ -564,11 +636,7 @@ export class Gateway {
         const device = this.store.device(targetDeviceId)
         if (!device) return this.#json(res, 404, { ok: false, error: 'device-not-found' })
         try {
-          const conversationId = this.sessionIdFor(targetDeviceId)
-          this.store.unbindDevice(targetDeviceId)
-          this.bridge.forgetDevice?.(targetDeviceId)?.catch?.(() => {})
-          this.log(`pairing: device ${targetDeviceId} unbound from desktop page`)
-          this.#broadcastParticipants(conversationId)
+          this.#unbindDevice(targetDeviceId)
         } catch (error) {
           this.log(`pairing: 手动解绑 ${targetDeviceId} 失败：${/** @type {Error} */ (error).message}`)
           return this.#json(res, 500, { ok: false, error: 'unbind-failed' })
@@ -579,9 +647,7 @@ export class Gateway {
       for (const device of removed) {
         const deviceId = device.id ?? device.deviceId
         try {
-          this.store.unbindDevice(deviceId)
-          this.bridge.forgetDevice?.(deviceId)?.catch?.(() => {})
-          this.log(`pairing: device ${deviceId} unbound from desktop page`)
+          this.#unbindDevice(deviceId)
         } catch (error) {
           this.log(`pairing: 手动解绑 ${deviceId} 失败：${/** @type {Error} */ (error).message}`)
         }
@@ -673,8 +739,14 @@ export class Gateway {
         return session.send({ t: SERVER_FRAME.CHAT_ACK, rid: frame.rid, callId: frame.callId, cancelled: true })
       case 'session/sync':
         return this.#handleSessionSync(session, frame)
-      case 'collab/set':
-        return this.#handleCollabSet(session, frame)
+      case 'session/list':
+        return this.#handleSessionList(session, frame)
+      case 'session/select':
+        return this.#handleSessionSelect(session, frame)
+      case 'session/create':
+        return this.#handleSessionCreate(session, frame)
+      case 'approval/reply':
+        return this.#handleApprovalReply(session, frame)
       case 'upload/start':
         return this.#handleUploadStart(session, frame)
       case 'upload/chunk':
@@ -782,26 +854,16 @@ export class Gateway {
     session.capabilities = new Set(
       Array.isArray(frame.capabilities) ? frame.capabilities.filter(capability => typeof capability === 'string') : [],
     )
-    session.sessionId = this.sessionIdFor(deviceId)
+    // 每台设备的会话绑定：已有绑定直接用，新设备首次绑定则新建一个会话。
+    session.sessionId = await this.#ensureDeviceSession(deviceId)
     clearTimeout(session.helloDeadline)
 
     // Racing two endpoints means two handshakes with the same deviceId arrive
     // almost together; both must stay alive (the loser is closed by the client).
     // Only when a device accumulates more than MAX_SESSIONS_PER_DEVICE do we
     // retire the oldest connection, so a disconnect never leaves a dead socket.
-    const wasOnline = this.deviceOnline(deviceId)
     const evicted = this.#addDeviceSession(session)
     for (const stale of evicted) stale.close(1000, 'replaced by a newer connection')
-
-    // Register the device in its conversation immediately: a phone that has not
-    // spoken yet must still receive peers' messages and the participant list.
-    if (this.bridge.attachDevice) {
-      try {
-        this.bridge.attachDevice(deviceId)
-      } catch (error) {
-        this.log(`bridge: attachDevice failed: ${/** @type {Error} */ (error).message}`)
-      }
-    }
 
     // The proof echoes the nonce this hello presented, so a phone that bound
     // through the QR can verify the ack against the computer's public key (`pk`)
@@ -831,7 +893,6 @@ export class Gateway {
       sessionId: conversationId,
       sessionEpoch: this.sessionEpoch,
       eventCursor: log.head,
-      collaboration: this.collaboration(),
       connectionMode: this.#mode(),
       endpoints: endpointUrls,
       endpointList: endpoints,
@@ -855,30 +916,27 @@ export class Gateway {
     // Conversation sync: snapshot first (no cursor), replay when the client says
     // how far it got and that position is still inside the log window.
     //
-    // A client that believes it is in a *different* conversation (collaboration
-    // was switched while it was offline) must never be caught up with events from
-    // this one: its cursor was issued by another session's log, so only a full
+    // A client that believes it is in a *different* conversation (it selected
+    // another session elsewhere) must never be caught up with events from this
+    // one: its cursor was issued by another session's log, so only a full
     // snapshot is correct.
     if (session.hasCap(CAPABILITIES.SESSION_SYNC)) {
       const cursor = Number.isFinite(frame.cursor) ? Math.max(0, Math.floor(Number(frame.cursor))) : undefined
       const believedSession = typeof frame.sessionId === 'string' && frame.sessionId !== '' ? frame.sessionId : undefined
       const sessionChanged = believedSession !== undefined && believedSession !== conversationId
-      if (sessionChanged || cursor === undefined) this.#deliverSessionState(session)
+      if (sessionChanged || cursor === undefined) await this.#deliverSessionState(session)
       else this.#deliverSessionEvents(session, cursor)
       if (sessionChanged) {
         this.log(`sync: 客户端认为的会话 ${believedSession} 与当前 ${conversationId} 不一致，已发全量快照`)
       }
     }
-    // Presence only changes on the first/last session; a racing second socket is
-    // not a new participant.
-    if (!wasOnline) this.#broadcastParticipants(conversationId)
 
     this.gatewayEvents.emit('device-online', { deviceId, sessionId: session.id, computerId: this.store.computerId })
     this.log(`auth: device ${deviceId} connected as ${device?.label ?? device?.deviceName} session=${conversationId}`)
   }
 
   /**
-   * Called by a Session when its socket closes. Broadcasts the presence change.
+   * Called by a Session when its socket closes.
    * @param {Session} session
    */
   handleSessionClosed(session) {
@@ -886,13 +944,9 @@ export class Gateway {
     this.sessions.delete(session)
     if (!session.deviceId) return
     this.#removeDeviceSession(session)
-    const stillOnline = this.deviceOnline(session.deviceId)
-    if (!stillOnline) {
+    if (!this.deviceOnline(session.deviceId)) {
       this.gatewayEvents.emit('device-offline', { deviceId: session.deviceId, sessionId: session.id })
     }
-    // With another connection still up the device is still online: the
-    // participant list does not change, so no broadcast is needed.
-    if (session.sessionId && !stillOnline) this.#broadcastParticipants(session.sessionId)
   }
 
   /** @param {Session} session @param {any} frame */
@@ -966,19 +1020,17 @@ export class Gateway {
       ...(prior?.failed ? { duplicate: true } : {}),
     })
 
-    const conversationId = session.sessionId ?? this.sessionIdFor(deviceId)
-    const sender = this.store.device(deviceId)
-    const speaker = sender?.label ?? sender?.deviceName
+    const conversationId = /** @type {string} */ (session.sessionId)
     if (!prior?.failed) {
       // Only the first attempt appends an echo: a retry of a failed delivery must
-      // not duplicate the bubble in every other device's chat.
+      // not duplicate the bubble in every other device's chat. `chat/echo` now
+      // only serves the same device's other sockets (two tabs, endpoint race).
       const echo = this.#appendEvent(conversationId, {
         t: SERVER_FRAME.CHAT_ECHO,
         msgId,
         rid: frame.rid,
         callId,
         deviceId,
-        speaker,
         text,
         files: stored.map(attachment => ({
           ...(attachment.fileId ? { fileId: attachment.fileId } : {}),
@@ -988,11 +1040,13 @@ export class Gateway {
         })),
         at: new Date().toISOString(),
       })
-      this.#broadcastToConversation(conversationId, echo, { requireCapability: CAPABILITIES.CHAT_ECHO })
+      // 只回给同一设备的其它 socket：`chat/echo` 现在用于同一台手机的多窗口/
+      // 竞速连接去重，协作语义已不存在，另一台设备即使绑到同一会话也不该收到。
+      this.#broadcastToDevice(deviceId, echo)
     }
 
     try {
-      await this.bridge.send({ deviceId, callId, text, attachments: stored, speaker })
+      await this.bridge.send({ deviceId, sessionId: conversationId, callId, text, attachments: stored })
     } catch (error) {
       // Keep a "failed" marker instead of dropping the claim: a retry gets the
       // duplicate ack it expects (so its outbox clears) AND is delivered again,
@@ -1069,62 +1123,152 @@ export class Gateway {
   #handleSessionSync(session, frame) {
     if (!session.hasCap(CAPABILITIES.SESSION_SYNC)) return undefined
     const cursor = Number.isFinite(frame.cursor) ? Math.max(0, Math.floor(Number(frame.cursor))) : undefined
-    if (cursor === undefined) this.#deliverSessionState(session)
+    if (cursor === undefined) void this.#deliverSessionState(session)
     else this.#deliverSessionEvents(session, cursor)
     return undefined
   }
 
+  // ---------------------------------------------------------------------------
+  // 会话列表 / 选择 / 新建（v2.3.0）
+  // ---------------------------------------------------------------------------
+
   /**
-   * Switch collaboration mode: everyone shares one conversation, or each device
-   * keeps its own. Called by `collab/set` and by the local HTTP toggle.
-   * @param {boolean} on
+   * `session/list`：把电脑上的 DSH 会话列给手机。
+   * @param {Session} session
+   * @param {any} frame
    */
-  async setCollaboration(on) {
-    const desired = on === true
-    if (this.collaboration() === desired) {
-      this.#broadcastCollabState(desired)
-      return
-    }
-    this.store.setPreference('collaboration', desired)
-    this.sessionEpoch += 1
-    this.log(`collab: 协作模式 → ${desired ? '开' : '关'}（sessionEpoch=${this.sessionEpoch}）`)
-
-    // Rebuild the mapping before any frame is sent: the new sessionId is what
-    // session/state and the bridge's attach must agree on.
-    for (const session of this.sessions) {
-      if (session.authenticated) session.sessionId = this.sessionIdFor(/** @type {string} */ (session.deviceId))
-    }
+  async #handleSessionList(session, frame) {
+    if (!session.hasCap(CAPABILITIES.SESSIONS)) return undefined
+    const deviceId = /** @type {string} */ (session.deviceId)
+    const current = session.sessionId ?? ''
+    let result = { sessions: [], truncated: false }
     try {
-      await this.bridge.resetSessions?.()
+      result = await (this.bridge.listSessions?.() ?? result)
     } catch (error) {
-      this.log(`collab: 重建会话映射失败：${/** @type {Error} */ (error).message}`)
+      this.log(`session: 列出会话失败：${/** @type {Error} */ (error).message}`)
+      session.sendError('session-list-failed', `无法列出电脑上的会话：${/** @type {Error} */ (error).message}`)
+      return undefined
     }
-    for (const session of this.sessions) {
-      if (!session.authenticated) continue
-      try {
-        this.bridge.attachDevice?.(/** @type {string} */ (session.deviceId))
-      } catch (error) {
-        this.log(`collab: attachDevice 失败：${/** @type {Error} */ (error).message}`)
-      }
-    }
+    const sessions = (Array.isArray(result?.sessions) ? result.sessions : []).map(summary => ({
+      ...summary,
+      ...(summary.id === current ? { current: true } : {}),
+    }))
+    session.send({
+      t: SERVER_FRAME.SESSIONS,
+      rid: frame.rid,
+      current: this.deviceSession.get(deviceId) ?? current,
+      sessions,
+      ...(result?.truncated ? { truncated: true } : {}),
+    })
+    return undefined
+  }
 
-    this.#broadcastCollabState(desired)
-    const conversations = new Set(
-      [...this.sessions].filter(session => session.authenticated && session.sessionId).map(session => session.sessionId),
-    )
-    for (const conversationId of conversations) {
-      this.#broadcastParticipants(/** @type {string} */ (conversationId))
-      for (const session of this.sessions) {
-        if (!session.authenticated || session.sessionId !== conversationId) continue
-        if (session.hasCap(CAPABILITIES.SESSION_SYNC)) this.#deliverSessionState(session)
+  /**
+   * `session/select`：把这台设备绑定到已有会话，并推新会话的快照。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  async #handleSessionSelect(session, frame) {
+    if (!session.hasCap(CAPABILITIES.SESSIONS)) return undefined
+    const deviceId = /** @type {string} */ (session.deviceId)
+    const requested = String(frame.sessionId ?? '')
+    const result = await this.#switchSession(deviceId, session, async () => this.bridge.selectSession?.(requested) ?? {
+      ok: false,
+      error: 'unavailable',
+      message: '电脑端不支持选择会话',
+    })
+    session.send({
+      t: SERVER_FRAME.SESSION_SELECTED,
+      rid: frame.rid,
+      ...result,
+    })
+    if (result.ok) await this.#deliverSessionState(session)
+    return undefined
+  }
+
+  /**
+   * `session/create`：新建一个 DSH 会话并把这台设备绑过去。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  async #handleSessionCreate(session, frame) {
+    if (!session.hasCap(CAPABILITIES.SESSIONS)) return undefined
+    const deviceId = /** @type {string} */ (session.deviceId)
+    const result = await this.#switchSession(deviceId, session, async () => this.bridge.createSession?.() ?? {
+      ok: false,
+      error: 'unavailable',
+      message: '电脑端不支持新建会话',
+    })
+    session.send({
+      t: SERVER_FRAME.SESSION_SELECTED,
+      rid: frame.rid,
+      ...result,
+    })
+    if (result.ok) await this.#deliverSessionState(session)
+    return undefined
+  }
+
+  /**
+   * 执行一次会话切换：成功则更新 deviceSession、递增 sessionEpoch，并让该设备
+   * 的所有 socket 都跟着换会话（多窗口/竞速连接不能各看一个会话）。
+   * @param {string} deviceId
+   * @param {Session} session
+   * @param {() => Promise<{ok: true, sessionId: string, title?: string} | {ok: false, error: string, message: string}>} open
+   * @returns {Promise<{ok: boolean, sessionId?: string, title?: string, sessionEpoch?: number, error?: string, message?: string}>}
+   */
+  async #switchSession(deviceId, session, open) {
+    let opened
+    try {
+      opened = await open()
+    } catch (error) {
+      this.log(`session: 切换会话失败：${/** @type {Error} */ (error).message}`)
+      return { ok: false, error: 'failed', message: `切换会话失败：${/** @type {Error} */ (error).message}` }
+    }
+    if (!opened?.ok || !opened.sessionId) {
+      return {
+        ok: false,
+        error: opened?.error ?? 'failed',
+        message: opened?.message ?? '切换会话失败',
       }
+    }
+    const previous = this.deviceSession.get(deviceId)
+    this.#bindDeviceSession(deviceId, opened.sessionId)
+    this.sessionEpoch += 1
+    // 同一设备可能有多个 socket（竞速/多窗口），它们必须一起换会话。
+    for (const sibling of this.sessionsForDevice(deviceId)) sibling.sessionId = opened.sessionId
+    session.sessionId = opened.sessionId
+    // 旧会话如果没有别的设备在用，就释放它的 agent（历史已持久化）。
+    if (previous && previous !== opened.sessionId && this.devicesInSession(previous).length === 0) {
+      this.bridge.releaseSession?.(previous)?.catch?.(() => {})
+    }
+    this.log(`session: 设备 ${deviceId} 切换到会话 ${opened.sessionId}（epoch=${this.sessionEpoch}）`)
+    return {
+      ok: true,
+      sessionId: opened.sessionId,
+      ...(opened.title ? { title: opened.title } : {}),
+      sessionEpoch: this.sessionEpoch,
     }
   }
 
-  /** @param {Session} session @param {any} frame */
-  async #handleCollabSet(session, frame) {
-    if (!session.hasCap(CAPABILITIES.COLLAB)) return undefined
-    await this.setCollaboration(frame.on === true)
+  /**
+   * `approval/reply`：手机对一条审批请求作答。未知/不属于该设备的请求被忽略
+   * （对方可能已经超时，卡片也会收到 resolved 帧）。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  async #handleApprovalReply(session, frame) {
+    if (!session.hasCap(CAPABILITIES.APPROVAL)) return undefined
+    const approvalId = String(frame.approvalId ?? '')
+    if (!approvalId) return session.sendError('bad-frame', 'approval/reply 缺少 approvalId')
+    const outcome = APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (frame.outcome))
+      ? frame.outcome
+      : 'rejected'
+    const accepted = this.bridge.answerApproval?.({
+      approvalId,
+      deviceId: /** @type {string} */ (session.deviceId),
+      outcome,
+    }) === true
+    if (!accepted) this.log(`approval: 忽略已失效的作答 ${approvalId}`)
     return undefined
   }
 
@@ -1336,8 +1480,6 @@ export class Gateway {
     const deviceId = /** @type {string} */ (session.deviceId)
     this.store.updateDevice(deviceId, { label })
     session.send({ t: SERVER_FRAME.ASSISTANTS, assistants: this.#assistantList() })
-    // 协作头像条要立刻看到新昵称，不必等下一次连接事件。
-    if (session.sessionId) this.#broadcastParticipants(session.sessionId)
     await this.bridge.renameAssistant?.({ deviceId, label })
     return undefined
   }
@@ -1353,7 +1495,6 @@ export class Gateway {
     this.log(`device: ${deviceId} 昵称改为「${label}」`)
     // 顺带把新列表推回去，手机端就不用再拉一次。
     session.send({ t: SERVER_FRAME.ASSISTANTS, assistants: this.#assistantList() })
-    if (session.sessionId) this.#broadcastParticipants(session.sessionId)
     return undefined
   }
 
@@ -1363,13 +1504,31 @@ export class Gateway {
     if (String(frame.deviceId ?? '') !== deviceId) {
       return session.sendError('forbidden', '只能解绑自己')
     }
-    const conversationId = session.sessionId
-    this.store.unbindDevice(deviceId)
+    this.#unbindDevice(deviceId)
     this.log(`pairing: device ${deviceId} unbound itself`)
     session.send({ t: SERVER_FRAME.ASSISTANTS, assistants: [], unbound: true })
     session.close(1000, 'device unbound')
-    if (conversationId) this.#broadcastParticipants(conversationId)
     return undefined
+  }
+
+  /**
+   * 解除一台设备的绑定：信任立刻失效，同时清掉它的会话绑定；如果那个会话没有
+   * 别的设备在用，就释放它的 agent（会话历史已持久化）。
+   * @param {string} deviceId
+   */
+  #unbindDevice(deviceId) {
+    const sessionId = this.deviceSession.get(deviceId)
+    this.deviceSession.delete(deviceId)
+    try {
+      this.store.setPreference('deviceSession', Object.fromEntries(this.deviceSession))
+    } catch (error) {
+      this.log(`session: 清理设备会话绑定失败：${/** @type {Error} */ (error).message}`)
+    }
+    this.store.unbindDevice(deviceId)
+    this.log(`pairing: device ${deviceId} unbound from desktop page`)
+    if (sessionId && this.devicesInSession(sessionId).length === 0) {
+      this.bridge.releaseSession?.(sessionId)?.catch?.(() => {})
+    }
   }
 
   /** @param {Session} session @param {any} frame */
@@ -1427,16 +1586,14 @@ export class Gateway {
   // ---------------------------------------------------------------------------
 
   /**
-   * Push a bridge event. Chat-level frames go to **every** device in the
-   * event's conversation (v2.2.0 multi-device sync); device-level frames stay
-   * targeted. The event log keeps the durable ones for reconnect catch-up.
+   * Push a bridge event. 会话级帧发给绑定该会话的**所有**设备（同一台手机的多
+   * socket 也都在内），审批帧只发给声明了 `approval-v1` 的设备。事件日志只保留
+   * 可重放的聊天事件。
    * @param {{kind: string, sessionId?: string, deviceId?: string, callId?: string, [key: string]: unknown}} event
    */
   pushEvent(event) {
     const deviceId = typeof event.deviceId === 'string' ? event.deviceId : ''
-    const conversationId = typeof event.sessionId === 'string' && event.sessionId !== ''
-      ? event.sessionId
-      : deviceId ? this.sessionIdFor(deviceId) : ''
+    const conversationId = typeof event.sessionId === 'string' && event.sessionId !== '' ? event.sessionId : ''
     if (!conversationId) return false
 
     switch (event.kind) {
@@ -1511,6 +1668,27 @@ export class Gateway {
         }
         return delivered > 0
       }
+      case 'approval-ask': {
+        const frame = {
+          t: SERVER_FRAME.APPROVAL_ASK,
+          approvalId: event.approvalId,
+          toolName: event.toolName,
+          ...(event.reason !== undefined ? { reason: event.reason } : {}),
+          ...(event.displayReason !== undefined ? { displayReason: event.displayReason } : {}),
+          ...(event.callId !== undefined ? { callId: event.callId } : {}),
+          expiresAt: event.expiresAt,
+        }
+        return this.#broadcastToConversation(conversationId, frame, {
+          requireCapability: CAPABILITIES.APPROVAL,
+        }) > 0
+      }
+      case 'approval-resolved':
+        return this.#broadcastToConversation(conversationId, {
+          t: SERVER_FRAME.APPROVAL_RESOLVED,
+          approvalId: event.approvalId,
+          outcome: event.outcome,
+          ...(event.source !== undefined ? { source: event.source } : {}),
+        }, { requireCapability: CAPABILITIES.APPROVAL }) > 0
       default:
         return false
     }
@@ -1593,66 +1771,62 @@ export class Gateway {
     return delivered
   }
 
-  /** @param {string} conversationId */
-  #broadcastParticipants(conversationId) {
-    const participants = this.#participants(conversationId)
-    const collaboration = this.collaboration()
-    for (const session of this.sessions) {
-      if (!session.authenticated || session.sessionId !== conversationId) continue
-      if (!session.hasCap(CAPABILITIES.PARTICIPANTS)) continue
-      session.send({
-        t: SERVER_FRAME.PARTICIPANTS,
-        sessionId: conversationId,
-        collaboration,
-        participants,
-      })
-    }
-  }
-
   /**
-   * Bound devices that belong to this conversation, with their live state.
-   * @param {string} conversationId
+   * Send one frame to every live socket of one device (multi-tab / endpoint race).
+   * @param {string} deviceId
+   * @param {any} frame
+   * @returns {number}
    */
-  #participants(conversationId) {
-    return this.store.devices
-      .filter(device => this.sessionIdFor(device.id) === conversationId)
-      .map(device => ({
-        deviceId: device.id,
-        name: device.label ?? device.deviceName,
-        online: this.deviceOnline(device.id),
-      }))
-  }
-
-  /** @param {boolean} on */
-  #broadcastCollabState(on) {
-    for (const session of this.sessions) {
-      if (!session.authenticated || !session.hasCap(CAPABILITIES.COLLAB)) continue
-      session.send({
-        t: SERVER_FRAME.COLLAB_STATE,
-        on,
-        sessionId: session.sessionId,
-        sessionEpoch: this.sessionEpoch,
-      })
+  #broadcastToDevice(deviceId, frame) {
+    let delivered = 0
+    for (const session of this.sessionsForDevice(deviceId)) {
+      if (!session.authenticated) continue
+      if (session.send(frame)) delivered += 1
     }
+    return delivered
   }
 
   /** @param {Session} session */
-  #deliverSessionState(session) {
+  async #deliverSessionState(session) {
     const conversationId = session.sessionId
     if (!conversationId) return
     const log = this.#log(conversationId)
     const active = this.activeCalls.get(conversationId)
+    const messages = await this.#snapshotMessages(conversationId, log)
     session.send({
       t: SERVER_FRAME.SESSION_STATE,
       sessionId: conversationId,
       sessionEpoch: this.sessionEpoch,
       head: log.head,
       snapshot: {
-        messages: log.snapshot(),
+        messages,
         ...(active ? { activeCall: { callId: active.callId, text: active.text, typing: active.typing !== false } } : {}),
       },
-      collaboration: this.collaboration(),
     })
+  }
+
+  /**
+   * 快照消息 = 会话日志里的历史 + 本进程收到但日志里还没有的增量。
+   *
+   * 历史来自 `bridge.historyMessages()`（`ctx.sessionQuery.readSession()`）；
+   * 读不到历史时整份退回进程内日志，绝不抛。两边会有重叠（一条手机消息既写进
+   * 会话日志又写进本进程日志），所以按 `kind + text` 做**计数式**去重：日志里
+   * 出现 n 次就抵掉 n 条历史，重复内容不会被误删，刚发出尚未提交的消息也不会
+   * 丢。
+   * @param {string} conversationId
+   * @param {SessionEventLog} log
+   * @returns {Promise<Array<any>>}
+   */
+  async #snapshotMessages(conversationId, log) {
+    const incremental = log.snapshot()
+    let history = []
+    try {
+      history = (await this.bridge.historyMessages?.(conversationId)) ?? []
+    } catch (error) {
+      this.log(`session: 读取历史失败（退回进程内日志）：${/** @type {Error} */ (error).message}`)
+      history = []
+    }
+    return mergeSnapshotMessages(Array.isArray(history) ? history : [], incremental, SESSION_SNAPSHOT_LIMIT)
   }
 
   /**
@@ -1667,7 +1841,7 @@ export class Gateway {
     if (!events) {
       // The cursor fell out of the retention window: a full snapshot is the only
       // correct answer (a partial replay would leave a hole in the chat).
-      this.#deliverSessionState(session)
+      void this.#deliverSessionState(session)
       return
     }
     session.send({
@@ -1908,7 +2082,6 @@ export class Gateway {
       detected,
       web: this.#webClientUrl(endpoints),
       webClientAvailable: this.webClient.available(),
-      collaboration: this.collaboration(),
     }
   }
 
@@ -2125,7 +2298,6 @@ export class Gateway {
    */
   #pageHtml(view) {
     const { payload, qr, webEntries, webUrl, endpoints, local } = view
-    const collaboration = this.collaboration()
     const mode = this.#mode()
     const report = this.connectionModeReport()
     const boundDevices = this.store.devices ?? []
@@ -2186,7 +2358,8 @@ export class Gateway {
 </style></head><body><div class="wrap">
 <h1>Open Whale <span class="tag">v${PLUGIN_VERSION}</span></h1>
 <div class="sub">用手机上的 Open Whale 应用扫描二维码绑定；也可以用手机浏览器直接打开网页版（无需安装应用）。</div>
-${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开的。为避免经公网隧道暴露管理能力，配对二维码与所有修改操作（改名/解绑/协作开关/连接方式/发送文件）都请在本机浏览器操作：<code>http://127.0.0.1:${port}/openwhale</code></div>`}
+<p class="hint">本页就是 DSH 设置 → 插件 → Open Whale 的插件页（同一份内容以内嵌 iframe 的方式显示）。</p>
+${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开的。为避免经公网隧道暴露管理能力，配对二维码与所有修改操作（改名/解绑/连接方式/发送文件）都请在本机浏览器操作：<code>http://127.0.0.1:${port}/openwhale</code></div>`}
 <div class="grid">
   <div class="col" style="flex:0 0 auto">
     <div class="card">
@@ -2220,8 +2393,6 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
       <p><b>电脑名称</b>：${escapeHtml(this.store.computerName)}</p>
       <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
       ${deviceRows}
-      <p><b>协作模式</b>：${collaboration ? '<span class="ok">已开启（多台手机共用一个对话，互相可见）</span>' : '关闭（每台设备各自独立）'}
-        ${local ? `<button class="btn-sm" id="collab">${collaboration ? '关闭' : '开启'}</button>` : ''}</p>
       <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.ok ? payload.payload.fp : this.store.fingerprint))}</span></p>
       <p><b>可用地址</b>：</p><ul>${addressList}</ul>
     </div>
@@ -2253,19 +2424,6 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
   function postJson(url, body) {
     return fetch(url, { method: 'POST', headers: body ? { 'content-type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined })
   }
-  document.getElementById('collab')?.addEventListener('click', async function (event) {
-    var button = event.currentTarget
-    var next = button.textContent.trim() === '开启'
-    button.disabled = true
-    try {
-      var response = await postJson('/openwhale/collaboration?on=' + (next ? '1' : '0'))
-      if (!response.ok) throw new Error(await response.text())
-      location.reload()
-    } catch (error) {
-      alert('切换失败：' + error.message)
-      button.disabled = false
-    }
-  })
   document.getElementById('save-mode')?.addEventListener('click', async function (event) {
     var button = event.currentTarget
     var selected = document.querySelector('input[name=connection-mode]:checked')
@@ -2302,7 +2460,7 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
   document.querySelectorAll('[data-rename]').forEach(function (button) {
     button.addEventListener('click', async function () {
       var id = button.getAttribute('data-rename')
-      var name = prompt('给这台设备起个昵称（多人协作时消息会带这个前缀）')
+      var name = prompt('给这台设备起个备注名（只用于配对页识别设备，不会出现在对话里）')
       if (!name) return
       button.disabled = true
       try {
@@ -2333,6 +2491,40 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
 </script>
 </body></html>`
   }
+}
+
+/**
+ * 合并「会话日志历史」与「本进程增量」成一份快照消息列表。
+ *
+ * 历史是权威的，但刚发出、DSH 还没来得及提交的消息只存在于进程内日志里，所以
+ * 必须保留增量。两者重叠的部分（同一条消息既在会话日志里又在进程日志里）用
+ * `kind + text` 计数抵消：历史里出现 n 次就抵掉 n 条增量，既不会漏掉重复内容，
+ * 也不会把尚未提交的新消息误删。
+ * @param {Array<{id: string, kind: string, text: string, at: string}>} history
+ * @param {Array<{id: string, kind: string, text: string, at: string}>} incremental
+ * @param {number} limit
+ * @returns {Array<any>}
+ */
+export function mergeSnapshotMessages(history, incremental, limit = SESSION_SNAPSHOT_LIMIT) {
+  const historic = Array.isArray(history) ? history : []
+  const fresh = Array.isArray(incremental) ? incremental : []
+  if (historic.length === 0) return fresh.slice(-limit)
+  const remaining = new Map()
+  for (const message of historic) {
+    const key = `${message?.kind}\u0000${message?.text}`
+    remaining.set(key, (remaining.get(key) ?? 0) + 1)
+  }
+  const extra = []
+  for (const message of fresh) {
+    const key = `${message?.kind}\u0000${message?.text}`
+    const count = remaining.get(key) ?? 0
+    if (count > 0) {
+      remaining.set(key, count - 1)
+      continue
+    }
+    extra.push(message)
+  }
+  return [...historic, ...extra].slice(-limit)
 }
 
 /** 中文标签：连接方式选择项。 */

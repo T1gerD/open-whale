@@ -1,29 +1,33 @@
 // The DSH-facing half of Open Whale.
 //
 // Responsibilities, in order of importance:
-//  1. Give each paired phone its own durable DSH conversation (agent + session),
-//     so the phone keeps one continuous chat and never collides with the
-//     conversations the user has open on the desktop.
+//  1. 持有「一个 DSH 会话 ↔ 一个 agent」的映射：手机在会话列表里选中的会话
+//     由这里 resume/复用，新设备首次绑定则由这里 create。设备到会话的绑定
+//     归网关（`Gateway.deviceSession`），本文件只认 sessionId。
 //  2. Turn DSH's event stream into the small vocabulary the phone speaks
 //     (message / done / tool / typing / error), and collect files it may fetch.
-//  3. Inject the personal-assistant voice as a *scoped* prompt section on those
+//  3. 把 DSH 的审批请求（`approval/request` 瀑布）转发给已绑定的手机，并等它
+//     作答；没有在线手机、超时或请求被中止时交回桌面 UI。
+//  4. Inject the personal-assistant voice as a *scoped* prompt section on those
 //     conversations only.
 //
 // It deliberately talks to DSH through the injected context instead of importing
 // harness internals, so the same file can be exercised in tests with a fake ctx.
 //
-// v2.2.0 fixes two reported defects here:
-//  · 助手回复重复拼接：一条 `assistant/message` 只归约一次（按 DSH 的 messageId
-//    去重），而不是按会话里的设备循环累加；`assistant/attempt` 与 message 对
-//    同一 (turn, step) 只算一次。
-//  · 多端不同步：事件带 `sessionId`，由网关广播给会话内所有设备；设备在 hello
-//    认证后即 `attachDevice()`，不必先发言才能收到推送。
-import { createHash } from 'node:crypto'
+// v2.3.0 removes collaboration: a device always drives the DSH session it is
+// bound to, and may list / select / create those sessions (`session/*`) and
+// answer the computer's approval prompts (`approval/*`).
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { IdempotencyCache } from './protocol.mjs'
+import {
+  APPROVAL_TIMEOUT_MS,
+  IdempotencyCache,
+  SESSION_LIST_LIMIT,
+  SESSION_SNAPSHOT_LIMIT,
+} from './protocol.mjs'
 import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from './voice.mjs'
 
 /** Tools whose results are files rather than text. */
@@ -32,12 +36,12 @@ const FILE_TOOL_HINTS = ['write', 'image', 'docx', 'xlsx', 'pptx', 'pdf', 'expor
 /**
  * @typedef {object} BridgeEvent
  * One event for the gateway to fan out. `sessionId` is the conversation the
- * event belongs to; the gateway broadcasts chat-level frames to every device in
- * that conversation (v2.2.0 multi-device sync) and only the bridge knows which
- * conversation DSH just spoke in.
- * @property {'message'|'delta'|'done'|'tool'|'typing'|'error'} kind
+ * event belongs to; the gateway broadcasts chat-level frames to every device
+ * bound to that conversation and only the bridge knows which conversation DSH
+ * just spoke in.
+ * @property {'message'|'delta'|'done'|'tool'|'typing'|'error'|'approval-ask'|'approval-resolved'} kind
  * @property {string} sessionId
- * @property {string} deviceId   The device whose turn produced the event.
+ * @property {string} [deviceId]   The device whose turn produced the event.
  * @property {string} callId
  * @property {string} [messageId] Stable DSH assistant message id (`kind:'message'`).
  * @property {number} [index]    Position of the message inside the turn.
@@ -55,6 +59,13 @@ export class DshBridge {
    * @param {(event: BridgeEvent) => void} options.emit
    * @param {(message: string) => void} [options.log]
    * @param {() => string} [options.defaultCwd]
+   * @param {(sessionId: string) => string[]} [options.devicesInSession]
+   *        Online phones bound to a session, supplied by the gateway. Used to
+   *        decide whether an approval may be forwarded at all — registering the
+   *        answerer is not the same as claiming: with no phone online the
+   *        request must fall through to the desktop UI.
+   * @param {number} [options.approvalTimeoutMs] Override the 60s forwarding timeout (tests).
+   * @param {() => number} [options.now]
    * @param {(input: {content: Array<{type: string, text: string}>, source: {kind: string}}) => any} [options.createUserMessage]
    *        Injected so the bridge can be exercised without the harness present.
    *        In production it is `createUserMessage` from `@deepseek-ai/dsh-llm`,
@@ -64,6 +75,10 @@ export class DshBridge {
    *        Without one the harness assembles a prompt whose `{{model}}` variable
    *        has no value and the first message fails, so this is required in
    *        practice and only optional so tests can omit it.
+   * @param {(deviceId?: string) => string} [options.newSessionId]
+   *        How a brand new conversation id is minted. Production uses a random
+   *        UUID (DSH's SessionId is just a branded string); tests pin it so the
+   *        rest of their fixtures can keep naming conversations `ow-dev_x`.
    */
   constructor(options) {
     this.ctx = options.ctx
@@ -75,10 +90,14 @@ export class DshBridge {
     this.defaultCwd = options.defaultCwd ?? (() => process.cwd())
     this.createUserMessage = options.createUserMessage ?? null
     this.modelSelection = options.modelSelection ?? (() => undefined)
-    /** deviceId → entry */
-    this.entries = new Map()
-    /** sessionId → entry（协作模式下多台设备共用同一个会话） */
-    this.bySession = new Map()
+    this.newSessionId = options.newSessionId ?? (() => randomUUID())
+    this.devicesInSession = options.devicesInSession ?? (() => [])
+    this.approvalTimeoutMs = Number.isFinite(options.approvalTimeoutMs)
+      ? Math.max(0, Number(options.approvalTimeoutMs))
+      : APPROVAL_TIMEOUT_MS
+    this.now = options.now ?? (() => Date.now())
+    /** sessionId → {agent, handle}：一个会话一个 agent，绝不重复创建 */
+    this.agents = new Map()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
     /** `${deviceId}\u0000${callId}` → 进行中的回合 */
@@ -89,6 +108,8 @@ export class DshBridge {
     this.pendingCalls = new Map()
     /** `${sessionId}:${turn}` → 该轮次属于哪个手机消息 */
     this.turnCalls = new Map()
+    /** approvalId → 等待手机作答的请求 */
+    this.approvals = new Map()
     this.disposed = false
     this.subscriptions = []
   }
@@ -114,10 +135,11 @@ export class DshBridge {
       } catch { /* already unwound */ }
     }
     this.subscriptions = []
-    const handlers = [...new Set([...this.entries.values()].map(entry => entry.handle))].filter(Boolean)
+    // 有待作答的审批时必须先结掉，否则那个工具调用会一直挂到超时。
+    for (const approvalId of [...this.approvals.keys()]) this.#settleApproval(approvalId, 'cancelled')
+    const handlers = [...new Set([...this.agents.values()].map(entry => entry.handle))].filter(Boolean)
     const disposals = handlers.map(handle => handle.dispose().catch(() => {}))
-    this.entries.clear()
-    this.bySession.clear()
+    this.agents.clear()
     this.calls.clear()
     this.files.clear()
     this.seenCalls.clear()
@@ -126,57 +148,373 @@ export class DshBridge {
     await Promise.all(disposals)
   }
 
-  /** Session id used for a device. Deterministic via the state store. */
-  sessionIdFor(deviceId) {
-    return this.config.sessionIdFor(deviceId)
-  }
-
-  /**
-   * 登记一台设备的会话归属，**不必等它先发消息**。
-   *
-   * v2.1.0 只在 `send()` 里创建 entries，于是刚配对、还没说过话的手机收不到
-   * 同会话的任何推送（多端不同步投诉的一半原因）。网关在 hello 认证成功后
-   * 就调用这里，让广播与在线成员列表立刻完整。
-   * @param {string} deviceId
-   */
-  attachDevice(deviceId) {
-    const sessionId = this.sessionIdFor(deviceId)
-    const entry = this.entries.get(deviceId) ?? { sessionId, agent: null, handle: null }
-    entry.sessionId = sessionId
-    this.entries.set(deviceId, entry)
-    this.bySession.set(sessionId, entry)
-  }
-
   /** 手机会话的实际工作目录（上传落盘、相对路径都以它为基准）。 */
   workingDirectory() {
     return this.#cwd()
   }
 
+  // ---------------------------------------------------------------------------
+  // 会话列表 / 选择 / 新建（v2.3.0）
+  // ---------------------------------------------------------------------------
+
   /**
-   * 协作模式切换后重建 device → session 映射。
+   * 手机端的会话选择器：列出电脑上的 DSH 会话。
    *
-   * 旧的会话 agent 会被释放（会话历史已持久化，下次用到时 `resume()` 恢复），
-   * 否则两台手机在共享/独立会话之间切换时会一直挂在旧会话上，消息投递到错误
-   * 的地方。调用方随后对每台已认证设备重新 `attachDevice()`。
+   * 只看根会话（`header.parentSession === undefined`），subagent 会话不给人选。
+   * 标题走 `readTitleSnapshots()`，拿不到时用 cwd 最后一段或「新会话」；按
+   * `createdAt` 倒序，截断到 `SESSION_LIST_LIMIT`。
+   * @returns {Promise<{sessions: Array<object>, truncated: boolean}>}
    */
-  async resetSessionMapping() {
-    const handles = [...new Set([...this.entries.values()].map(entry => entry.handle).filter(Boolean))]
-    this.entries.clear()
-    this.bySession.clear()
-    this.calls.clear()
-    this.pendingCalls.clear()
-    this.turnCalls.clear()
-    await Promise.all(handles.map(handle => handle.dispose?.().catch?.(() => {})))
+  async listSessions() {
+    const query = this.#sessionQuery()
+    if (typeof query?.listSessions !== 'function') {
+      this.log('bridge: 会话查询服务不可用，会话列表为空')
+      return { sessions: [], truncated: false }
+    }
+    let records
+    try {
+      records = await query.listSessions()
+    } catch (error) {
+      this.log(`bridge: 列出会话失败：${/** @type {Error} */ (error).message}`)
+      return { sessions: [], truncated: false }
+    }
+    const roots = (Array.isArray(records) ? records : [])
+      .filter(record => record?.header && record.header.parentSession === undefined)
+      .sort((a, b) => (Number(b.header.createdAt) || 0) - (Number(a.header.createdAt) || 0))
+    const truncated = roots.length > SESSION_LIST_LIMIT
+    const limited = roots.slice(0, SESSION_LIST_LIMIT)
+
+    const titles = await this.#titles(limited.map(record => record.header.id))
+    const sessions = limited.map(record => {
+      const header = record.header
+      const live = record.live === true || Boolean(this.ctx.agents.get(header.id))
+      return {
+        id: header.id,
+        title: titles.get(header.id) ?? this.#titleFallback(header),
+        ...(typeof header.cwd === 'string' && header.cwd !== '' ? { cwd: header.cwd } : {}),
+        createdAt: Number(header.createdAt) || 0,
+        live,
+      }
+    })
+    return { sessions, truncated }
   }
 
   /**
-   * Deliver one phone message into the device's conversation.
+   * 把某个设备绑定到一个已有会话（会话不存在时返回 `not-found`）。
+   *
+   * 已 live 的会话**绝不**再次 create/resume：直接复用现有 agent，否则同一个
+   * sessionId 会撞上 "session already exists"。
+   * @param {string} sessionId
+   * @returns {Promise<{ok: true, sessionId: string, title?: string} | {ok: false, error: string, message: string}>}
+   */
+  async selectSession(sessionId) {
+    const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+    if (id === '') return { ok: false, error: 'not-found', message: '没有指定会话' }
+
+    const live = this.ctx.agents.get(id)
+    if (live) {
+      const entry = this.agents.get(id)
+      this.agents.set(id, { agent: live, handle: entry?.handle ?? null })
+      return { ok: true, sessionId: id, ...(await this.#selectedTitle(id)) }
+    }
+
+    if (!(await this.#sessionExists(id))) {
+      return { ok: false, error: 'not-found', message: '电脑上找不到这个会话' }
+    }
+    try {
+      const handle = await this.ctx.agents.resume({
+        resumeSessionId: id,
+        agentOptions: this.#agentOptions(),
+        setup: this.#setupFor(id),
+      })
+      if (!handle?.agent) throw new Error('resume 返回空 handle')
+      this.agents.set(id, { agent: handle.agent, handle })
+      this.log(`bridge: resumed conversation ${id}`)
+      return { ok: true, sessionId: id, ...(await this.#selectedTitle(id)) }
+    } catch (error) {
+      this.log(`bridge: resume ${id} 失败：${/** @type {Error} */ (error).message}`)
+      return {
+        ok: false,
+        error: 'resume-failed',
+        message: `无法打开这个会话：${/** @type {Error} */ (error).message}`,
+      }
+    }
+  }
+
+  /**
+   * 新建一个 DSH 会话并返回它的 id（等同 `session/create`）。
+   * @returns {Promise<{ok: true, sessionId: string}>}
+   */
+  async createSession(deviceId) {
+    const sessionId = String(this.newSessionId(deviceId) ?? '')
+    if (sessionId === '') throw new Error('无法生成会话 id')
+    const handle = await this.ctx.agents.create({
+      sessionId,
+      meta: { cwd: this.#cwd() },
+      agentOptions: this.#agentOptions(),
+      setup: this.#setupFor(sessionId),
+    })
+    this.agents.set(sessionId, { agent: handle.agent, handle })
+    this.log(`bridge: created conversation ${sessionId}`)
+    return { ok: true, sessionId }
+  }
+
+  /**
+   * `session/state` 用的历史快照：来自 DSH 会话日志，而不仅是本进程收到的事件。
+   * 读历史失败时降级为空数组（调用方会退回进程内日志），绝不抛。
+   * @param {string} sessionId
+   * @returns {Promise<Array<{id: string, kind: 'user'|'assistant', text: string, at: string}>>}
+   */
+  async historyMessages(sessionId) {
+    const query = this.#sessionQuery()
+    if (typeof query?.readSession !== 'function') return []
+    let result
+    try {
+      result = await query.readSession(sessionId)
+    } catch (error) {
+      this.log(`bridge: 读取会话历史失败（降级为进程内日志）：${/** @type {Error} */ (error).message}`)
+      return []
+    }
+    // 实际宿主返回 `{session, events}`（协议文档里写的是 `{header, events}`），
+    // 两种形状都接受：header 只用于诊断，这里只需要事件。
+    const events = Array.isArray(result?.events) ? result.events : []
+    const messages = []
+    for (const event of events) {
+      const mapped = historyMessageOf(event)
+      if (mapped) messages.push(mapped)
+    }
+    return messages.slice(-SESSION_SNAPSHOT_LIMIT)
+  }
+
+  // ---------------------------------------------------------------------------
+  // 审批转发（v2.3.0）
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 手机对一条待答审批作答。
+   * @param {{approvalId: string, deviceId?: string, outcome: string}} input
+   * @returns {boolean} 是否真的结算了一条等待中的请求
+   */
+  answerApproval(input) {
+    const approvalId = String(input?.approvalId ?? '')
+    const entry = this.approvals.get(approvalId)
+    if (!entry) return false
+    const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
+    // 只有被问过的那台手机能答，避免同会话的另一台设备抢答。
+    if (deviceId !== '' && !entry.deviceIds.has(deviceId)) return false
+    this.#settleApproval(approvalId, input?.outcome === 'allowed-once' ? 'allowed-once' : 'rejected')
+    return true
+  }
+
+  /**
+   * 一个 agent 的 setup：声音段落 + autoApproveTools 或手机审批转发。
+   * @param {string} sessionId
+   */
+  #setupFor(sessionId) {
+    /** @type {(agentCtx: any, agent: any) => void} */
+    return (agentCtx, agent) => this.#setupAgent(agentCtx, agent, sessionId)
+  }
+
+  /**
+   * @param {any} agentCtx
+   * @param {any} _agent
+   * @param {string} sessionId
+   */
+  #setupAgent(agentCtx, _agent, sessionId) {
+    // The voice is registered in the agent's own scope: it applies to this
+    // conversation and disappears with it, so the desktop conversations the
+    // user has open keep their normal, technical register.
+    if (this.config.voice !== 'off') {
+      agentCtx.systemPrompt.section({
+        name: VOICE_SECTION_NAME,
+        order: VOICE_SECTION_ORDER,
+        text: assistantVoiceSection({ assistantName: this.config.assistantName }),
+      })
+    }
+    if (this.config.autoApproveTools) {
+      // Approval is granted by *answering* the approval waterfall, never by a
+      // guard. `ctx.tools.guard()` is deny-only: its declared type is
+      // `(execution) => string | undefined` and `guardReason()` turns any
+      // non-undefined return into the denial reason, so returning
+      // `{kind:'allow'}` from a guard denies every tool call with
+      // "Error: [object Object]" (measured on a real dsh instance).
+      // `{prepend:true}` makes this answerer run before any other and return
+      // its grant without chaining; `'allowed-once'` is the only outcome the
+      // approval service treats as a grant.
+      agentCtx.on('approval/request', () => Promise.resolve('allowed-once'), { prepend: true })
+      return
+    }
+    // 只对本插件创建/接管的 agent 注册（agentCtx 天然按 agent 隔离）。
+    agentCtx.on(
+      'approval/request',
+      /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
+      (req, next) => this.#onApprovalRequest(sessionId, req, next),
+      { prepend: true },
+    )
+  }
+
+  /**
+   * 把一条审批请求转发给在线手机；没有手机、超时或请求被中止时交回桌面。
+   * @param {string} sessionId
+   * @param {any} req
+   * @param {() => Promise<any>} next
+   */
+  async #onApprovalRequest(sessionId, req, next) {
+    if (this.disposed) return next()
+    const devices = this.#approvalDevices(sessionId)
+    if (devices.length === 0) {
+      // 没有手机在线：绝不冒领，把问题交回桌面 UI。
+      return next()
+    }
+    const signal = req?.signal
+    if (signal?.aborted) return next()
+
+    const approvalId = randomUUID()
+    const expiresAt = this.now() + this.approvalTimeoutMs
+    const decisionPromise = new Promise(resolve => {
+      /** @type {any} */
+      const entry = { resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null }
+      this.approvals.set(approvalId, entry)
+      if (this.approvalTimeoutMs > 0) {
+        entry.timer = setTimeout(() => this.#settleApproval(approvalId, 'timeout'), this.approvalTimeoutMs)
+        entry.timer.unref?.()
+      }
+      if (signal && typeof signal.addEventListener === 'function') {
+        entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
+        signal.addEventListener('abort', entry.onAbort, { once: true })
+      }
+    })
+    this.emit({
+      kind: 'approval-ask',
+      sessionId,
+      approvalId,
+      toolName: String(req?.toolName ?? ''),
+      ...(typeof req?.reason === 'string' && req.reason !== '' ? { reason: req.reason.slice(0, 500) } : {}),
+      ...(isLocalizedText(req?.displayReason) ? { displayReason: req.displayReason } : {}),
+      ...(typeof req?.callId === 'string' && req.callId !== '' ? { callId: req.callId } : {}),
+      expiresAt,
+    })
+
+    const decision = await decisionPromise
+    if (decision === 'allowed-once' || decision === 'rejected') {
+      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: decision, source: 'phone' })
+      return decision
+    }
+    // 超时 / 中止：给已经发出去的卡片补一条 resolved，手机据此关掉它。
+    this.emit({
+      kind: 'approval-resolved',
+      sessionId,
+      approvalId,
+      outcome: 'cancelled',
+      source: decision === 'timeout' ? 'timeout' : 'cancelled',
+    })
+    return next()
+  }
+
+  /**
+   * 可以接收这条审批的手机。网关按「在线 + 绑定该会话 + 支持 approval-v1」过滤。
+   * @param {string} sessionId
+   * @returns {string[]}
+   */
+  #approvalDevices(sessionId) {
+    try {
+      const devices = this.devicesInSession(sessionId)
+      return Array.isArray(devices) ? devices.filter(deviceId => typeof deviceId === 'string' && deviceId !== '') : []
+    } catch (error) {
+      this.log(`bridge: 查询在线手机失败：${/** @type {Error} */ (error).message}`)
+      return []
+    }
+  }
+
+  /** @param {string} approvalId @param {'allowed-once'|'rejected'|'timeout'|'aborted'|'cancelled'} outcome */
+  #settleApproval(approvalId, outcome) {
+    const entry = this.approvals.get(approvalId)
+    if (!entry) return
+    this.approvals.delete(approvalId)
+    if (entry.timer) clearTimeout(entry.timer)
+    if (entry.onAbort && typeof entry.signal?.removeEventListener === 'function') {
+      entry.signal.removeEventListener('abort', entry.onAbort)
+    }
+    entry.resolve(outcome)
+  }
+
+  /** @param {string} sessionId */
+  async #selectedTitle(sessionId) {
+    const titles = await this.#titles([sessionId])
+    const title = titles.get(sessionId)
+    return title ? { title } : {}
+  }
+
+  /** @param {string} sessionId @returns {Promise<boolean>} */
+  async #sessionExists(sessionId) {
+    const query = this.#sessionQuery()
+    if (typeof query?.listSessions !== 'function') return true // 交给 resume 判断
+    try {
+      const records = await query.listSessions()
+      return (Array.isArray(records) ? records : []).some(record => record?.header?.id === sessionId)
+    } catch (error) {
+      this.log(`bridge: 校验会话是否存在失败：${/** @type {Error} */ (error).message}`)
+      return true
+    }
+  }
+
+  /**
+   * @param {string[]} sessionIds
+   * @returns {Promise<Map<string, string>>} sessionId → 标题
+   */
+  async #titles(sessionIds) {
+    /** @type {Map<string, string>} */
+    const titles = new Map()
+    const query = this.#sessionQuery()
+    if (sessionIds.length === 0 || typeof query?.readTitleSnapshots !== 'function') return titles
+    try {
+      const snapshots = await query.readTitleSnapshots(sessionIds)
+      for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+        const title = snapshot?.value?.title
+        if (snapshot?.status === 'fulfilled' && typeof title === 'string' && title.trim() !== '') {
+          titles.set(snapshot.sessionId, title.trim())
+        }
+      }
+    } catch (error) {
+      this.log(`bridge: 读取会话标题失败：${/** @type {Error} */ (error).message}`)
+    }
+    return titles
+  }
+
+  /** @param {any} header */
+  #titleFallback(header) {
+    const cwd = typeof header?.cwd === 'string' ? header.cwd.replace(/[\\/]+$/, '') : ''
+    const last = cwd.split(/[\\/]/).pop()
+    return last && last !== cwd ? last : '新会话'
+  }
+
+  /**
+   * 读 `ctx.sessionQuery`：宿主用 `ctx.get()` 暴露可选服务（直接读属性在
+   * Cordis 里会因未 inject 而抛），测试用的假 ctx 则直接挂属性。
+   */
+  #sessionQuery() {
+    const ctx = this.ctx
+    if (typeof ctx?.get === 'function') {
+      try {
+        const service = ctx.get('sessionQuery')
+        if (service) return service
+      } catch { /* 服务未提供 */ }
+    }
+    try {
+      return ctx?.sessionQuery
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Deliver one phone message into the conversation it is bound to.
    * @param {object} input
    * @param {string} input.deviceId
+   * @param {string} input.sessionId 会话（网关持有 device → session 绑定）
    * @param {string} input.callId
    * @param {string} input.text
    * @param {Array<{name: string, mime?: string, size?: number, dataBase64?: string, path?: string, fileId?: string}>} input.attachments
-   * @param {string} [input.speaker] 协作模式下的发言人显示名。
    */
   async send(input) {
     if (this.disposed) throw new Error('bridge 已关闭')
@@ -187,19 +525,15 @@ export class DshBridge {
       this.log(`bridge: 忽略重复投递 device=${input.deviceId} callId=${input.callId}`)
       return
     }
-    bridgeDiagnostic(`bridge: send 开始 device=${input.deviceId} callId=${input.callId} 文本长度=${input.text?.length ?? 0} 附件=${input.attachments?.length ?? 0}`)
+    const sessionId = String(input.sessionId ?? '')
+    if (sessionId === '') throw new Error('这条消息没有绑定会话')
+    bridgeDiagnostic(`bridge: send 开始 session=${sessionId} device=${input.deviceId} callId=${input.callId} 文本长度=${input.text?.length ?? 0} 附件=${input.attachments?.length ?? 0}`)
 
-    const entry = await this.#ensureAgent(input.deviceId)
+    const entry = await this.#ensureAgent(sessionId)
     if (!entry) throw new Error('无法创建会话')
     bridgeDiagnostic(`bridge: 会话就绪 sessionId=${entry.sessionId}`)
 
-    let text = this.#composeText(input)
-    const collaboration = this.config.isCollaboration ? this.config.isCollaboration() : this.config.collaboration === true
-    if (collaboration && input.speaker) {
-      // DSH 会话里没有「发言人」概念，用文本前缀把身份带进去，
-      // 这样电脑端和 GPT 侧都能看出多人协作里是谁在说话。
-      text = `[${input.speaker}] ${text}`
-    }
+    const text = this.#composeText(input)
 
     const call = {
       callKey,
@@ -234,7 +568,7 @@ export class DshBridge {
   cancel(callId, deviceId) {
     const call = this.#findCall(callId, deviceId)
     if (!call) return
-    const entry = this.entries.get(call.deviceId)
+    const entry = this.agents.get(call.sessionId)
     try {
       entry?.agent?.cancel?.({ kind: 'user' }, { keepInbox: true })
       this.emit({
@@ -264,24 +598,27 @@ export class DshBridge {
     return { name: record.name, mime: record.mime, path: record.path }
   }
 
-  /** Forget per-device conversation state (called when the phone unbinds). */
-  async forgetDevice(deviceId) {
-    const entry = this.entries.get(deviceId)
-    this.entries.delete(deviceId)
-    for (const [sessionId, mapped] of this.bySession) {
-      if (mapped === entry) this.bySession.delete(sessionId)
-    }
+  /**
+   * 释放一个不再被任何设备绑定的会话（解绑/切换时调用）。
+   *
+   * 会话历史已持久化，下次 `resume()` 仍能恢复；不释放会让 agent 泄漏。
+   * @param {string} sessionId
+   */
+  async releaseSession(sessionId) {
+    const entry = this.agents.get(sessionId)
+    if (!entry) return
+    this.agents.delete(sessionId)
     for (const call of [...this.calls.values()]) {
-      if (call.deviceId === deviceId) this.#retireCall(call)
+      if (call.sessionId === sessionId) this.#retireCall(call)
     }
     for (const [fileId, record] of this.files) {
-      if (record.deviceId === deviceId) this.files.delete(fileId)
+      if (record.sessionId === sessionId) this.files.delete(fileId)
     }
-    if (entry?.handle?.dispose) {
+    if (entry.handle?.dispose) {
       try {
         await entry.handle.dispose()
       } catch (error) {
-        this.log(`bridge: dispose failed for ${deviceId}: ${/** @type {Error} */ (error).message}`)
+        this.log(`bridge: dispose failed for ${sessionId}: ${/** @type {Error} */ (error).message}`)
       }
     }
   }
@@ -339,59 +676,18 @@ export class DshBridge {
   }
 
   /**
-   * Get or create the agent for a device.
-   * @param {string} deviceId
+   * Get or create the agent for a session.
+   * @param {string} sessionId
    */
-  async #ensureAgent(deviceId) {
-    const existing = this.entries.get(deviceId)
-    if (existing?.agent && this.ctx.agents.get(existing.sessionId)) return existing
-
-    const sessionId = existing?.sessionId ?? this.sessionIdFor(deviceId)
-
-    // 协作模式：另一个设备已经为这个会话建过 agent，直接挂上去。
-    // 没有这一步，两台手机同时发言会走到 create() 并撞名
-    // （session "ow-xxx" already exists），正是 10-19 那个 bug 的形态。
-    const sharedEntry = this.bySession.get(sessionId)
-    if (sharedEntry?.agent && this.ctx.agents.get(sharedEntry.sessionId)) {
-      const entry = { sessionId, agent: sharedEntry.agent, handle: null }
-      this.entries.set(deviceId, entry)
-      this.bySession.set(sessionId, entry)
-      return entry
-    }
+  async #ensureAgent(sessionId) {
+    const existing = this.agents.get(sessionId)
+    if (existing?.agent && this.ctx.agents.get(sessionId)) return { sessionId, ...existing }
 
     const live = this.ctx.agents.get(sessionId)
-
-    /** @type {(agentCtx: any, agent: any) => void} */
-    const setup = (agentCtx) => {
-      // The voice is registered in the agent's own scope: it applies to this
-      // conversation and disappears with it, so the desktop conversations the
-      // user has open keep their normal, technical register.
-      if (this.config.voice !== 'off') {
-        agentCtx.systemPrompt.section({
-          name: VOICE_SECTION_NAME,
-          order: VOICE_SECTION_ORDER,
-          text: assistantVoiceSection({ assistantName: this.config.assistantName }),
-        })
-      }
-      if (this.config.autoApproveTools) {
-        // Approval is granted by *answering* the approval waterfall, never by a
-        // guard. `ctx.tools.guard()` is deny-only: its declared type is
-        // `(execution) => string | undefined` and `guardReason()` turns any
-        // non-undefined return into the denial reason, so returning
-        // `{kind:'allow'}` from a guard denies every tool call with
-        // "Error: [object Object]" (measured on a real dsh instance).
-        // `{prepend:true}` makes this answerer run before any other and return
-        // its grant without chaining; `'allowed-once'` is the only outcome the
-        // approval service treats as a grant.
-        agentCtx.on('approval/request', () => Promise.resolve('allowed-once'), { prepend: true })
-      }
-    }
-
     if (live) {
-      const entry = { sessionId, agent: live, handle: null }
-      this.entries.set(deviceId, entry)
-      this.bySession.set(sessionId, entry)
-      return entry
+      const entry = { agent: live, handle: this.agents.get(sessionId)?.handle ?? null }
+      this.agents.set(sessionId, entry)
+      return { sessionId, ...entry }
     }
 
     // 到这里说明：内存里没有活动 agent。但会话可能已经**持久化在磁盘上**
@@ -402,13 +698,13 @@ export class DshBridge {
     // 正确顺序是：
     //   ① 先 `resume()` 恢复磁盘上的既有会话（保留历史，且能接管上次中断的轮次）
     //   ② 只有确认磁盘上也没有时，才 `create()` 新建
+    const setup = this.#setupFor(sessionId)
     const resumed = await this.#tryResumeAgent(sessionId, setup)
     if (resumed) {
-      const entry = { sessionId, agent: resumed.agent, handle: resumed.handle }
-      this.entries.set(deviceId, entry)
-      this.bySession.set(sessionId, entry)
-      this.log(`bridge: resumed conversation ${sessionId} for device ${deviceId}`)
-      return entry
+      const entry = { agent: resumed.agent, handle: resumed.handle }
+      this.agents.set(sessionId, entry)
+      this.log(`bridge: resumed conversation ${sessionId}`)
+      return { sessionId, ...entry }
     }
 
     const handle = await this.ctx.agents.create({
@@ -417,10 +713,10 @@ export class DshBridge {
       agentOptions: this.#agentOptions(),
       setup,
     })
-    const entry = { sessionId, agent: handle.agent, handle }
-    this.entries.set(deviceId, entry)
-    this.log(`bridge: created conversation ${sessionId} for device ${deviceId}`)
-    return entry
+    const entry = { agent: handle.agent, handle }
+    this.agents.set(sessionId, entry)
+    this.log(`bridge: created conversation ${sessionId}`)
+    return { sessionId, ...entry }
   }
 
   /**
@@ -495,21 +791,17 @@ export class DshBridge {
   // ---------------------------------------------------------------------------
 
   /**
-   * Route one durable session event.
-   *
-   * v2.1.0 looped over every device in the session and dispatched the *same*
-   * event into a per-device mutating call, which pushed the same assistant text
-   * N times and produced `done.text === 'T\n\nT'`. v2.2.0 reduces the event
-   * exactly once and emits a single session-scoped event for the gateway to
-   * broadcast.
+   * Route one durable session event. One event is reduced exactly once and
+   * emitted as a session-scoped event; the gateway fans it out to the devices
+   * bound to that session.
    * @param {any} session
    * @param {any} event
    */
   #onSessionEvent(session, event) {
     const sessionId = this.#sessionIdOf(session)
     if (!sessionId) return
-    // 只有本插件拥有的会话才处理：桌面上的其它会话不能把内容推给手机。
-    if (this.#devicesForSession(session).length === 0) return
+    // 只有本插件创建/接管的会话才处理：桌面上的其它会话不能把内容推给手机。
+    if (!this.agents.has(sessionId)) return
 
     switch (event?.type) {
       case 'turn/start':
@@ -722,17 +1014,6 @@ export class DshBridge {
     return session?.id ?? session?.header?.id ?? ''
   }
 
-  /** @param {any} session */
-  #devicesForSession(session) {
-    const id = this.#sessionIdOf(session)
-    if (!id) return []
-    const devices = []
-    for (const [deviceId, entry] of this.entries) {
-      if (entry.sessionId === id) devices.push(deviceId)
-    }
-    return devices
-  }
-
   /**
    * fileId 列表 → 手机端渲染文件卡片所需的元信息数组。
    * @param {string[] | undefined} fileIds
@@ -768,7 +1049,7 @@ export class DshBridge {
         mime: block.mime,
         size: block.size,
         path,
-        deviceId: call.deviceId,
+        sessionId: call.sessionId,
       })
       call.files = call.files ?? []
       if (!call.files.includes(fileId)) call.files.push(fileId)
@@ -920,6 +1201,64 @@ export function extractAssistantText(data) {
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text)
     .join('')
+}
+
+/** Text blocks of a user message's `content` array. */
+function extractUserText(data) {
+  const blocks = data?.content
+  if (!Array.isArray(blocks)) return typeof data?.text === 'string' ? data.text : ''
+  return blocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('')
+}
+
+/**
+ * One event of a DSH session log → one snapshot bubble for `session/state`.
+ *
+ * Only the two user-visible event kinds are mapped. `assistant/attempt` is not
+ * committed history (the loop may retry it), so it must not become a bubble.
+ * @param {any} event
+ * @returns {{id: string, kind: 'user'|'assistant', text: string, at: string} | undefined}
+ */
+export function historyMessageOf(event) {
+  const type = event?.type
+  let kind
+  let text
+  if (type === 'user/message') {
+    kind = 'user'
+    text = extractUserText(event?.data)
+  } else if (type === 'assistant/message') {
+    kind = 'assistant'
+    text = extractAssistantText(event?.data)
+  } else {
+    return undefined
+  }
+  if (!text) return undefined
+  return {
+    id: `hist_${event?.seq ?? 'x'}`,
+    kind,
+    text,
+    at: isoTimeOf(event?.time),
+  }
+}
+
+/** @param {unknown} value */
+function isoTimeOf(value) {
+  const ms = Number(value)
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : new Date().toISOString()
+}
+
+/**
+ * Is this a localized display string the phone can resolve (`{en, zh, ...}`)?
+ * Kept strict so a non-serializable reason cannot leak into the frame.
+ * @param {unknown} value
+ */
+export function isLocalizedText(value) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const entries = Object.entries(value)
+  if (entries.length === 0 || entries.length > 32) return false
+  return entries.every(([key, text]) => key.length <= 32 && typeof text === 'string' && text.length <= 500)
 }
 
 /**

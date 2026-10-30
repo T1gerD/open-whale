@@ -34,6 +34,12 @@ export const BACKOFF = Object.freeze({
 export const HELLO_TIMEOUT_MS = 12_000
 
 /**
+ * 「被替换」退避的重新计数窗口：两次 replaced 间隔超过它，就当作已经稳定，
+ * 退避重置回最短。两个窗口真的在互相抢时，间隔一定远小于这个窗口。
+ */
+export const REPLACED_RESET_MS = 5 * 60 * 1000
+
+/**
  * 竞速确认窗口（毫秒）。同一 deviceId 并发 hello 时，服务端可能把先 ack 的那条
  * 当作「旧连接」关掉；等一个短暂的确认窗口再定 winner，就能把「被顶掉」翻译成
  * 「换另一条已 ack 的候选」，而不是整轮重连死循环。
@@ -92,9 +98,12 @@ export function describeStatus(status) {
       }
     case CONNECTION_STATE.RECONNECTING: {
       if (status.replaced === true) {
+        const wait = Number.isFinite(Number(status.delayMs)) ? Math.max(1, Math.ceil(Number(status.delayMs) / 1000)) : 0
         return {
           title: '连接被新打开的设备/窗口替换',
-          detail: '另一个窗口或另一台设备用同一身份连上了这台电脑。为避免两边互相顶掉，已停止自动重连；点「重试」可抢回连接。',
+          detail: wait > 0
+            ? `另一个窗口或另一台设备用同一身份连上了这台电脑；${wait} 秒后会自动重试抢回连接。两个窗口互相抢时重试间隔会越来越长，关掉多余的窗口即可恢复。`
+            : '另一个窗口或另一台设备用同一身份连上了这台电脑；稍后会自动重试抢回连接。关掉多余的窗口即可恢复。',
           action: 'retry',
         }
       }
@@ -192,6 +201,15 @@ export class ConnectionManager {
     this.reconnectTimer = null
     this.lastInboundAt = 0
     this.stopped = true
+    /** 最近一次掉线是否因为「被同一身份的新连接替换」（可恢复，用长退避重连）。 */
+    this.replaced = false
+    /**
+     * 连续被替换的次数。它**不**随一次成功握手清零（两个窗口抢回来又马上被顶掉是
+     * 常态），而是靠时间窗口 {@link REPLACED_RESET_MS} 复位，从而让互相顶掉的
+     * 两个页面退避得越来越远，而不是每 2 秒循环一次。
+     */
+    this.replaceStreak = 0
+    this.lastReplacedAt = 0
     /** @type {object} 最近一次状态。 */
     this.lastStatus = { state: CONNECTION_STATE.IDLE }
   }
@@ -222,6 +240,8 @@ export class ConnectionManager {
     this.attempt = 0
     this.index = 0
     this.failures = []
+    this.replaced = false
+    this.replaceStreak = 0
     this.#connectCycle()
   }
 
@@ -229,6 +249,7 @@ export class ConnectionManager {
   stop(reason = '手动断开') {
     this.stopped = true
     this.cycle += 1 // 旧周期的迟到回调全部作废
+    this.replaced = false
     this.#clearTimers()
     this.#closeAll()
     this.current = null
@@ -270,6 +291,7 @@ export class ConnectionManager {
     this.#closeAll()
     this.cycle += 1
     this.index = 0
+    this.replaced = false
     if (resetAttempts) {
       this.attempt = 0
       this.failures = []
@@ -572,6 +594,7 @@ export class ConnectionManager {
     this.attempt = 0
     this.index = 0
     this.failures = []
+    this.replaced = false
     // 成功的地址排到第一位，下次重连先试它（协议：上次成功 > Tailscale > ...）。
     const successful = { url: context.url, kind: context.kind }
     this.candidates = [successful, ...this.candidates.filter(item => item.url !== context.url)]
@@ -623,6 +646,7 @@ export class ConnectionManager {
       this.#handleReplaced(reason)
       return
     }
+    this.replaced = false
     this.state = CONNECTION_STATE.RECONNECTING
     this.onOffline({ reason })
     this.#scheduleReconnect([{ url: context?.url ?? '', reason }])
@@ -631,38 +655,58 @@ export class ConnectionManager {
   /**
    * 连接被「同一设备的新连接」替换。
    *
-   * 为什么**不**自动重连：两个窗口/两台页面用同一个 deviceId 时，服务端会不断踢掉
-   * 旧连接；自动重连会让两边互相顶掉，形成每秒循环。这里停下来，把决定权交给用户
-   * （点「重试」抢回连接，或关掉另一个窗口）。
+   * 历史：v2.2.0 在这里直接停掉自动重连，理由是「两个窗口用同一个 deviceId 会
+   * 互相顶掉，自动重连会每秒循环」。副作用更糟：用户只是多开了一个窗口，关掉它
+   * 之后原页面**永远**停在「已断开」，只能手动点重试，手机上很容易以为插件坏了。
+   *
+   * 现在改成可恢复：仍然自动重连，但走**更长的指数退避**（每次被顶掉都退得更远，
+   * 直到 maxBackoffMs），所以两个窗口最多以 15s 的间隔互相让一下，不会形成
+   * 每秒循环；而只要另一个窗口被关掉，这边下一次重试就能拿回连接。
+   *
+   * 用户意图（`stopped`，由 stop() 设置）优先：明确断开时绝不自动重连。
    * @param {string} reason
    */
   #handleReplaced(reason) {
+    if (this.stopped) return
+    this.#clearTimers()
     this.live.clear()
     this.lastInboundAt = 0
     this.state = CONNECTION_STATE.RECONNECTING
+    this.replaced = true
+    const now = this.now()
+    if (now - this.lastReplacedAt > REPLACED_RESET_MS) this.replaceStreak = 0
+    this.replaceStreak += 1
+    this.lastReplacedAt = now
     this.onOffline({ reason, replaced: true })
-    this.#emitStatus({
-      state: CONNECTION_STATE.RECONNECTING,
-      reason,
-      replaced: true,
-      manual: true,
-      action: 'retry',
-      attempt: 0,
-    })
+    this.#scheduleReconnect([], { replaced: true, reason })
   }
 
   /** 安排下一次重连（指数退避）。 */
-  #scheduleReconnect() {
+  #scheduleReconnect(failed = [], options = {}) {
     if (this.stopped) return
     this.attempt += 1
-    const delayMs = Math.min(this.maxBackoffMs, reconnectDelay(this.attempt, { random: this.random }))
-    const failedUrls = [...new Set(this.failures.slice(-3).map(item => item.url).filter(Boolean))]
+    const replaced = options.replaced === true
+    // 被替换的重连按「连续被替换次数」退避：即使中间成功过一下，只要很快又被顶掉，
+    // 间隔也会继续变长。
+    const effectiveAttempt = replaced ? Math.max(this.attempt, this.replaceStreak) : this.attempt
+    const baseDelay = Math.min(this.maxBackoffMs, reconnectDelay(effectiveAttempt, { random: this.random }))
+    // 「被替换」再多等一倍：两个窗口用同一身份时，给对方一次自然让位的机会，
+    // 避免两个页面在同一毫秒一起重连、永远互相顶掉。
+    const delayMs = Math.min(this.maxBackoffMs, replaced ? baseDelay * 2 : baseDelay)
+    const failedUrls = [
+      ...new Set([
+        ...failed.map(item => item?.url),
+        ...this.failures.slice(-3).map(item => item?.url),
+      ].filter(Boolean)),
+    ].slice(-3)
+    const reason = options.reason ?? failed[0]?.reason ?? this.failures[this.failures.length - 1]?.reason
     this.state = CONNECTION_STATE.RECONNECTING
     this.#emitStatus({
       state: CONNECTION_STATE.RECONNECTING,
       attempt: this.attempt,
       delayMs,
-      reason: this.failures[this.failures.length - 1]?.reason,
+      reason,
+      replaced,
       failedUrls,
       action: 'retry',
     })

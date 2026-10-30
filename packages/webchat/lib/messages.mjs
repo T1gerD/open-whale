@@ -1,13 +1,18 @@
 // 会话模型：把电脑端推来的帧合并成一份「可直接渲染的消息列表」。
 //
-// 这是网页版最容易出 bug 的一层（v2.2.0 专门修的就是「重复拼接 / 看不到别人消息 /
-// 重连丢消息」），所以它被写成零 DOM 的纯逻辑，`test/messages.test.mjs` 全量覆盖：
+// 这一层刻意是零 DOM 的纯逻辑，`test/messages.test.mjs` 全量覆盖：
 //
 //  * 用户消息 id = `usr_<msgId>`（本地先插入，echo 回来时**更新**而不是再插一条）；
 //  * 助手消息 id = `msg_<callId>`（按 messageId upsert，`chat/done` 全文覆盖）；
 //  * `chat/delta` 只在不支持 `chat/message` 的老电脑端上追加，且按 seq 去重；
 //  * `session/state` 幂等覆盖，`session/events` 按 seq 回放，cursor 持久化；
+//  * v2.3.0：`sessions` / `session/selected` 维护会话选择器状态，会话切换后由
+//    `session/state` 整页替换消息；`approval/ask` 进队列、`approval/resolved` 出队，
+//    多条待办审批**排队**而不是互相覆盖；
 //  * 未知帧一律忽略（协议只增不改）。
+//
+// 协作（共享会话 / 在线成员 / 昵称前缀）已在 v2.3.0 删除：每台设备只驱动它当前
+// 绑定的那个 DSH 会话，消息里不再有 `speaker`。
 
 import { CLIENT_FRAME, SERVER_FRAME } from './protocol.mjs'
 import { clampAssistantText } from './protocol.mjs'
@@ -18,6 +23,12 @@ export const USER_MESSAGE_PREFIX = 'usr_'
 export const ASSISTANT_MESSAGE_PREFIX = 'msg_'
 /** 电脑推送的文件消息 id 前缀。 */
 export const FILE_MESSAGE_PREFIX = 'file_'
+
+/**
+ * 待处理审批的队列上限。电脑端超时（60s）后会补 `approval/resolved`，正常不会
+ * 堆积；这里留一个硬上限，保证一个出错的对端也不能把手机内存撑爆。
+ */
+export const APPROVAL_QUEUE_LIMIT = 8
 
 /** 本地消息状态。 */
 export const MESSAGE_STATUS = Object.freeze({
@@ -41,6 +52,63 @@ export function assistantMessageId(callId) {
 /** @param {string} fileId */
 export function fileMessageId(fileId) {
   return `${FILE_MESSAGE_PREFIX}${fileId}`
+}
+
+/**
+ * 归一化一条 `sessions` 里的会话摘要（`SessionSummary`）。
+ * 缺 id 的条目直接丢掉：没有 id 就没法 `session/select`。
+ * @param {any} raw
+ * @returns {any | undefined}
+ */
+export function normalizeSessionSummary(raw) {
+  if (!raw || typeof raw !== 'object') return undefined
+  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+  if (id === '') return undefined
+  const title = typeof raw.title === 'string' && raw.title.trim() !== '' ? raw.title.trim().slice(0, 200) : '新会话'
+  const createdAt = Number(raw.createdAt)
+  const updatedAt = Number(raw.updatedAt)
+  return {
+    id,
+    title,
+    ...(typeof raw.cwd === 'string' && raw.cwd !== '' ? { cwd: raw.cwd } : {}),
+    createdAt: Number.isFinite(createdAt) ? createdAt : 0,
+    ...(Number.isFinite(updatedAt) ? { updatedAt } : {}),
+    live: raw.live === true,
+    current: raw.current === true,
+  }
+}
+
+/**
+ * 归一化一条 `approval/ask`。
+ * @param {any} raw
+ * @param {number} now
+ * @returns {any | undefined}
+ */
+export function normalizeApproval(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object') return undefined
+  const approvalId = typeof raw.approvalId === 'string' ? raw.approvalId : ''
+  if (approvalId === '') return undefined
+  const expiresAt = Number(raw.expiresAt)
+  let displayReason = ''
+  if (raw.displayReason && typeof raw.displayReason === 'object') {
+    // `displayReason` 是本地化字典（至少含 en）；优先中文，其次 en。
+    const entries = raw.displayReason
+    displayReason = String(entries.zh ?? entries['zh-CN'] ?? entries.en ?? '')
+  } else if (typeof raw.displayReason === 'string') {
+    displayReason = raw.displayReason
+  }
+  return {
+    approvalId,
+    toolName: typeof raw.toolName === 'string' && raw.toolName !== '' ? raw.toolName : '工具',
+    ...(typeof raw.reason === 'string' && raw.reason !== '' ? { reason: raw.reason } : {}),
+    ...(displayReason !== '' ? { displayReason } : {}),
+    ...(typeof raw.callId === 'string' && raw.callId !== '' ? { callId: raw.callId } : {}),
+    ...(Number.isFinite(expiresAt) && expiresAt > 0 ? { expiresAt } : {}),
+    at: new Date(now).toISOString(),
+    /** 本地是否已经点过按钮（避免连点；电脑端 pending 期间不重发）。 */
+    replied: false,
+    repliedOutcome: undefined,
+  }
 }
 
 /**
@@ -99,9 +167,20 @@ export class ChatModel {
     /** @type {string | null} */
     this.sessionId = null
     this.sessionEpoch = 0
-    this.collaboration = false
-    /** @type {Array<{deviceId: string, name: string, online: boolean}>} */
-    this.participants = []
+    /** 当前会话的人类可读标题（来自 session/state / session/selected / 会话列表）。 */
+    this.sessionTitle = ''
+    /** @type {any[]} 电脑上的会话列表（`sessions` 帧，新的在前）。 */
+    this.sessions = []
+    /** `sessions.current`：电脑认为这台设备当前绑定的会话。 */
+    this.sessionsCurrent = ''
+    /** 会话列表是否被电脑截断。 */
+    this.sessionsTruncated = false
+    /** @type {any | null} 最近一次 session/selected 的结果（UI 用来提示/关面板）。 */
+    this.lastSessionSelection = null
+    /** @type {any[]} 待处理审批，队首是最早收到的。 */
+    this.approvals = []
+    /** @type {Map<string, any>} */
+    this.approvalsById = new Map()
     /** @type {{message: string, code?: string, at: string} | null} */
     this.lastError = null
     this.myDeviceId = options.myDeviceId ?? ''
@@ -167,7 +246,7 @@ export class ChatModel {
     }
   }
 
-  /** 清空会话（会话切换 / 用户手动清空）。 */
+  /** 清空会话（会话切换 / 用户手动清空）。审批属于某个会话，一并清掉。 */
   clearConversation() {
     this.messages = []
     this.byId.clear()
@@ -177,12 +256,60 @@ export class ChatModel {
     this.files.clear()
     this.cursor = 0
     this.lastError = null
+    this.clearApprovals()
     this.#touch()
   }
 
   /**
+   * 电脑端在 hello/ack 里告诉我们「你绑定的会话变了」（插件重启后重建了绑定、
+   * 或另一个窗口切换过会话）：旧会话的本地视图 / cursor / 审批全部作废，
+   * 等随后到达的 `session/state` 整页替换。
+   * @param {unknown} sessionId
+   * @param {unknown} sessionEpoch
+   * @returns {boolean} 是否真的换了会话
+   */
+  adoptServerSession(sessionId, sessionEpoch) {
+    const nextId = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null
+    const nextEpoch = Number.isFinite(Number(sessionEpoch)) ? Number(sessionEpoch) : 0
+    if (nextId === this.sessionId && nextEpoch === this.sessionEpoch) return false
+    this.clearConversation()
+    this.sessionId = nextId
+    this.sessionEpoch = nextEpoch
+    this.sessionTitle = ''
+    this.#touch()
+    return true
+  }
+
+  /** 清空待处理审批（会话切换、解绑时调用）。 */
+  clearApprovals() {
+    this.approvals = []
+    this.approvalsById.clear()
+  }
+
+  /**
+   * 本地已经点了审批按钮：标记该条为已回复，避免连点/重发。
+   * @param {string} approvalId
+   * @param {'allowed-once'|'rejected'} outcome
+   * @returns {boolean} false 表示这条审批已不在队列里（已 resolved / 已回复）
+   */
+  markApprovalReplied(approvalId, outcome) {
+    const approval = this.approvalsById.get(String(approvalId ?? ''))
+    if (!approval || approval.replied === true) return false
+    approval.replied = true
+    approval.repliedOutcome = outcome
+    approval.repliedAt = new Date().toISOString()
+    this.#touch()
+    return true
+  }
+
+  /** 是否还有未回答的审批（决定是否跑倒计时定时器）。 */
+  get hasPendingApprovals() {
+    return this.approvals.length > 0
+  }
+
+  /**
    * 本地先插入用户消息（乐观 UI）。之后 `chat/echo` 回来会按同一个 id 合并。
-   * @param {{msgId: string, text: string, at?: string, speaker?: string, files?: any[], status?: string}} input
+   * @param {{msgId: string, text: string, at?: string, files?: any[], status?: string}} input
    * @returns {any}
    */
   addLocalUserMessage(input) {
@@ -192,7 +319,6 @@ export class ChatModel {
       kind: 'user',
       text: String(input.text ?? ''),
       at: String(input.at ?? new Date().toISOString()),
-      speaker: input.speaker,
       files: normalizeAttachments(input.files),
       status: input.status ?? MESSAGE_STATUS.PENDING,
       msgId,
@@ -283,10 +409,14 @@ export class ChatModel {
         return this.#onSessionState(frame, now)
       case SERVER_FRAME.SESSION_EVENTS:
         return this.#onSessionEvents(frame, now)
-      case SERVER_FRAME.PARTICIPANTS:
-        return this.#onParticipants(frame, now)
-      case SERVER_FRAME.COLLAB_STATE:
-        return this.#onCollabState(frame, now)
+      case SERVER_FRAME.SESSIONS:
+        return this.#onSessions(frame, now)
+      case SERVER_FRAME.SESSION_SELECTED:
+        return this.#onSessionSelected(frame, now)
+      case SERVER_FRAME.APPROVAL_ASK:
+        return this.#onApprovalAsk(frame, now)
+      case SERVER_FRAME.APPROVAL_RESOLVED:
+        return this.#onApprovalResolved(frame, now)
       case SERVER_FRAME.FILE_OFFERED:
         return this.#onFileOffered(frame, now)
       case SERVER_FRAME.ERROR:
@@ -317,7 +447,6 @@ export class ChatModel {
       Object.assign(existing, {
         text: typeof frame.text === 'string' && frame.text !== '' ? frame.text : existing.text,
         at: String(frame.at ?? existing.at),
-        speaker: frame.speaker ?? existing.speaker,
         files: normalizeAttachments(frame.files).length > 0 ? normalizeAttachments(frame.files) : existing.files,
         status: MESSAGE_STATUS.SENT,
         deviceId: frame.deviceId,
@@ -332,7 +461,6 @@ export class ChatModel {
       kind: 'user',
       text: String(frame.text ?? ''),
       at: String(frame.at ?? new Date().toISOString()),
-      speaker: frame.speaker,
       files: normalizeAttachments(frame.files),
       status: MESSAGE_STATUS.SENT,
       msgId,
@@ -500,6 +628,12 @@ export class ChatModel {
     const sessionId = String(frame.sessionId ?? this.sessionId ?? '')
     const epoch = Number.isFinite(Number(frame.sessionEpoch)) ? Number(frame.sessionEpoch) : this.sessionEpoch
     const sessionChanged = sessionId !== this.sessionId || epoch !== this.sessionEpoch
+    if (sessionChanged) {
+      // 换会话 = 换一整套上下文：旧会话的待办审批与输入态必须先清掉，再按新快照
+      // 重建；否则上一会话的“正在输入”会残留到新会话里。
+      this.clearApprovals()
+      this.typing.clear()
+    }
     const snapshot = frame.snapshot && typeof frame.snapshot === 'object' ? frame.snapshot : {}
     const incoming = Array.isArray(snapshot.messages) ? snapshot.messages : []
     /** @type {any[]} */
@@ -539,11 +673,14 @@ export class ChatModel {
     this.byId = new Map(this.messages.map(message => [message.id, message]))
     this.parts.clear()
     this.deltaSeq.clear()
+    if (typeof frame.title === 'string' && frame.title !== '') this.sessionTitle = frame.title
     this.sessionId = sessionId
     this.sessionEpoch = epoch
-    this.collaboration = frame.collaboration === true
-    if (Number.isFinite(Number(frame.head))) {
-      this.cursor = Math.max(this.cursor, Number(frame.head))
+    const head = Number(frame.head)
+    if (Number.isFinite(head)) {
+      // 换会话后 cursor 必须跟着新会话走（取快照的 head，而不是和旧会话取 max），
+      // 否则下一次 session/sync 会用旧会话的 seq 去要增量。
+      this.cursor = sessionChanged ? Math.max(0, head) : Math.max(this.cursor, head)
     }
     this.#touch(now)
     return { handled: true, changed: true, sessionChanged, frame }
@@ -568,7 +705,6 @@ export class ChatModel {
       kind,
       text: String(raw.text ?? ''),
       at: String(raw.at ?? new Date(now).toISOString()),
-      speaker: raw.speaker,
       files: normalizeAttachments(raw.files),
       status: kind === 'assistant' ? MESSAGE_STATUS.DONE : MESSAGE_STATUS.SENT,
       msgId: raw.msgId,
@@ -586,6 +722,11 @@ export class ChatModel {
     if (sessionChanged) {
       this.sessionId = sessionId
       this.sessionEpoch = epoch
+      // 事件回放里出现新会话：上一会话的审批作废（电脑端会补 resolved，但界面要立刻清），
+      // cursor 也要从新会话的 from 重新起算，不能被旧会话的 seq 挡住。
+      this.clearApprovals()
+      this.typing.clear()
+      this.cursor = Number.isFinite(Number(frame.from)) ? Math.max(0, Number(frame.from)) : 0
     }
     let changed = false
     for (const event of events) {
@@ -605,40 +746,116 @@ export class ChatModel {
     return { handled: true, changed, sessionChanged, frame }
   }
 
-  /** @param {any} frame @param {number} now */
-  #onParticipants(frame, now) {
-    const list = Array.isArray(frame.participants) ? frame.participants : []
-    this.participants = list
-      .filter(item => item && typeof item.deviceId === 'string')
-      .map(item => ({
-        deviceId: item.deviceId,
-        name: String(item.name ?? item.deviceName ?? '设备'),
-        online: item.online !== false,
-        self: item.deviceId === this.myDeviceId,
-      }))
-    if (typeof frame.collaboration === 'boolean') this.collaboration = frame.collaboration
-    if (typeof frame.sessionId === 'string' && frame.sessionId !== '') this.sessionId = frame.sessionId
+  /**
+   * `sessions`：会话选择器的数据源（电脑上的 DSH 会话，新的在前）。
+   * 重复/非法条目直接过滤，`current` 以帧为准重算，避免本地标记过期。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onSessions(frame, now) {
+    const raw = Array.isArray(frame.sessions) ? frame.sessions : []
+    /** @type {any[]} */
+    const next = []
+    const seen = new Set()
+    for (const item of raw) {
+      const summary = normalizeSessionSummary(item)
+      if (!summary || seen.has(summary.id)) continue
+      seen.add(summary.id)
+      next.push(summary)
+    }
+    const current = typeof frame.current === 'string' && frame.current !== '' ? frame.current : this.sessionsCurrent
+    this.sessions = next
+    this.sessionsCurrent = current
+    this.sessionsTruncated = frame.truncated === true
+    for (const summary of this.sessions) summary.current = summary.id === current
+    // 列表里的标题比会话快照更及时（重命名后刷新列表就能看到）。
+    const active = this.sessions.find(summary => summary.id === this.sessionId)
+    if (active) this.sessionTitle = active.title
     this.#touch(now)
     return { handled: true, changed: true, frame }
   }
 
-  /** @param {any} frame @param {number} now */
-  #onCollabState(frame, now) {
-    this.collaboration = frame.on === true
-    const epoch = Number.isFinite(Number(frame.sessionEpoch)) ? Number(frame.sessionEpoch) : this.sessionEpoch
-    const sessionId = String(frame.sessionId ?? this.sessionId ?? '')
-    const sessionChanged = sessionId !== this.sessionId || epoch !== this.sessionEpoch
-    this.sessionEpoch = epoch
-    this.sessionId = sessionId
-    if (sessionChanged) {
-      // 协作模式开关会重建会话：本地旧消息必须清掉，等 session/state 快照。
-      this.clearConversation()
-      this.sessionId = sessionId
-      this.sessionEpoch = epoch
-      this.collaboration = frame.on === true
+  /**
+   * `session/selected`：`session/select` / `session/create` 的结果。
+   * 成功时电脑紧接着推 `session/state`，由它整页替换消息；这里只记录结果。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onSessionSelected(frame, now) {
+    const ok = frame.ok === true
+    const sessionId = typeof frame.sessionId === 'string' ? frame.sessionId : ''
+    const title = typeof frame.title === 'string' ? frame.title : ''
+    this.lastSessionSelection = {
+      ok,
+      sessionId,
+      title: title || undefined,
+      error: typeof frame.error === 'string' ? frame.error : undefined,
+      message: typeof frame.message === 'string' ? frame.message : undefined,
+      at: new Date(now).toISOString(),
+    }
+    if (ok) {
+      this.sessionsCurrent = sessionId || this.sessionsCurrent
+      for (const summary of this.sessions) summary.current = summary.id === this.sessionsCurrent
+      if (title !== '') this.sessionTitle = title
+      if (sessionId !== '' && sessionId !== this.sessionId) {
+        // 真正的消息替换在随后到达的 session/state；先清掉上一会话的审批。
+        this.clearApprovals()
+        this.typing.clear()
+      }
     }
     this.#touch(now)
-    return { handled: true, changed: true, sessionChanged, needsSync: sessionChanged, frame }
+    return { handled: true, changed: true, frame, selection: this.lastSessionSelection }
+  }
+
+  /**
+   * `approval/ask`：进待处理队列。同 approvalId 的重发只更新内容（幂等），
+   * 不同 approvalId 一律排队——多条请求同时到来时不能互相覆盖。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onApprovalAsk(frame, now) {
+    const approval = normalizeApproval(frame, now)
+    if (!approval) return { handled: true, changed: false, frame }
+    const existing = this.approvalsById.get(approval.approvalId)
+    if (existing) {
+      Object.assign(existing, approval, {
+        replied: existing.replied === true,
+        repliedOutcome: existing.repliedOutcome,
+        repliedAt: existing.repliedAt,
+      })
+      this.#touch(now)
+      return { handled: true, changed: true, frame, approval: existing }
+    }
+    if (this.approvals.length >= APPROVAL_QUEUE_LIMIT) {
+      const dropped = this.approvals.shift()
+      if (dropped) this.approvalsById.delete(dropped.approvalId)
+    }
+    this.approvals.push(approval)
+    this.approvalsById.set(approval.approvalId, approval)
+    this.#touch(now)
+    return { handled: true, changed: true, frame, approval }
+  }
+
+  /**
+   * `approval/resolved`：出队（无论结果如何都不该再显示可点的按钮）。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onApprovalResolved(frame, now) {
+    const approvalId = String(frame.approvalId ?? '')
+    if (approvalId === '') return { handled: true, changed: false, frame }
+    const index = this.approvals.findIndex(item => item.approvalId === approvalId)
+    this.approvalsById.delete(approvalId)
+    if (index >= 0) this.approvals.splice(index, 1)
+    const outcome = typeof frame.outcome === 'string' ? frame.outcome : ''
+    const source = typeof frame.source === 'string' ? frame.source : ''
+    if (index >= 0) this.#touch(now)
+    return {
+      handled: true,
+      changed: index >= 0,
+      frame,
+      resolved: { approvalId, outcome, source },
+    }
   }
 
   /** @param {any} frame @param {number} now */
@@ -702,18 +919,16 @@ export class ChatModel {
   snapshotForStorage(options = {}) {
     const limit = options.limit ?? 200
     return {
-      version: 1,
+      version: 2,
       sessionId: this.sessionId,
       sessionEpoch: this.sessionEpoch,
+      sessionTitle: this.sessionTitle,
       cursor: this.cursor,
-      collaboration: this.collaboration,
-      participants: this.participants.slice(0, 20),
       messages: this.messages.slice(-limit).map(message => ({
         id: message.id,
         kind: message.kind,
         text: message.text,
         at: message.at,
-        speaker: message.speaker,
         files: message.files,
         status: message.status === MESSAGE_STATUS.PENDING ? MESSAGE_STATUS.ERROR : message.status,
         error: message.error,
@@ -727,6 +942,9 @@ export class ChatModel {
 
   /**
    * 从 localStorage 恢复。
+   *
+   * 待处理审批**不**落盘：`approval/ask` 是一次性、有时效的请求，刷新后界面
+   * 重新等电脑端推；把旧卡片恢复出来只会让人对已经超时的请求点按钮。
    * @param {any} saved
    * @returns {boolean}
    */
@@ -738,6 +956,7 @@ export class ChatModel {
     this.deltaSeq.clear()
     this.typing.clear()
     this.files.clear()
+    this.clearApprovals()
     for (const raw of saved.messages) {
       if (!raw || typeof raw.id !== 'string') continue
       const message = { ...raw, tools: Array.isArray(raw.tools) ? raw.tools : [] }
@@ -748,9 +967,8 @@ export class ChatModel {
     }
     this.sessionId = typeof saved.sessionId === 'string' ? saved.sessionId : null
     this.sessionEpoch = Number.isFinite(Number(saved.sessionEpoch)) ? Number(saved.sessionEpoch) : 0
+    this.sessionTitle = typeof saved.sessionTitle === 'string' ? saved.sessionTitle : ''
     this.cursor = Number.isFinite(Number(saved.cursor)) ? Number(saved.cursor) : 0
-    this.collaboration = saved.collaboration === true
-    this.participants = Array.isArray(saved.participants) ? saved.participants : []
     this.#trim()
     this.#touch()
     return true

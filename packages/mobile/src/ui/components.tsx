@@ -11,7 +11,6 @@ import {
   Animated,
   Modal,
   Pressable,
-  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -346,7 +345,7 @@ export function StatusPill({
   )
 }
 
-/** 小标签：网络类型、协作模式等。 */
+/** 小标签：网络类型、会话状态（live/当前）等。 */
 export function Chip({
   label,
   tone = 'neutral',
@@ -399,18 +398,16 @@ function initialOf(name: string): string {
   return Array.from(trimmed)[0]!.toUpperCase()
 }
 
-/** 参与者/助理头像：取名字首字母，颜色由名字稳定决定；右下角在线小圆点。 */
+/** 助理头像：取名字首字母，颜色由名字稳定决定；右下角在线小圆点。 */
 export function Avatar({
   name,
   size = 40,
   online,
-  isMe,
   style,
 }: {
   name: string
   size?: number
   online?: boolean
-  isMe?: boolean
   style?: StyleProp<ViewStyle>
 }) {
   const theme = useTheme()
@@ -426,8 +423,6 @@ export function Avatar({
             height: size,
             borderRadius: size / 2,
             backgroundColor: avatarTone(name),
-            borderColor: isMe ? theme.colors.accent : 'transparent',
-            borderWidth: isMe ? 2 : 0,
             opacity: online === false ? 0.55 : 1,
           },
         ]}
@@ -452,42 +447,6 @@ export function Avatar({
         />
       ) : null}
     </View>
-  )
-}
-
-export interface Person {
-  deviceId: string
-  name: string
-  online: boolean
-  isMe?: boolean
-}
-
-/** 聊天页/设置页顶部的参与者头像条：在线绿点，自己带主色描边。 */
-export function AvatarBar({
-  people,
-  style,
-  max = 8,
-}: {
-  people: Person[]
-  style?: StyleProp<ViewStyle>
-  max?: number
-}) {
-  const styles = useThemedStyles(createAvatarStyles)
-  if (people.length === 0) return null
-  const shown = people.slice(0, max)
-  const hidden = people.length - shown.length
-  return (
-    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={[styles.bar, style]}>
-      {shown.map(person => (
-        <View key={person.deviceId} style={styles.barItem}>
-          <Avatar name={person.name} size={28} online={person.online} isMe={person.isMe} />
-          <Text style={styles.barName} numberOfLines={1}>
-            {person.isMe ? '我' : person.name}
-          </Text>
-        </View>
-      ))}
-      {hidden > 0 ? <View style={styles.barItem}><Chip label={`+${hidden}`} /></View> : null}
-    </ScrollView>
   )
 }
 
@@ -1048,9 +1007,6 @@ const createAvatarStyles = (theme: Theme) =>
     avatar: { alignItems: 'center', justifyContent: 'center' },
     avatarText: { color: '#FFFFFF', fontWeight: '700' },
     presence: { position: 'absolute' },
-    bar: { flexDirection: 'row', alignItems: 'center', gap: spacing.md, paddingVertical: spacing.sm },
-    barItem: { alignItems: 'center', gap: 4, maxWidth: 64 },
-    barName: { color: theme.colors.textMuted, fontSize: font.tiny, maxWidth: 64 },
   })
 
 const createEmptyStyles = (theme: Theme) =>

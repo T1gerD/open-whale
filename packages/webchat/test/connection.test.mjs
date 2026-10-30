@@ -403,16 +403,22 @@ test('describeStatus 把状态翻成可操作中文文案', () => {
   assert.match(replaced.title, /替换/)
   assert.match(replaced.detail, /重试|窗口/)
   assert.equal(replaced.action, 'retry')
+  const replacedWithDelay = describeStatus({ state: CONNECTION_STATE.RECONNECTING, replaced: true, delayMs: 4000 })
+  assert.match(replacedWithDelay.detail, /4 秒后/)
   assert.equal(describeStatus({ state: CONNECTION_STATE.STOPPED }).title, '已断开')
   assert.equal(describeStatus({}).title, '未连接')
 })
 
 // ---------------------------------------------------------------------------
-// 竞速确认窗口 / 「被新连接替换」死循环回归测试
+// 竞速确认窗口 / 「被新连接替换」回归测试
 //
 // 背景（真实联调 bug）：同一 deviceId 的两条 socket 并发 hello，电脑端只允许一条
 // 会话时会把先连上的以「replaced」踢掉。旧实现把「winner 被踢」当成普通掉线，
 // 于是重新竞速 → 两条又互相顶掉 → 每秒循环，永远不 online。
+//
+// 2.2.0 的修法是把 replaced 当成永久停止自动重连，副作用是：多开一个窗口后，
+// 原页面关掉新窗口也不会再恢复（手机上看起来就是卡死）。v2.3.0 改成**可恢复**：
+// 仍自动重连，但走更长的指数退避，并尊重 stop() 的意图。
 // ---------------------------------------------------------------------------
 
 test('isReplacedClose 识别各种「被替换」措辞', () => {
@@ -490,7 +496,7 @@ test('确认窗口内 winner 被 replaced 且另一条还没 ack：等它 ack �
   assert.equal(online.length, 1)
 })
 
-test('已在线后收到 replaced close：不自动重连，状态标记 replaced 等待用户重试', () => {
+test('已在线后收到 replaced close：可恢复，按更长退避自动重连', () => {
   FakeSocket.reset()
   const clock = createClock()
   const { manager, offline, statuses } = createManager(clock, { candidates: [LAN], settleMs: 0 })
@@ -502,16 +508,66 @@ test('已在线后收到 replaced close：不自动重连，状态标记 replace
 
   socket.close(1000, 'replaced by a newer connection')
   assert.equal(manager.online, false)
+  assert.equal(manager.replaced, true)
   assert.equal(offline.length, 1)
   assert.equal(offline[0].replaced, true)
   const last = statuses[statuses.length - 1]
   assert.equal(last.state, CONNECTION_STATE.RECONNECTING)
   assert.equal(last.replaced, true)
-  assert.equal(last.manual, true)
-  assert.equal(clock.pending(), 0, '不能留自动重连定时器（否则两窗口互相顶掉死循环）')
+  assert.equal(last.attempt, 1)
+  // 被替换的重连刻意比普通掉线慢一倍：random=0.5 时第一次是 2s（普通掉线 1s）。
+  assert.equal(last.delayMs, 2000)
+  assert.match(manager.statusText().detail, /重试|窗口/)
+  assert.ok(clock.pending() >= 1, '必须留下自动重连定时器')
+
   const count = FakeSocket.instances.length
-  clock.advance(60_000)
-  assert.equal(FakeSocket.instances.length, count, '不应自动创建新连接')
+  clock.advance(1999)
+  assert.equal(FakeSocket.instances.length, count, '退避没到点不能重连')
+  clock.advance(1)
+  assert.equal(FakeSocket.instances.length, count + 1, '到点后自动抢回连接')
+
+  const fresh = FakeSocket.instances[count]
+  fresh.open()
+  fresh.receive({ t: 'hello/ack', paired: true, heartbeatMs: 25_000 })
+  assert.equal(manager.online, true, '抢回后必须真的在线，而不是卡在「已断开」')
+  assert.equal(manager.replaced, false)
+  assert.equal(statuses[statuses.length - 1].state, CONNECTION_STATE.ONLINE)
+})
+
+test('连续被替换时退避越来越长（不会每秒互相顶掉）', () => {
+  FakeSocket.reset()
+  const clock = createClock()
+  const { manager, statuses } = createManager(clock, { candidates: [LAN], settleMs: 0 })
+  manager.start()
+  FakeSocket.instances[0].open()
+  FakeSocket.instances[0].receive({ t: 'hello/ack', paired: true, heartbeatMs: 25_000 })
+  FakeSocket.instances[0].close(1000, 'replaced by a newer connection')
+  const firstDelay = statuses[statuses.length - 1].delayMs
+  clock.advance(firstDelay)
+  const second = FakeSocket.instances[FakeSocket.instances.length - 1]
+  second.open()
+  second.receive({ t: 'hello/ack', paired: true, heartbeatMs: 25_000 })
+  second.close(1000, 'replaced by a newer connection')
+  const secondDelay = statuses[statuses.length - 1].delayMs
+  assert.ok(secondDelay > firstDelay, `第二次退避必须更长：${secondDelay} > ${firstDelay}`)
+})
+
+test('replaced 之后的自动重连仍尊重 stop() 意图（手动断开不再重连）', () => {
+  FakeSocket.reset()
+  const clock = createClock()
+  const { manager, statuses } = createManager(clock, { candidates: [LAN], settleMs: 0 })
+  manager.start()
+  const socket = FakeSocket.instances[0]
+  socket.open()
+  socket.receive({ t: 'hello/ack', paired: true, heartbeatMs: 25_000 })
+  socket.close(1000, 'replaced by a newer connection')
+  const count = FakeSocket.instances.length
+
+  manager.stop('用户手动断开')
+  assert.equal(statuses[statuses.length - 1].state, CONNECTION_STATE.STOPPED)
+  clock.advance(120_000)
+  assert.equal(FakeSocket.instances.length, count, 'stop() 之后不能再自动创建连接')
+  assert.equal(clock.pending(), 0)
 })
 
 test('落选 socket 之后的 close 被忽略（不影响在线状态）', () => {

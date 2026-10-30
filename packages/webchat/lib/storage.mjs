@@ -20,7 +20,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   preferredEndpoint: '',
   /** 用户手动添加的地址（最多 8 个）。 */
   manualEndpoints: [],
-  /** 设备昵称（协作模式里显示）；空 = 用 UA 推断的默认名。 */
+  /** 设备名称（只用于电脑端的设备列表；聊天里不再有昵称前缀）。空 = 用 UA 推断的默认名。 */
   deviceName: '',
   /** 上次刷新时页面是不是独立窗口（用于提示安装到主屏幕）。 */
   standaloneHintDismissed: false,
@@ -231,6 +231,33 @@ export function createStorage(storage, prefix = STORAGE_PREFIX) {
     /** @param {string} deviceId */
     clearOutbox(deviceId) {
       removeRaw(`outbox.${deviceId}`)
+    },
+    /**
+     * 这台设备上次选中的 DSH 会话。按设备（= 电脑助手）分开存，换一台电脑不会
+     * 把上一台电脑的 sessionId 拿来乱选。
+     * @param {string} deviceId
+     * @returns {string} 没有记录时返回空串
+     */
+    loadLastSession(deviceId) {
+      if (!deviceId) return ''
+      const saved = parseStored(getRaw(`session.${deviceId}`))
+      const sessionId = saved && typeof saved.sessionId === 'string' ? saved.sessionId : ''
+      return sessionId.length > 0 && sessionId.length <= 200 ? sessionId : ''
+    },
+    /** @param {string} deviceId @param {string} sessionId */
+    saveLastSession(deviceId, sessionId) {
+      if (!deviceId) return false
+      const value = String(sessionId ?? '').trim()
+      if (value === '' || value.length > 200) {
+        removeRaw(`session.${deviceId}`)
+        return true
+      }
+      return setRaw(`session.${deviceId}`, JSON.stringify({ sessionId: value, at: new Date().toISOString() }))
+    },
+    /** @param {string} deviceId */
+    clearLastSession(deviceId) {
+      if (!deviceId) return
+      removeRaw(`session.${deviceId}`)
     },
   }
 }

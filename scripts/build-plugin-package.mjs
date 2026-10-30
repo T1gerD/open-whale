@@ -3,9 +3,10 @@
 // A DSH plugin is installed straight from a tarball (or from npm), and the install
 // is a *copy*, so the package must be complete and self-contained: the entrypoint,
 // every module it imports (including the generated `src/protocol.mjs`), the bundle
-// patch, the README, and — since 2.2.0 — the web/PWA client served at
-// `/openwhale/app` (that is what makes the same plugin usable from HarmonyOS and
-// iOS browsers without an app store).
+// patch, the README, the DSH Web client plugin page under `lib/` (v2.3.0: the
+// `plugins.bundle.config` slot that replaced the `/openwhale` chat command), and —
+// since 2.2.0 — the web/PWA client served at `/openwhale/app` (that is what makes
+// the same plugin usable from HarmonyOS and iOS browsers without an app store).
 //
 // File discovery is dynamic on purpose. A pinned list is auditable but silently
 // ships a broken package the moment someone adds a module and forgets the list;
@@ -54,13 +55,13 @@ function walk(dir, prefix = '') {
   return found
 }
 
-/** The plugin's own source and helper scripts. */
+/** The plugin's own source, client bundle and helper scripts. */
 function pluginFiles() {
   const files = new Set()
   for (const file of FIXED_FILES) {
     if (existsSync(join(pluginDir, file))) files.add(file)
   }
-  for (const sub of ['src', 'scripts']) {
+  for (const sub of ['src', 'lib', 'scripts']) {
     if (!existsSync(join(pluginDir, sub))) continue
     for (const rel of walk(pluginDir, sub)) files.add(rel)
   }
@@ -102,6 +103,16 @@ for (const required of ['index.html', 'app.js']) {
     process.exit(1)
   }
 }
+// v2.3.0：客户端插件页。包清单必须真的带上它，`--check` 也必须能对出来——否则
+// 发出去的 tarball 在 DSH 设置里看不到 Open Whale 插件页，而构建却是"绿"的。
+if (!files.includes('lib/client.js')) {
+  console.error('lib/client.js is required (the DSH Web plugin page is registered from it)')
+  process.exit(1)
+}
+if (pkg.dsh?.client?.platform !== 'web' || pkg.exports?.['./client'] === undefined) {
+  console.error('package.json must declare dsh.client.platform = "web" and export "./client" (lib/client.js)')
+  process.exit(1)
+}
 
 const totalBytes = (list, root) =>
   list.reduce((sum, file) => sum + statSync(join(root, file)).size, 0)
@@ -136,7 +147,7 @@ function stagePackage(stage, { forNpm }) {
     // the staged manifest has to mention webchat or the published tarball would
     // install fine and then 404 every asset.
     const stagedPkg = JSON.parse(readFileSync(join(stage, 'package.json'), 'utf8'))
-    stagedPkg.files = ['src', 'scripts', 'webchat', 'cordis.patch.yml', 'README.md', 'LICENSE']
+    stagedPkg.files = ['src', 'lib', 'scripts', 'webchat', 'cordis.patch.yml', 'README.md', 'LICENSE']
     writeFileSync(join(stage, 'package.json'), `${JSON.stringify(stagedPkg, null, 2)}\n`)
   }
 }

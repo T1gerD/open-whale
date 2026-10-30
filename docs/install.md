@@ -50,8 +50,7 @@ dsh --profile <你的profile> --dump-config | grep -A2 openwhale
 | `cwd` | 空 | 手机对话的工作目录；留空用当前工作区 |
 | `allowRemoteShutdown` | `true` | 是否允许手机远程关机/重启（取消始终可用） |
 | `shutdownDelaySeconds` | `30` | 关机宽限秒数，期间可取消 |
-| `autoApproveTools` | `false` | 手机会话是否自动批准所有工具调用 |
-| `collaboration` | `false` | 多人协作：多台手机共用一个对话并互相可见（也可在配对页/手机端随时切换） |
+| `autoApproveTools` | `false` | 手机会话是否自动批准所有工具调用（一般保持关闭，让请求转到手机逐条确认） |
 | `connectionMode` | `auto` | 连接方式偏好：`auto`（Tailscale → 局域网 → 隧道）、`lan`、`tailscale`、`tunnel`；也可在配对页选择，保存在 state.json |
 | `tunnelMode` | `off` | `off` 或 `quick`（cloudflared 快速隧道） |
 | `cloudflaredPath` | 空 | cloudflared 可执行文件路径；留空自动探测 |
@@ -75,9 +74,11 @@ dsh --profile <你的profile> --dump-config | grep -A2 openwhale
 
 | 方式 | 怎么做 |
 |---|---|
-| 浏览器（推荐） | 打开 `http://127.0.0.1:<DSH端口>/openwhale`。端口从 DSH 启动日志里找，例如 `dsh web: http://127.0.0.1:3080/` |
-| DSH 命令 | 在任意 DSH 会话里执行 `/openwhale`，终端会打印二维码和指纹 |
+| 插件页（推荐） | **DSH 设置 → 插件 → Open Whale**：页面内直接显示绑定二维码与已绑定设备 |
+| 浏览器 | 打开 `http://127.0.0.1:<DSH端口>/openwhale`（插件页里也有「在浏览器中打开」）。端口从 DSH 启动日志里找，例如 `dsh web: http://127.0.0.1:3080/` |
 | 图片 | `http://127.0.0.1:<端口>/openwhale/qr.png`（或 `qr.svg`） |
+
+> v2.3.0 删掉了聊天输入框「+」里的 `/openwhale` 命令：二维码只放在插件页与浏览器页里。
 
 配对页会同时显示**两个二维码**：左边是手机 App 的绑定二维码，右边是**网页版（PWA）地址**的二维码——鸿蒙 / iOS / 任意浏览器用系统相机扫右边那个就能直接打开聊天界面，不需要安装 App。
 
@@ -86,16 +87,16 @@ dsh --profile <你的profile> --dump-config | grep -A2 openwhale
 | 路径 | 用途 | 谁能访问 |
 |---|---|---|
 | `/openwhale` | 配对页：二维码、连接方式、发送到手机、已绑定设备 | 任意（远程只读） |
-| `/openwhale/health` | 健康检查：版本、电脑 ID、绑定/协作状态、连接方式、分类地址 | 任意（只读） |
+| `/openwhale/health` | 健康检查：版本、电脑 ID、绑定状态、连接方式、分类地址 | 任意（只读） |
 | `/openwhale/info` | 电脑 ID、名称、公钥指纹、分类地址、绑定状态 | 任意（只读） |
 | `/openwhale/pairing.json` | 二维码里的原始载荷（含一次性密钥） | 任意（只读） |
 | `/openwhale/app` | 内置网页版 / PWA 客户端 | 任意（只读静态资源） |
 | `/openwhale/connection-mode` | 查看/设置连接方式（`GET` / `POST ?mode=auto\|lan\|tailscale\|tunnel`） | POST 仅本机 |
 | `/openwhale/send-file` | 电脑 → 手机发文件（`POST {path, name?}`） | **仅本机** |
-| `/openwhale/unbind`、`/openwhale/device-rename`、`/openwhale/collaboration` | 解绑/改名/协作开关 | **仅本机** |
+| `/openwhale/unbind`、`/openwhale/device-rename` | 解绑/改名 | **仅本机** |
 | `/openwhale/qr.png`、`/openwhale/qr.svg` | 二维码图片（含一次性密钥） | **仅本机** |
 
-> 「仅本机」= 请求必须来自这台电脑的环回地址，且不能带 `x-forwarded-for` 等代理头。这样即使公网隧道把 `/openwhale` 暴露出去，拿到隧道 URL 的人也无法解绑手机、改协作开关或读取配对密钥；在远程打开的页面上，这些控件会显示为只读并提示回本机操作。
+> 「仅本机」= 请求必须来自这台电脑的环回地址，且不能带 `x-forwarded-for` 等代理头。这样即使公网隧道把 `/openwhale` 暴露出去，拿到隧道 URL 的人也无法解绑手机或读取配对密钥；在远程打开的页面上，这些控件会显示为只读并提示回本机操作。
 
 **二维码 10 分钟有效，且只能用一次。** 重新生成会让上一个立即失效。
 
@@ -155,15 +156,19 @@ Tailscale 的典型用法：电脑和手机都登录同一个 tailnet，电脑�
 
 协议本身按「中继不可信」设计：身份验证与鉴权都在应用层，换中继不需要改协议。
 
-## 六、多设备、协作模式与网页版
+## 六、多设备、会话选择与网页版
 
 ### 多台手机
 
-一台电脑最多绑 5 台手机（`state.json` 里逐台记录）。配对页可以给每台设备改名或单独移除；手机端也可以自己解绑。设备之间默认**各自独立**：每台手机一个 DSH 会话，互不可见。
+一台电脑最多绑 5 台手机（`state.json` 里逐台记录）。配对页可以给每台设备改名或单独移除；手机端也可以自己解绑。设备之间默认**各自独立**：每台手机驱动自己当前选中的那个 DSH 会话。
 
-### 协作模式（多台手机共用一个对话）
+### 会话选择（v2.3.0）
 
-在配对页或手机端切换「协作模式」：开启后所有已绑定手机落到**同一个会话**，能看到彼此的提问和 AI 的回复（消息带发送者昵称），回复不会重复拼接。切换会立即生效，不需要重启插件，也不需要重连；电脑端会广播 `collab/state` / `session/state` / `session/participants`。
+手机 / 网页版的聊天页顶部有「会话」入口：列出电脑上的全部 DSH 会话（标题、创建时间、是否正在运行），点一个就续上那个会话的历史，也可以「新建会话」。选中的会话记在设备绑定里，重开应用自动恢复；同一台电脑上的两台手机可以各看各的，也可以各自选中同一个会话（此时它们在同一份历史里协作——但不再有协作开关、在线成员或昵称前缀）。
+
+### 手机处理权限请求（v2.3.0）
+
+电脑上的 DSH 要审批某个工具调用时，请求会转到绑定了该会话的在线手机：显示工具名与原因，可选「允许一次 / 拒绝」。60 秒没人作答、手机离线或请求被中止时，请求自动交回电脑端的 DSH 弹窗，不会把一轮卡死。审批只授权这一次调用，**不改变沙箱边界**。
 
 ### 网页版 / PWA
 
@@ -216,7 +221,7 @@ node scripts/verify-install.mjs http://127.0.0.1:<端口>
 | `$DSH_HOME/openwhale/state.json` | 电脑身份密钥、配对窗口、已绑定手机（权限 0600，原子写） |
 | `$DSH_HOME/openwhale/openwhale.log` | 插件自己的日志（就绪、端口、隧道地址、配对/解绑、错误）——**排错先看这里** |
 | `<会话工作目录>/.openwhale/uploads/` | 手机发来的附件落盘位置（v2.2.0 起改到这里，保证 DSH 文件沙箱读得到；会话工作目录由 `cwd` 配置决定，默认是插件进程的当前目录） |
-| DSH 会话日志 | 协作模式所有手机共用一个会话；非协作模式每台手机一个，id 形如 `ow-<hash>` |
+| DSH 会话日志 | 每台手机驱动自己选中的 DSH 会话；绑定关系保存在 state.json 的 `deviceSession` |
 
 > 为什么有独立日志文件：`ctx.logger` 不一定挂载了可用的输出端，而插件在"手机连不上"时最需要能看到自身状态。所以每条插件日志都同时写到 `openwhale.log`。
 

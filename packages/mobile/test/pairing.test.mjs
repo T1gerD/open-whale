@@ -244,20 +244,19 @@ test('hello carries capabilities, cursor and sessionId when known', () => {
   assert.equal('sessionId' in bare, false)
 })
 
-test('hello/ack exposes 2.2.0 session fields and classified endpoints', () => {
+test('hello/ack exposes the session fields and classified endpoints (and no collaboration flag)', () => {
   const outcome = interpretHelloAck(
     {
       t: 'hello/ack',
-      version: '1.1.0',
+      version: '1.2.0',
       computerId: 'cmp_abc123',
       computerFingerprint: 'aabb',
       paired: true,
       heartbeatMs: 25_000,
-      capabilities: ['chat-echo-v1', 'session-sync-v1', 'upload-v1'],
+      capabilities: ['chat-echo-v1', 'session-sync-v1', 'upload-v1', 'sessions-v1', 'approval-v1'],
       sessionId: 'sess_shared',
       sessionEpoch: 3,
       eventCursor: 42,
-      collaboration: true,
       connectionMode: 'tailscale',
       endpointList: [
         { url: 'http://100.88.1.2:8787', kind: 'tailscale' },
@@ -268,11 +267,12 @@ test('hello/ack exposes 2.2.0 session fields and classified endpoints', () => {
     { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
   )
   assert.equal(outcome.ok, true)
-  assert.deepEqual(outcome.capabilities, ['chat-echo-v1', 'session-sync-v1', 'upload-v1'])
+  assert.deepEqual(outcome.capabilities, ['chat-echo-v1', 'session-sync-v1', 'upload-v1', 'sessions-v1', 'approval-v1'])
   assert.equal(outcome.sessionId, 'sess_shared')
   assert.equal(outcome.sessionEpoch, 3)
   assert.equal(outcome.eventCursor, 42)
-  assert.equal(outcome.collaboration, true)
+  // 2.3.0 删掉了协作：hello/ack 不再带 collaboration，解析结果里也不该出现这个键。
+  assert.equal('collaboration' in outcome, false)
   assert.equal(outcome.connectionMode, 'tailscale')
   assert.deepEqual(outcome.endpoints, [
     'http://100.88.1.2:8787',
@@ -290,17 +290,16 @@ test('an old hello/ack without 2.2.0 fields degrades to "no capabilities"', () =
   assert.deepEqual(outcome.capabilities, [])
   assert.equal(outcome.sessionId, undefined)
   assert.equal(outcome.eventCursor, undefined)
-  assert.equal(outcome.collaboration, undefined)
 })
 
 test('the displayed server version is the plugin version, not the protocol version', () => {
-  // 真实插件：version='1.1.0'（协议版本）、serverVersion='2.2.0'（插件版本）
+  // 真实插件：version='1.2.0'（协议版本）、serverVersion='2.3.0'（插件版本）
   const withPluginVersion = interpretHelloAck(
-    { t: 'hello/ack', version: '1.1.0', serverVersion: '2.2.0', computerId: 'cmp_abc123', computerFingerprint: 'aabb', paired: true },
+    { t: 'hello/ack', version: '1.2.0', serverVersion: '2.3.0', computerId: 'cmp_abc123', computerFingerprint: 'aabb', paired: true },
     { computerId: 'cmp_abc123', fingerprint: 'aabb', pairing: false },
   )
   assert.equal(withPluginVersion.ok, true)
-  assert.equal(withPluginVersion.patch.serverVersion, '2.2.0')
+  assert.equal(withPluginVersion.patch.serverVersion, '2.3.0')
 
   // 老插件没有 serverVersion：回退到协议版本，至少不显示 undefined
   const legacy = interpretHelloAck(

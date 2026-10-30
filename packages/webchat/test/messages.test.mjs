@@ -1,8 +1,10 @@
 // 会话合并（帧去重 / 增量合并 / 快照覆盖 / 事件回放）测试。
 //
-// 这是 v2.2.0 缺陷密度最高的一层：四条历史 bug 都落在这里——
+// 这是网页版缺陷密度最高的一层：四条历史 bug 都落在这里——
 //   同一条消息投递两次（幂等 / usr_ 去重）、协作模式回复重复拼接（msg_ upsert）、
 //   多设备看不到别人消息（chat/echo）、重连丢消息（session/state + events）。
+// v2.3.0 删掉协作后，这一层还负责会话切换（sessions / session/selected / session/state）
+// 与审批队列（approval/ask 排队、approval/resolved 出队）。
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -48,13 +50,12 @@ test('本地用户消息 + chat/echo 回显不会产生第二条气泡', () => {
   assert.equal(model.cursor, 1)
 })
 
-test('别人发来的 chat/echo 追加成带昵称的用户气泡', () => {
+test('同一身份另一个窗口的 chat/echo 合并成一条用户气泡（不再有昵称前缀）', () => {
   const model = makeModel()
   model.applyFrame({
     t: 'chat/echo',
     msgId: 'm2',
-    deviceId: 'dev_b',
-    speaker: '小王',
+    deviceId: 'dev_a',
     text: '帮我看下这个报错',
     at: '2026-10-26T12:00:02.000Z',
     files: [{ fileId: 'f1', name: 'error.png', size: 1024, mime: 'image/png' }],
@@ -62,8 +63,8 @@ test('别人发来的 chat/echo 追加成带昵称的用户气泡', () => {
   })
   assert.equal(model.messages.length, 1)
   const message = model.messages[0]
-  assert.equal(message.speaker, '小王')
-  assert.equal(message.mine, false)
+  assert.equal(message.speaker, undefined, '协作删除后不再保存/渲染 speaker')
+  assert.equal(message.mine, true)
   assert.equal(message.files[0].fileId, 'f1')
 })
 
@@ -187,9 +188,9 @@ test('session/state 幂等覆盖：重复快照不会翻倍', () => {
   const snapshot = {
     t: 'session/state',
     sessionId: 'sess_1',
+    title: '修一下构建',
     sessionEpoch: 1,
     head: 42,
-    collaboration: true,
     snapshot: {
       messages: [
         { id: 'usr_m1', kind: 'user', text: '你好', at: '2026-10-26T11:00:00.000Z', msgId: 'm1' },
@@ -205,7 +206,7 @@ test('session/state 幂等覆盖：重复快照不会翻倍', () => {
   assert.equal(model.cursor, 42)
   assert.equal(model.sessionId, 'sess_1')
   assert.equal(model.sessionEpoch, 1)
-  assert.equal(model.collaboration, true)
+  assert.equal(model.sessionTitle, '修一下构建')
   assert.equal(model.messages[2].status, MESSAGE_STATUS.STREAMING)
   assert.equal(model.isTyping, true)
 
@@ -224,7 +225,6 @@ test('session/state 缺少 id 时按 msgId / callId 推导稳定 id', () => {
     sessionId: 'sess_1',
     sessionEpoch: 0,
     head: 3,
-    collaboration: false,
     snapshot: {
       messages: [
         { kind: 'user', msgId: 'm10', text: '甲', at: '2026-10-26T11:00:00.000Z' },
@@ -262,39 +262,167 @@ test('session/events 只回放 cursor 之后的事件，并把 head 记为新 cu
   assert.equal(model.messages.length, before)
 })
 
-test('collab/state 切换会话 epoch 时清空本地消息并提示需要同步', () => {
+test('sessions：归一化会话列表、去重、重算 current', () => {
   const model = makeModel()
-  model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '旧会话', at: '2026-10-26T11:00:00.000Z', seq: 1 })
+  const result = model.applyFrame({
+    t: 'sessions',
+    current: 'sess_b',
+    truncated: true,
+    sessions: [
+      { id: 'sess_a', title: '修构建', createdAt: 100, updatedAt: 200, live: true },
+      { id: 'sess_b', title: '写文档', createdAt: 300, live: false },
+      { id: 'sess_a', title: '重复条目', createdAt: 999 },
+      { title: '没有 id 的坏条目' },
+      { id: '', title: '空 id' },
+    ],
+  })
+  assert.equal(result.changed, true)
+  assert.deepEqual(model.sessions.map(item => item.id), ['sess_a', 'sess_b'])
+  assert.equal(model.sessionsCurrent, 'sess_b')
+  assert.equal(model.sessionsTruncated, true)
+  assert.equal(model.sessions[0].title, '修构建')
+  assert.equal(model.sessions[0].live, true)
+  assert.equal(model.sessions[0].current, false)
+  assert.equal(model.sessions[1].current, true)
+  assert.equal(model.sessions[1].title, '写文档')
+  // 标题缺失的会话用「新会话」兜底，不会渲染出 undefined。
+  assert.equal(model.applyFrame({ t: 'sessions', current: 'sess_c', sessions: [{ id: 'sess_c', createdAt: 5 }] }).changed, true)
+  assert.equal(model.sessions[0].title, '新会话')
+})
+
+test('sessions：重命名后列表标题会更新当前会话标题', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_1', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })
+  model.applyFrame({ t: 'sessions', current: 'sess_1', sessions: [{ id: 'sess_1', title: '旧标题', createdAt: 1 }] })
+  assert.equal(model.sessionTitle, '旧标题')
+  model.applyFrame({ t: 'sessions', current: 'sess_1', sessions: [{ id: 'sess_1', title: '新标题', createdAt: 1 }] })
+  assert.equal(model.sessionTitle, '新标题')
+})
+
+test('session/selected 成功：记录选择，等 session/state 整页替换消息', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 3, snapshot: { messages: [
+    { id: 'usr_m1', kind: 'user', text: 'A 会话的旧消息', at: '2026-10-26T11:00:00.000Z' },
+  ] } })
+  model.applyFrame({ t: 'sessions', current: 'sess_a', sessions: [
+    { id: 'sess_a', title: 'A', createdAt: 1 },
+    { id: 'sess_b', title: 'B', createdAt: 2 },
+  ] })
+  const selected = model.applyFrame({ t: 'session/selected', rid: 'r1', ok: true, sessionId: 'sess_b', title: 'B', sessionEpoch: 2 })
+  assert.equal(selected.changed, true)
+  assert.equal(selected.selection.ok, true)
+  assert.equal(selected.selection.sessionId, 'sess_b')
+  assert.equal(model.sessionsCurrent, 'sess_b')
+  assert.equal(model.sessions.find(item => item.id === 'sess_b').current, true)
+  assert.equal(model.sessionTitle, 'B')
+  // 在 session/state 到达前，旧消息仍然在（不闪空白）。
   assert.equal(model.messages.length, 1)
-  const result = model.applyFrame({ t: 'collab/state', on: true, sessionId: 'sess_shared', sessionEpoch: 2 })
-  assert.equal(result.needsSync, true)
-  assert.equal(result.sessionChanged, true)
+
+  const snapshot = model.applyFrame({
+    t: 'session/state',
+    sessionId: 'sess_b',
+    title: 'B',
+    sessionEpoch: 2,
+    head: 0,
+    snapshot: { messages: [{ id: 'usr_m9', kind: 'user', text: 'B 会话', at: '2026-10-26T12:00:00.000Z' }] },
+  })
+  assert.equal(snapshot.sessionChanged, true)
+  assert.deepEqual(model.messages.map(item => item.text), ['B 会话'])
+  assert.equal(model.cursor, 0, '换会话后 cursor 重新从快照开始，不能沿用旧会话的 seq')
+})
+
+test('session/selected 失败：记录原因、不动消息', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '现状', at: '2026-10-26T11:00:00.000Z', seq: 1 })
+  const result = model.applyFrame({
+    t: 'session/selected',
+    rid: 'r1',
+    ok: false,
+    error: 'not-found',
+    message: '这个会话在电脑上已经不存在了',
+  })
+  assert.equal(result.changed, true)
+  assert.equal(result.selection.ok, false)
+  assert.equal(result.selection.error, 'not-found')
+  assert.equal(model.messages.length, 1)
+  assert.equal(model.sessionTitle, '')
+})
+
+test('adoptServerSession：电脑端换了绑定会话时清空旧视图', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 5, snapshot: { messages: [
+    { id: 'usr_m1', kind: 'user', text: '旧会话', at: '2026-10-26T11:00:00.000Z' },
+  ] } })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_old', toolName: 'bash' })
+  assert.equal(model.adoptServerSession('sess_b', 2), true)
   assert.equal(model.messages.length, 0)
-  assert.equal(model.sessionId, 'sess_shared')
-  assert.equal(model.collaboration, true)
-  // 同一 epoch 的重复广播不应再清空。
-  model.applyFrame({ t: 'chat/echo', msgId: 'm2', deviceId: 'dev_a', text: '新会话', at: '2026-10-26T11:00:02.000Z', seq: 2 })
-  const again = model.applyFrame({ t: 'collab/state', on: true, sessionId: 'sess_shared', sessionEpoch: 2 })
-  assert.equal(again.sessionChanged, false)
+  assert.equal(model.cursor, 0)
+  assert.equal(model.approvals.length, 0, '换会话要丢掉上一会话的待办审批')
+  assert.equal(model.sessionId, 'sess_b')
+  assert.equal(model.sessionEpoch, 2)
+  // 同一个会话/epoch 重复调用不再清空。
+  model.applyFrame({ t: 'chat/echo', msgId: 'm2', deviceId: 'dev_a', text: '新会话', at: '2026-10-26T12:00:00.000Z', seq: 1 })
+  assert.equal(model.adoptServerSession('sess_b', 2), false)
   assert.equal(model.messages.length, 1)
 })
 
-test('session/participants 提供协作头像条数据', () => {
+test('审批：多条 approval/ask 排队，不会互相覆盖', () => {
   const model = makeModel()
-  model.applyFrame({
-    t: 'session/participants',
-    sessionId: 'sess_1',
-    collaboration: true,
-    participants: [
-      { deviceId: 'dev_a', name: '我', online: true },
-      { deviceId: 'dev_b', name: '小王', online: false },
-      { bad: true },
-    ],
+  const expiresAt = NOW + 60_000
+  const first = model.applyFrame({
+    t: 'approval/ask',
+    approvalId: 'ap_1',
+    toolName: 'bash',
+    reason: '执行命令',
+    displayReason: { en: 'run a command', zh: '执行命令' },
+    callId: 'c1',
+    expiresAt,
   })
-  assert.equal(model.collaboration, true)
-  assert.equal(model.participants.length, 2)
-  assert.equal(model.participants[0].self, true)
-  assert.equal(model.participants[1].online, false)
+  assert.equal(first.changed, true)
+  assert.equal(first.approval.approvalId, 'ap_1')
+  assert.equal(first.approval.displayReason, '执行命令')
+  assert.equal(first.approval.expiresAt, expiresAt)
+  assert.equal(first.approval.replied, false)
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_2', toolName: 'write', reason: '写文件' })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_3', toolName: 'read' })
+  assert.deepEqual(model.approvals.map(item => item.approvalId), ['ap_1', 'ap_2', 'ap_3'], '必须按到达顺序排队')
+  assert.equal(model.hasPendingApprovals, true)
+  // 同一个 approvalId 重发（电脑端重连回放）只更新，不插新卡。
+  const again = model.applyFrame({ t: 'approval/ask', approvalId: 'ap_2', toolName: 'write', reason: '写文件（更新）' })
+  assert.equal(again.changed, true)
+  assert.equal(model.approvals.length, 3)
+  assert.equal(model.approvalsById.get('ap_2').reason, '写文件（更新）')
+  // 缺 approvalId 的脏帧直接忽略。
+  assert.equal(model.applyFrame({ t: 'approval/ask', toolName: 'bash' }).changed, false)
+  assert.equal(model.approvals.length, 3)
+})
+
+test('审批：resolved 只移除对应那条，且不影响已回复标记', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash' })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_2', toolName: 'write' })
+  assert.equal(model.markApprovalReplied('ap_1', 'allowed-once'), true)
+  assert.equal(model.approvalsById.get('ap_1').replied, true)
+  assert.equal(model.markApprovalReplied('ap_1', 'rejected'), false, '已经答过就不能再答')
+
+  const resolved = model.applyFrame({ t: 'approval/resolved', approvalId: 'ap_1', outcome: 'allowed-once', source: 'phone' })
+  assert.equal(resolved.changed, true)
+  assert.deepEqual(resolved.resolved, { approvalId: 'ap_1', outcome: 'allowed-once', source: 'phone' })
+  assert.deepEqual(model.approvals.map(item => item.approvalId), ['ap_2'])
+
+  // 重复 / 迟到 / 陌生的 resolved 都是无害的。
+  assert.equal(model.applyFrame({ t: 'approval/resolved', approvalId: 'ap_1', outcome: 'allowed-once' }).changed, false)
+  assert.equal(model.applyFrame({ t: 'approval/resolved', approvalId: 'nope', outcome: 'cancelled' }).changed, false)
+  assert.deepEqual(model.approvals.map(item => item.approvalId), ['ap_2'])
+})
+
+test('审批：会话切换会清空队列（不能按错会话作答）', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash' })
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_b', sessionEpoch: 2, head: 0, snapshot: { messages: [] } })
+  assert.equal(model.approvals.length, 0)
+  assert.equal(model.approvalsById.size, 0)
 })
 
 test('file/offered 生成文件卡片，重复推送只更新不新增', () => {
@@ -324,18 +452,21 @@ test('error 帧记录在模型上供 UI 显示横幅', () => {
   assert.match(model.lastError.message, /帧缺少/)
 })
 
-test('localStorage 快照往返：消息 / cursor / 会话 / 待发状态', () => {
+test('localStorage 快照往返：消息 / cursor / 会话标题 / 待发状态', () => {
   const model = makeModel()
-  model.applyFrame({ t: 'session/state', sessionId: 'sess_9', sessionEpoch: 3, head: 7, collaboration: true, snapshot: { messages: [
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_9', title: '修构建', sessionEpoch: 3, head: 7, snapshot: { messages: [
     { id: 'usr_m1', kind: 'user', text: '你好', at: '2026-10-26T11:00:00.000Z' },
   ] } })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash' })
   model.addLocalUserMessage({ msgId: 'm2', text: '还没发出去' })
   const saved = model.snapshotForStorage({ limit: 50 })
   assert.equal(saved.cursor, 7)
   assert.equal(saved.sessionId, 'sess_9')
   assert.equal(saved.sessionEpoch, 3)
+  assert.equal(saved.sessionTitle, '修构建')
   assert.equal(saved.messages.length, 2)
   assert.equal(saved.messages[1].status, MESSAGE_STATUS.ERROR, '待发状态落盘时要降级成失败，刷新后由离线队列重发')
+  assert.equal('approvals' in saved, false, '审批是有时效的请求，不落盘')
 
   const restored = makeModel()
   assert.equal(restored.restoreFromStorage(saved), true)
@@ -343,7 +474,8 @@ test('localStorage 快照往返：消息 / cursor / 会话 / 待发状态', () =
   assert.equal(restored.cursor, 7)
   assert.equal(restored.sessionId, 'sess_9')
   assert.equal(restored.sessionEpoch, 3)
-  assert.equal(restored.collaboration, true)
+  assert.equal(restored.sessionTitle, '修构建')
+  assert.equal(restored.approvals.length, 0)
   assert.equal(restored.restoreFromStorage({}), false)
   assert.equal(restored.restoreFromStorage({ messages: 'nope' }), false)
 })

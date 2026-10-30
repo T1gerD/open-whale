@@ -28,8 +28,9 @@ export const STATE_VERSION = 1
  *
  * It used to be implicitly 1: the gateway refused a second device even with a
  * valid pairing secret. A five-person demo needs more, and devices are already
- * isolated per device by `sessionIdFor`, so the only real cost is unbounded
- * growth from a leaked QR — hence a hard cap rather than "unlimited".
+ * isolated per device by their own session binding (`Gateway.deviceSession`), so
+ * the only real cost is unbounded growth from a leaked QR — hence a hard cap
+ * rather than "unlimited".
  */
 export const MAX_DEVICES = 5
 
@@ -337,36 +338,6 @@ export class StateStore {
       return true
     }
     return false
-  }
-
-  /**
-   * The session id used for a device's assistant conversation. Deterministic so
-   * the phone keeps one continuous chat across reconnects and restarts.
-   * @param {string} deviceId
-   * @returns {string}
-   */
-  sessionIdFor(deviceId) {
-    const digest = createHash('sha256')
-      .update(`${this.computerId}:${deviceId}`)
-      .digest('hex')
-      .slice(0, 32)
-    return `ow-${digest}`
-  }
-
-  /**
-   * The session id shared by *every* device, used in collaboration mode.
-   *
-   * Deliberately derived from the computer id only: all phones bound to this
-   * computer land in one DSH conversation, so the five people at a demo table
-   * are talking to the same assistant and see each other's turns.
-   * @returns {string}
-   */
-  sharedSessionId() {
-    const digest = createHash('sha256')
-      .update(`${this.computerId}:shared`)
-      .digest('hex')
-      .slice(0, 32)
-    return `ow-${digest}`
   }
 
   /** @param {string} key @param {unknown} value */
