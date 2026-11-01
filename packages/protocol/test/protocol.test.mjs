@@ -16,6 +16,12 @@ import {
   SERVER_FRAME,
   SESSION_LIST_LIMIT,
   SESSION_WATCH_LIMIT,
+  QUESTION_LATE_WINDOW_MS,
+  QUESTION_MAX_ITEMS,
+  QUESTION_MAX_OPTIONS,
+  QUESTION_MAX_TEXT,
+  QUESTION_TIMEOUT_MS,
+  normalizeQuestionAnswers,
   SessionEventLog,
   classifyEndpoint,
   clampAssistantText,
@@ -420,3 +426,59 @@ test('the session list is bounded so one frame cannot grow without limit', () =>
   assert.ok(SESSION_LIST_LIMIT > 0 && SESSION_LIST_LIMIT <= 500)
 })
 
+
+// ---------------------------------------------------------------------------
+// 3.0.0: structured questions (ask_user_question / plan review)
+// ---------------------------------------------------------------------------
+
+test('the questions capability and frames exist', () => {
+  assert.equal(CAPABILITIES.QUESTIONS, 'questions-v1')
+  assert.equal(CLIENT_FRAME.QUESTION_REPLY, 'question/reply')
+  assert.equal(SERVER_FRAME.QUESTION_ASK, 'question/ask')
+  assert.equal(SERVER_FRAME.QUESTION_RESOLVED, 'question/resolved')
+})
+
+test('question limits keep one frame bounded', () => {
+  assert.ok(QUESTION_TIMEOUT_MS >= 30_000 && QUESTION_TIMEOUT_MS <= 300_000)
+  assert.ok(QUESTION_LATE_WINDOW_MS > QUESTION_TIMEOUT_MS)
+  assert.ok(QUESTION_MAX_ITEMS > 0 && QUESTION_MAX_ITEMS <= 20)
+  assert.ok(QUESTION_MAX_OPTIONS > 0 && QUESTION_MAX_OPTIONS <= 50)
+  assert.ok(QUESTION_MAX_TEXT > 100)
+})
+
+test('an answer batch must name every question exactly once', () => {
+  const questions = [
+    { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+    { id: 'q2', question: '补充？' },
+  ]
+  assert.equal(normalizeQuestionAnswers(questions, [{ id: 'q1', selected: ['A'] }]), null)
+  assert.equal(
+    normalizeQuestionAnswers(questions, [{ id: 'q1', selected: ['A'] }, { id: 'q1', selected: ['B'] }]),
+    null,
+  )
+  assert.deepEqual(
+    normalizeQuestionAnswers(questions, [{ id: 'q1', selected: ['B'] }, { id: 'q2', selected: [], custom: ' 好 ' }]),
+    [{ id: 'q1', selected: ['B'] }, { id: 'q2', selected: [], custom: '好' }],
+  )
+})
+
+test('an answer may not select options the computer never offered', () => {
+  const questions = [{ id: 'q1', question: '选哪个？', options: [{ label: 'A' }] }]
+  assert.deepEqual(
+    normalizeQuestionAnswers(questions, [{ id: 'q1', selected: ['A', 'NOPE'] }]),
+    [{ id: 'q1', selected: ['A'] }],
+  )
+  // 自定义文本仍然保留，空字符串不算
+  assert.deepEqual(
+    normalizeQuestionAnswers(questions, [{ id: 'q1', selected: [], custom: '' }]),
+    [{ id: 'q1', selected: [] }],
+  )
+})
+
+test('a malformed answer batch is rejected instead of half-accepted', () => {
+  const questions = [{ id: 'q1', question: 'x' }]
+  assert.equal(normalizeQuestionAnswers(questions, null), null)
+  assert.equal(normalizeQuestionAnswers(questions, [null]), null)
+  assert.equal(normalizeQuestionAnswers(questions, [{ selected: [] }]), null)
+  assert.equal(normalizeQuestionAnswers(null, [{ id: 'q1', selected: [] }]), null)
+})

@@ -45,7 +45,7 @@ import {
   signHello,
   verifyHelloAckProof,
 } from './lib/keys.mjs'
-import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildSnapshotFrame, buildWatchFrame, normalizeAttachments } from './lib/messages.mjs'
+import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, normalizeAttachments } from './lib/messages.mjs'
 import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
 import { createStorage } from './lib/storage.mjs'
 import {
@@ -268,6 +268,32 @@ function approvalCountdownText(approval, now = Date.now()) {
 function approvalExpired(approval, now = Date.now()) {
   const expiresAt = Number(approval?.expiresAt)
   return Number.isFinite(expiresAt) && expiresAt > 0 && expiresAt <= now
+}
+
+/**
+ * 提问卡片倒计时文案（3.0.0）。`canAnswerLate` 的提问超时后仍可补答，
+ * 所以文案要说明「还能答」，而不是像审批那样一律「交回电脑」。
+ * @param {any} question
+ * @param {number} [now]
+ * @returns {string}
+ */
+function questionCountdownText(question, now = Date.now()) {
+  const expiresAt = Number(question?.expiresAt)
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return ''
+  const left = Math.max(0, expiresAt - now)
+  const late = question?.canAnswerLate === true
+  if (left <= 0) return late ? '已交回电脑，仍可补答' : '已交回电脑处理'
+  const seconds = Math.ceil(left / 1000)
+  const clock = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+  return late ? `${clock} 后交回电脑（仍可补答）` : `${clock} 后交回电脑处理`
+}
+
+/** 过了前台等待时间、且不能补答的提问才真正作废。 */
+function questionExpired(question, now = Date.now()) {
+  const expiresAt = Number(question?.expiresAt)
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return false
+  if (expiresAt > now) return false
+  return question?.canAnswerLate !== true
 }
 
 /** @param {string} raw */
@@ -1285,11 +1311,15 @@ function stopApprovalTicker() {
 
 function syncApprovalTicker() {
   const approvals = state.model?.approvals ?? []
+  const questions = state.model?.questions ?? []
   // 只有「带 expiresAt 且还没回答」的卡片需要每秒刷新倒计时。
-  const need = approvals.some(
+  const needApproval = approvals.some(
     item => !item.replied && Number.isFinite(Number(item.expiresAt)) && !approvalExpired(item),
   )
-  if (!need) {
+  const needQuestion = questions.some(
+    item => !item.replied && Number.isFinite(Number(item.expiresAt)) && !questionExpired(item),
+  )
+  if (!needApproval && !needQuestion) {
     stopApprovalTicker()
     return
   }
@@ -1316,6 +1346,22 @@ function updateApprovalCountdowns() {
     if (card) {
       card.classList.toggle('is-expired', expired)
       for (const button of card.querySelectorAll('button')) button.disabled = expired || approval.replied === true
+    }
+  }
+  for (const node of dom.messageList.querySelectorAll('[data-question-countdown-for]')) {
+    const question = model.questionsById.get(node.dataset.questionCountdownFor ?? '')
+    if (!question) continue
+    const expired = questionExpired(question)
+    const answered = question.replied === true
+    if (!answered && !(expired && question.canAnswerLate !== true)) live = true
+    node.textContent = questionCountdownText(question)
+    const card = node.closest('.question-card')
+    if (card) {
+      card.classList.toggle('is-expired', expired)
+      const locked = answered || (expired && question.canAnswerLate !== true)
+      if (locked) {
+        for (const control of card.querySelectorAll('button, input')) control.disabled = true
+      }
     }
   }
   if (!live) stopApprovalTicker()
@@ -1383,6 +1429,149 @@ function approvalCardsHtml() {
   const approvals = state.model?.approvals ?? []
   if (approvals.length === 0) return ''
   return `<div class="approval-stack" aria-live="polite">${approvals.map(approvalCardHtml).join('')}</div>`
+}
+
+// ---------------------------------------------------------------------------
+// 提问卡片（3.0.0）
+// ---------------------------------------------------------------------------
+
+/**
+ * 页面上的提问草稿：questionId → (itemId → {selected, custom})。
+ * 放在 DOM 之外，重绘不会把用户已经选中的选项/输入的文本冲掉。
+ */
+const questionDrafts = new Map()
+
+/** @param {string} questionId */
+function draftFor(questionId) {
+  let draft = questionDrafts.get(questionId)
+  if (!draft) {
+    draft = {}
+    questionDrafts.set(questionId, draft)
+  }
+  return draft
+}
+
+/** @param {any} question */
+function questionCardHtml(question) {
+  const draft = draftFor(question.questionId)
+  const expired = questionExpired(question)
+  const replied = question.replied === true
+  const disabled = replied || (expired && question.canAnswerLate !== true)
+  const classes = ['question-card']
+  if (expired) classes.push('is-expired')
+  if (replied) classes.push('is-replied')
+  const planReview = question.items.some(item => item.intent?.kind === 'plan-review')
+  const items = question.items.map((item, index) => {
+    const selection = draft[item.id] ?? { selected: [] }
+    const options = (item.options ?? []).map(option => {
+      const selected = (selection.selected ?? []).includes(option.label)
+      const approve = item.intent?.kind === 'plan-review' && item.intent.approve === option.label
+      const optionClasses = ['question-option']
+      if (selected) optionClasses.push('is-selected')
+      if (approve) optionClasses.push('is-approve')
+      return `<button class="${optionClasses.join(' ')}" type="button" role="button"
+        data-action="question-option" data-question-id="${escapeHtml(question.questionId)}"
+        data-item-id="${escapeHtml(item.id)}" data-label="${escapeHtml(option.label)}"
+        aria-pressed="${selected ? 'true' : 'false'}" ${disabled ? 'disabled' : ''}>
+        <span class="question-option-label">${selected ? '✓ ' : ''}${escapeHtml(option.label)}</span>
+        ${approve ? '<span class="question-approve-badge">同意</span>' : ''}
+        ${option.description ? `<span class="question-option-desc">${escapeHtml(option.description)}</span>` : ''}
+      </button>`
+    })
+    return `<div class="question-item">
+      <p class="question-text">${question.items.length > 1 ? `${index + 1}. ` : ''}${escapeHtml(item.question)}</p>
+      ${item.header ? `<p class="question-item-header">${escapeHtml(item.header)}</p>` : ''}
+      ${item.detail ? `<p class="question-detail">${escapeHtml(item.detail)}</p>` : ''}
+      ${options.length > 0 ? `<div class="question-options">${options.join('')}</div>` : ''}
+      <input class="question-custom" type="text" autocomplete="off"
+        data-question-id="${escapeHtml(question.questionId)}" data-item-id="${escapeHtml(item.id)}"
+        placeholder="${item.options?.length ? '其他（可选，填写后覆盖上面的选择）' : '输入你的回答'}"
+        value="${escapeHtml(selection.custom ?? '')}" ${disabled ? 'disabled' : ''} />
+    </div>`
+  })
+  const foot = replied
+    ? '<p class="question-state">已提交，等待电脑继续</p>'
+    : `<p class="question-countdown" data-question-countdown-for="${escapeHtml(question.questionId)}">${escapeHtml(
+        questionCountdownText(question),
+      )}</p>
+      <button class="btn btn-primary question-submit" type="button" data-action="question-submit"
+        data-question-id="${escapeHtml(question.questionId)}" ${disabled ? 'disabled' : ''}>提交回答</button>`
+  return `<div class="${classes.join(' ')}" data-question-card="${escapeHtml(question.questionId)}" role="group" aria-label="提问">
+    <div class="question-head">
+      <span class="question-title">${planReview ? '计划需要你确认' : '需要你的回答'}</span>
+      ${question.canAnswerLate ? '<span class="question-badge">可稍后补答</span>' : ''}
+    </div>
+    ${items.join('')}
+    <div class="question-foot">${foot}</div>
+  </div>`
+}
+
+/**
+ * 点一个选项：单选替换、多选切换。只改草稿 + 按钮选中态，整表重绘会把焦点丢掉。
+ * @param {HTMLElement} button
+ */
+function toggleQuestionOption(button) {
+  const questionId = button.dataset.questionId ?? ''
+  const itemId = button.dataset.itemId ?? ''
+  const label = button.dataset.label ?? ''
+  const question = state.model?.questionsById.get(questionId)
+  const item = question?.items.find(entry => entry.id === itemId)
+  if (!item) return
+  const draft = draftFor(questionId)
+  const current = draft[itemId] ?? { selected: [] }
+  const selected = new Set(current.selected ?? [])
+  if (item.multiSelect === true) {
+    if (selected.has(label)) selected.delete(label)
+    else selected.add(label)
+  } else if (selected.has(label)) {
+    selected.clear()
+  } else {
+    selected.clear()
+    selected.add(label)
+  }
+  draft[itemId] = { ...current, selected: [...selected] }
+  const card = button.closest('.question-card')
+  if (!card) return
+  for (const option of card.querySelectorAll('.question-option')) {
+    if (option.dataset.itemId !== itemId) continue
+    const isSelected = (draft[itemId].selected ?? []).includes(option.dataset.label ?? '')
+    option.classList.toggle('is-selected', isSelected)
+    option.setAttribute('aria-pressed', isSelected ? 'true' : 'false')
+    const labelNode = option.querySelector('.question-option-label')
+    if (labelNode) labelNode.textContent = `${isSelected ? '✓ ' : ''}${option.dataset.label ?? ''}`
+  }
+}
+
+/** 所有待回答提问的卡片栈（没有则返回空串）。 */
+function questionCardsHtml() {
+  const questions = state.model?.questions ?? []
+  if (questions.length === 0) return ''
+  return `<div class="question-stack" aria-live="polite">${questions.map(questionCardHtml).join('')}</div>`
+}
+
+/**
+ * 提交一批回答。拼包规则与手机端一致（未答 = 跳过；单选 custom 覆盖 selected）。
+ * @param {string} questionId
+ */
+function submitQuestion(questionId) {
+  const model = state.model
+  if (!model) return
+  if (!state.connection?.online) {
+    showToast('还没连上电脑，无法提交回答', 'error')
+    return
+  }
+  const found = model.findQuestion(questionId)
+  if (!found) return
+  const reply = buildQuestionReply(found.question, draftFor(questionId))
+  if (!reply) {
+    showToast('这批提问已经失效了', 'error', 3200)
+    return
+  }
+  if (!model.markQuestionReplied(questionId)) return
+  state.connection.send({ t: CLIENT_FRAME.QUESTION_REPLY, ...reply })
+  scheduleRender()
+  syncApprovalTicker()
+  showToast('已提交回答', 'ok', 2200)
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,6 +1669,18 @@ function handleFrame(frame) {
     }
   }
   if (frame.t === SERVER_FRAME.APPROVAL_RESOLVED) handleApprovalResolved(result.resolved)
+  if (frame.t === SERVER_FRAME.QUESTION_ASK) {
+    syncApprovalTicker()
+    if (isActiveTarget) {
+      showToast('电脑有一个问题需要你回答', '', 3200)
+    } else {
+      showToast(`「${state.model.titleFor(target)}」有一个问题，切到该标签回答`, '', 3600)
+    }
+  }
+  if (frame.t === SERVER_FRAME.QUESTION_RESOLVED) {
+    showToast('问题已处理', '', 2200)
+    scheduleRender()
+  }
   if (result.needsWatch) sendTabWatch()
 
   if (result.changed) {
@@ -1488,6 +1689,7 @@ function handleFrame(frame) {
         isActiveTarget &&
         (frame.t === SERVER_FRAME.SESSION_STATE ||
           frame.t === SERVER_FRAME.APPROVAL_ASK ||
+          frame.t === SERVER_FRAME.QUESTION_ASK ||
           frame.t === SERVER_FRAME.SESSION_EVENTS),
     })
     persistSoon()
@@ -1976,6 +2178,11 @@ function messageSignature() {
   for (const approval of state.model.approvals) {
     hash = (hash * 31 + approval.approvalId.length + (approval.replied ? 7 : 3)) % 1_000_000_007
   }
+  // 提问卡片同理：批次、题目数量、是否已提交都影响渲染。
+  hash = (hash * 31 + state.model.questions.length) % 1_000_000_007
+  for (const question of state.model.questions) {
+    hash = (hash * 31 + question.questionId.length + question.items.length + (question.replied ? 7 : 3)) % 1_000_000_007
+  }
   hash = (hash * 31 + state.model.sessionTitle.length) % 1_000_000_007
   return String(hash)
 }
@@ -2008,8 +2215,9 @@ function renderMessages({ forceScroll = false } = {}) {
   state.lastRenderSignature = signature
   const messages = state.model.messages
   const approvals = approvalCardsHtml()
+  const questions = questionCardsHtml()
   if (messages.length === 0) {
-    dom.messageList.innerHTML = `${approvals}${emptyStateHtml()}`
+    dom.messageList.innerHTML = `${questions}${approvals}${emptyStateHtml()}`
     updateApprovalCountdowns()
     syncApprovalTicker()
     maybeScrollToLatest(true)
@@ -2034,7 +2242,7 @@ function renderMessages({ forceScroll = false } = {}) {
       parts.push('<div class="typing-row" aria-label="助理正在输入"><span></span><span></span><span></span></div>')
     }
   }
-  dom.messageList.innerHTML = `${parts.join('')}${approvals}`
+  dom.messageList.innerHTML = `${parts.join('')}${questions}${approvals}`
   updateApprovalCountdowns()
   syncApprovalTicker()
   maybeScrollToLatest(forceScroll)
@@ -2681,7 +2889,25 @@ function setupChatEvents() {
     if (target.dataset.action === 'approval-reply') {
       const outcome = target.dataset.outcome === 'allowed-once' ? 'allowed-once' : 'rejected'
       replyApproval(target.dataset.approvalId ?? '', outcome)
+      return
     }
+    if (target.dataset.action === 'question-option') {
+      toggleQuestionOption(target)
+      return
+    }
+    if (target.dataset.action === 'question-submit') {
+      submitQuestion(target.dataset.questionId ?? '')
+    }
+  })
+  // 「其他」文本框：只更新草稿和本地 DOM，不整表重绘（否则输入焦点会丢）。
+  dom.messageList.addEventListener('input', event => {
+    const input = event.target.closest('.question-custom')
+    if (!input) return
+    const questionId = input.dataset.questionId ?? ''
+    const itemId = input.dataset.itemId ?? ''
+    if (!questionId || !itemId) return
+    const draft = draftFor(questionId)
+    draft[itemId] = { ...(draft[itemId] ?? { selected: [] }), custom: input.value }
   })
   dom.installHintAction.addEventListener('click', () => {
     if (state.installPrompt) {

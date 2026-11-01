@@ -18,7 +18,7 @@
 ## 1. 发布前门禁（必须全绿才打 tag）
 
 ```bash
-node scripts/run-tests.mjs                 # 49 文件 / 751 项（3.0.0 基线）
+node scripts/run-tests.mjs                 # 51 文件 / 789 项（3.0.0 基线）
 node packages/mobile/scripts/check-syntax.mjs
 node packages/plugin/scripts/sync-protocol.mjs --check
 node scripts/build-plugin-package.mjs --check

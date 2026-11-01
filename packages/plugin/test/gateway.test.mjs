@@ -23,6 +23,7 @@ function makeBridge() {
   const renamed = []
   const powerCalls = []
   const answeredApprovals = []
+  const answeredQuestions = []
   const releasedSessions = []
   // Mutable so a test can flip the power policy the same way the real plugin
   // reads it from the state store's preferences, and can steer the session API.
@@ -32,6 +33,7 @@ function makeBridge() {
     renamed,
     powerCalls,
     answeredApprovals,
+    answeredQuestions,
     releasedSessions,
     /** Every sessionId the gateway asked the bridge to open. */
     selectedRequests: [],
@@ -84,6 +86,10 @@ function makeBridge() {
     historyMessages: async sessionId => harness.history(sessionId),
     answerApproval: input => {
       answeredApprovals.push(input)
+      return harness.answerResult
+    },
+    answerQuestion: input => {
+      answeredQuestions.push(input)
       return harness.answerResult
     },
     releaseSession: async sessionId => { releasedSessions.push(sessionId) },
@@ -1324,7 +1330,7 @@ test('a fresh client gets a session snapshot and a returning one gets a replay',
   const head = gateway.eventLogs.get(sessionId).head
   assert.ok(head >= 2)
   first.client.close()
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
 
   // Reconnecting with a cursor that is still in the log window gets the missed
   // events instead of a full snapshot.
@@ -1368,7 +1374,7 @@ test('a history read failure falls back to the in-process log instead of throwin
   first.client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '进程内的消息' })
   assert.ok(await first.client.waitFor(f => f.t === 'chat/ack'))
   first.client.close()
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
 
   const second = await reconnectWith(port, device, { capabilities: [CAPABILITIES.SESSION_SYNC] })
   const state = await second.client.waitFor(f => f.t === 'session/state')
@@ -1433,7 +1439,7 @@ test('a hello whose sessionId disagrees with the computer gets a snapshot, never
   })
   gateway.pushEvent({ kind: 'done', sessionId, deviceId: device.deviceId, callId: 'c-old', text: '旧消息' })
   one.client.close()
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
 
   const stale = await reconnectWith(port, device, {
     capabilities: sync,
@@ -1552,7 +1558,7 @@ test('session/select reports a missing session and keeps the old binding', async
   assert.equal(selected.ok, false)
   assert.equal(selected.error, 'not-found')
   assert.equal(selected.sessionEpoch, undefined)
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
   assert.equal(client.frames.some(f => f.t === 'session/state' && f.sessionId === 'missing'), false)
   assert.equal(gateway.deviceSession.get(device.deviceId), ack.sessionId, 'the binding must not move on failure')
   client.close()
@@ -1947,7 +1953,7 @@ test('an unknown uploadId reference is refused without waking the assistant', as
   client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '看这个', files: [{ uploadId: 'nope' }] })
   const error = await client.waitFor(f => f.t === 'error')
   assert.equal(error.code, 'upload-not-found')
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
   assert.equal(harness.sent.length, 0)
   client.close()
 })
@@ -2077,7 +2083,7 @@ test('a session that is neither bound nor watched never leaks to the device', as
   const device = freshDevice()
   const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_TABS] })
   gateway.pushEvent({ kind: 'delta', sessionId: 'someone-elses', deviceId: device.deviceId, callId: 'x', seq: 0, text: 'leak' })
-  await delay(40)
+  await new Promise(resolve => setTimeout(resolve, 40))
   assert.equal(client.frames.some(f => f.t === 'chat/delta'), false)
   client.close()
 })
@@ -2133,5 +2139,86 @@ test('closing a tab is client-side; unbinding still releases everything it used'
   assert.ok(await client.waitFor(f => f.t === 'assistants' && f.unbound === true))
   assert.ok(harness.releasedSessions.includes('tab-b'), 'an unbound device must not leave background agents alive')
   assert.ok(harness.releasedSessions.includes(bound))
+  client.close()
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.0: structured questions — ask_user_question / plan review on the phone
+// ---------------------------------------------------------------------------
+
+test('a question is pushed to a capable device with its routing session', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.QUESTIONS] })
+  const sessionId = gateway.deviceSession.get(device.deviceId)
+
+  gateway.pushEvent({
+    kind: 'question-ask',
+    sessionId,
+    questionId: 'qst_1',
+    items: [{ id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] }],
+    callId: 'call_1',
+    expiresAt: Date.now() + 60_000,
+    canAnswerLate: true,
+  })
+
+  const ask = await client.waitFor(f => f.t === 'question/ask')
+  assert.ok(ask, 'the phone must receive question/ask')
+  assert.equal(ask.questionId, 'qst_1')
+  assert.equal(ask.sessionId, sessionId)
+  assert.equal(ask.items[0].options.length, 2)
+  assert.equal(ask.callId, 'call_1')
+  assert.equal(ask.canAnswerLate, true)
+  client.close()
+})
+
+test('a device without the questions capability is never sent question frames', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.APPROVAL] })
+  gateway.pushEvent({
+    kind: 'question-ask',
+    sessionId: gateway.deviceSession.get(device.deviceId),
+    questionId: 'qst_2',
+    items: [{ id: 'q1', question: 'x' }],
+    expiresAt: Date.now() + 60_000,
+  })
+  await new Promise(resolve => setTimeout(resolve, 40))
+  assert.equal(client.frames.some(f => f.t === 'question/ask'), false)
+  client.close()
+})
+
+test('question/reply reaches the bridge with the device identity', async t => {
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.QUESTIONS] })
+
+  client.send({
+    t: 'question/reply',
+    questionId: 'qst_3',
+    answers: [{ id: 'q1', selected: ['A'] }],
+  })
+  await new Promise(resolve => setTimeout(resolve, 40))
+  assert.equal(harness.answeredQuestions.length, 1)
+  assert.equal(harness.answeredQuestions[0].questionId, 'qst_3')
+  assert.equal(harness.answeredQuestions[0].deviceId, device.deviceId)
+  assert.deepEqual(harness.answeredQuestions[0].answers, [{ id: 'q1', selected: ['A'] }])
+  client.close()
+})
+
+test('question/resolved dismisses the card for every device in the conversation', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client } = await pairDevice(port, device, { capabilities: [CAPABILITIES.QUESTIONS] })
+  const sessionId = gateway.deviceSession.get(device.deviceId)
+
+  gateway.pushEvent({ kind: 'question-resolved', sessionId, questionId: 'qst_4', outcome: 'answered', source: 'phone' })
+  const resolved = await client.waitFor(f => f.t === 'question/resolved')
+  assert.equal(resolved.questionId, 'qst_4')
+  assert.equal(resolved.outcome, 'answered')
   client.close()
 })

@@ -29,6 +29,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { approvalAvailability, approvalRemainingMs } from '../../../src/core/approvals.mts'
+import { questionAvailability, type QuestionDraft } from '../../../src/core/questions.mts'
 import { endpointKindLabel } from '../../../src/core/endpoint.mts'
 import { describeTransfer, formatBytes, transferProgress } from '../../../src/core/files.mts'
 import { formatCountdown } from '../../../src/core/power.mts'
@@ -38,6 +39,7 @@ import { pickAttachment, type PickedAttachment } from '../../../src/services/att
 import type { AssistantView } from '../../../src/state/app-store'
 import { useAppStore, useAssistantView } from '../../../src/state/store'
 import { ApprovalCard } from '../../../src/ui/approval-card'
+import { QuestionCard } from '../../../src/ui/question-card'
 import {
   ActionSheet,
   EmptyState,
@@ -104,6 +106,9 @@ export default function ChatScreen() {
   const approvals = view?.approvals ?? []
   // 多条待答请求按队列显示：先显示最早的一条，其余用一行字提示，绝不互相覆盖。
   const pendingApproval = approvals[0]
+  // 结构化提问（3.0.0）与审批并列排队，一次只展开最早的一批。
+  const questions = view?.questions ?? []
+  const pendingQuestion = questions[0]
   const tabViews = view?.tabViews ?? []
   const activeSessionId = view?.tabs.activeSessionId ?? ''
   const tabsSupported = view?.tabsSupported === true
@@ -433,6 +438,24 @@ export default function ChatScreen() {
     },
     [assistantId, store, view],
   )
+
+  /**
+   * 回答一批结构化提问（3.0.0）。草稿 → 回包的拼装/校验在 core/questions.mts，
+   * 这里只把失败原因说清楚；成功后卡片由 store 乐观撤掉（resolved 帧幂等）。
+   */
+  const answerQuestion = useCallback(
+    (questionId: string, draft: QuestionDraft) => {
+      if (!assistantId) return
+      const gate = questionAvailability(view?.link.online === true, view?.link.capabilities)
+      if (!gate.ok) {
+        setNotice(`${gate.error}\n${gate.hint}`)
+        return
+      }
+      const result = store.answerQuestion(assistantId, questionId, draft)
+      if (!result.sent) setNotice(result.error ?? '没能把回答发出去，请重试')
+    },
+    [assistantId, store, view],
+  )
   if (!view || !controller) {
     return (
       <View style={styles.screen}>
@@ -628,6 +651,20 @@ export default function ChatScreen() {
             />
             {approvals.length > 1 ? (
               <Text style={styles.moreApprovals}>还有 {approvals.length - 1} 条请求在排队，处理完这条后显示。</Text>
+            ) : null}
+          </View>
+        ) : null}
+
+        {/* 结构化提问（3.0.0）：与审批并列排队，一次只展开最早的一批。 */}
+        {pendingQuestion ? (
+          <View style={styles.approvalWrap}>
+            <QuestionCard
+              prompt={pendingQuestion}
+              disabled={!link.online}
+              onSubmit={draft => answerQuestion(pendingQuestion.questionId, draft)}
+            />
+            {questions.length > 1 ? (
+              <Text style={styles.moreApprovals}>还有 {questions.length - 1} 批提问在排队，处理完这批后显示。</Text>
             ) : null}
           </View>
         ) : null}

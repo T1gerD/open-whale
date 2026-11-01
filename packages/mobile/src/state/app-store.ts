@@ -31,6 +31,12 @@ import {
   type ApprovalPrompt,
 } from '../core/approvals.mts'
 import {
+  buildQuestionReply,
+  questionAvailability,
+  type QuestionDraft,
+  type QuestionPrompt,
+} from '../core/questions.mts'
+import {
   CONNECTION_POLICY_KEYS,
   DEFAULT_CONNECTION_POLICY,
   formatPolicyFlag,
@@ -101,6 +107,7 @@ import {
   restoreTabs,
   routeEvent,
   sessionOfApproval,
+  sessionOfQuestion,
   tabStripModel,
   tabsMeta,
   totalUnread,
@@ -146,6 +153,8 @@ export interface AssistantView {
   sessions: SessionListState | undefined
   /** 等待手机回答的 DSH 权限请求（多条并存，不会互相覆盖）。 */
   approvals: ApprovalPrompt[]
+  /** 等待手机回答的结构化提问（3.0.0，与审批并列排队）。 */
+  questions: QuestionPrompt[]
   /** 未读消息数（进入聊天页调用 markRead 清零）。 */
   unread: number
   /** 每台电脑持久化的连接方式。 */
@@ -380,14 +389,18 @@ class ChatController {
    * v2.4.0 要**所有**标签都扫一遍，否则切走后那条卡会一直挂在那里。
    */
   tickApprovals(): void {
-    const any = Object.values(this.tabs.chats).some(chat => (chat?.approvals.length ?? 0) > 0)
+    const any = Object.values(this.tabs.chats).some(
+      chat => (chat?.approvals.length ?? 0) > 0 || (chat?.questions.length ?? 0) > 0,
+    )
     if (!any) return
     this.dispatch({ t: 'tabs/tick', at: Date.now() })
   }
 
-  /** 是否有任何一个标签在等审批（AppStore 用它决定要不要起每秒节拍）。 */
+  /** 是否有任何一个标签在等审批/提问（AppStore 用它决定要不要起每秒节拍）。 */
   hasApprovals(): boolean {
-    return Object.values(this.tabs.chats).some(chat => (chat?.approvals.length ?? 0) > 0)
+    return Object.values(this.tabs.chats).some(
+      chat => (chat?.approvals.length ?? 0) > 0 || (chat?.questions.length ?? 0) > 0,
+    )
   }
 
   /**
@@ -403,6 +416,19 @@ class ChatController {
       sessionId: owner,
       approvalId,
       outcome,
+      source: 'phone',
+      at: Date.now(),
+    })
+  }
+
+  /** 手机已经答完一条提问：本地先撤掉卡片（resolved 幂等，电脑端还会再推一次）。 */
+  ackQuestion(questionId: string): void {
+    const owner = sessionOfQuestion(this.tabs, questionId)
+    this.dispatch({
+      t: 'question/resolved',
+      sessionId: owner,
+      questionId,
+      outcome: 'answered',
       source: 'phone',
       at: Date.now(),
     })
@@ -592,6 +618,7 @@ class ChatController {
       ).length,
       sessions: this.tabs.sessionList,
       approvals: this.chat.approvals,
+      questions: this.chat.questions,
       // 未读 = 当前标签的助理级未读 + 后台标签的未读（activity 只在非当前标签累加）。
       unread: this.unread + totalUnread(this.tabs),
       connectionMode: normalizeConnectionMode(row.connectionMode),
@@ -1593,6 +1620,34 @@ export class AppStore {
     return { sent: true }
   }
 
+  /**
+   * 回答一条结构化提问（3.0.0）。
+   *
+   * 与审批一样**不发假帧**：离线或电脑端没有 `questions-v1` 时直接拒绝并说明原因。
+   * 草稿 → 回包的拼装与校验都在 `core/questions.mts`，这里只负责路由和乐观撤卡。
+   */
+  answerQuestion(
+    assistantId: string,
+    questionId: string,
+    draft: QuestionDraft,
+  ): { sent: boolean; error?: string; hint?: string } {
+    const link = this.links.get(assistantId)
+    const gate = questionAvailability(link?.isOnline === true, link?.capabilityList)
+    if (!gate.ok) return { sent: false, error: gate.error, hint: gate.hint }
+    if (!link) return { sent: false, error: '还没有建立连接' }
+    const owner = sessionOfQuestion(this.tabs, questionId)
+    const prompt: QuestionPrompt | undefined = owner
+      ? this.tabs.chats[owner]?.questions.find(item => item.questionId === questionId)
+      : undefined
+    if (!prompt) return { sent: false, error: '这个问题已经失效了', hint: '等电脑重新发起，或直接在电脑上回答。' }
+    const frame = buildQuestionReply(prompt, draft)
+    if (!frame) return { sent: false, error: '答案不完整', hint: '每个问题都要有答案（跳过也要显式提交）。' }
+    if (!link.replyQuestion(frame)) return { sent: false, error: '发送失败，连接可能已断开', hint: '点「重连」后再试。' }
+    this.controller(assistantId).ackQuestion(questionId)
+    this.notify()
+    return { sent: true }
+  }
+
   // ---------------------------------------------------------------------------
   // 助理管理
   // ---------------------------------------------------------------------------
@@ -1869,7 +1924,12 @@ export class AppStore {
       return
     }
     // 权限请求：ask 要给用户看见（并启动倒计时节拍），resolved 要撤掉卡片。
-    if (frame.t === 'approval/ask' || frame.t === 'approval/resolved') {
+    if (
+      frame.t === 'approval/ask' ||
+      frame.t === 'approval/resolved' ||
+      frame.t === 'question/ask' ||
+      frame.t === 'question/resolved'
+    ) {
       this.controller(assistantId).onFrame(frame)
       this.ensureApprovalTicker()
       this.notify()

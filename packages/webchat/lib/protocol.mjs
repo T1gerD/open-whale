@@ -36,6 +36,8 @@ export const CAPABILITIES = Object.freeze({
   SESSIONS: 'sessions-v1',
   /** 手机/网页可以回答电脑转发的权限请求。 */
   APPROVAL: 'approval-v1',
+  /** 结构化提问（ask_user_question / 计划审阅）的转发与回答。 */
+  QUESTIONS: 'questions-v1',
   /** `session/watch` + `session/snapshot`：多个会话标签同时保持在线。 */
   SESSION_TABS: 'session-tabs-v1',
 })
@@ -73,6 +75,8 @@ export const CLIENT_FRAME = Object.freeze({
   SESSION_SNAPSHOT: 'session/snapshot',
   /** 回答一条 `approval/ask`（outcome 为 allowed-once / rejected）。 */
   APPROVAL_REPLY: 'approval/reply',
+  /** 回答一条 `question/ask`（每个问题恰好一条答案）。 */
+  QUESTION_REPLY: 'question/reply',
 })
 
 /** 电脑 → 客户端 的帧名。 */
@@ -105,6 +109,10 @@ export const SERVER_FRAME = Object.freeze({
   APPROVAL_ASK: 'approval/ask',
   /** 该权限请求已被处理（手机/电脑/超时）。 */
   APPROVAL_RESOLVED: 'approval/resolved',
+  /** 一条结构化提问，等待本设备作答。 */
+  QUESTION_ASK: 'question/ask',
+  /** 该提问已被处理（手机/电脑/超时）。 */
+  QUESTION_RESOLVED: 'question/resolved',
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
   UPLOAD_DONE: 'upload/done',
@@ -215,6 +223,17 @@ export const SESSION_LIST_LIMIT = 200
  * 客户端只用来做倒计时文案，真正的裁决在电脑端。
  */
 export const APPROVAL_TIMEOUT_MS = 60_000
+
+/** 电脑端等手机回答结构化提问的时长（比审批略长：多题、多选项、要打字）。 */
+export const QUESTION_TIMEOUT_MS = 90_000
+
+/** 超时后电脑端仍接受补答的窗口（DSH 的 askTimed / continued question）。 */
+export const QUESTION_LATE_WINDOW_MS = 5 * 60_000
+
+/** 一批提问的条目/选项/文本上限，与 protocol 保持一致。 */
+export const QUESTION_MAX_ITEMS = 10
+export const QUESTION_MAX_OPTIONS = 20
+export const QUESTION_MAX_TEXT = 2_000
 
 /** `approval/reply` 唯一允许的两种结果；其它值电脑端按 `rejected` 处理。 */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])

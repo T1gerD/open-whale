@@ -39,6 +39,8 @@ export const CLIENT_FRAME = {
   SESSION_SNAPSHOT: 'session/snapshot',
   /** 回答电脑端转发来的 DSH 权限请求（2.3.0）。 */
   APPROVAL_REPLY: 'approval/reply',
+  /** 回答电脑端转发来的一条结构化提问（3.0.0）。 */
+  QUESTION_REPLY: 'question/reply',
 } as const
 
 export const SERVER_FRAME = {
@@ -70,6 +72,10 @@ export const SERVER_FRAME = {
   APPROVAL_ASK: 'approval/ask',
   /** 那条请求已经在别处（手机/电脑/超时）被处理。 */
   APPROVAL_RESOLVED: 'approval/resolved',
+  /** 电脑端转发来的一条结构化提问（ask_user_question / 计划审阅）。 */
+  QUESTION_ASK: 'question/ask',
+  /** 那条提问已经在别处被处理或超时。 */
+  QUESTION_RESOLVED: 'question/resolved',
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
   UPLOAD_DONE: 'upload/done',
@@ -94,6 +100,8 @@ export const CAPABILITIES = {
   SESSIONS: 'sessions-v1',
   /** 权限请求转发（2.3.0）。 */
   APPROVAL: 'approval-v1',
+  /** 结构化提问转发（3.0.0）：`question/ask` / `question/reply` / `question/resolved`。 */
+  QUESTIONS: 'questions-v1',
   /**
    * 会话标签页（2.4.0）：`session/watch` + `session/snapshot`，且所有会话帧
    * 都带 `sessionId`。旧电脑端不声明它，手机端就退回单会话行为。
@@ -165,6 +173,17 @@ export const SESSION_WATCH_LIMIT = 8
 
 /** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
 export const APPROVAL_TIMEOUT_MS = 60_000
+
+/** 电脑端等手机回答结构化提问的时长，镜像 `QUESTION_TIMEOUT_MS`。 */
+export const QUESTION_TIMEOUT_MS = 90_000
+
+/** 超时后电脑端仍接受补答的窗口，镜像 `QUESTION_LATE_WINDOW_MS`。 */
+export const QUESTION_LATE_WINDOW_MS = 5 * 60_000
+
+/** 一批提问的条目/选项/文本上限，镜像 protocol 的 `QUESTION_MAX_*`。 */
+export const QUESTION_MAX_ITEMS = 10
+export const QUESTION_MAX_OPTIONS = 20
+export const QUESTION_MAX_TEXT = 2_000
 
 /** 手机端唯一允许的审批答复，镜像 `APPROVAL_REPLY_OUTCOMES`。 */
 export const APPROVAL_REPLY_OUTCOMES: readonly string[] = Object.freeze(['allowed-once', 'rejected'])

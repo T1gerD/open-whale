@@ -30,6 +30,7 @@ function fakeContext() {
   const sections = []
   const guards = []
   const scopedEvents = []
+  const answeredQuestions = []
   /** @type {Map<string, any>} */
   const live = new Map()
 
@@ -40,6 +41,7 @@ function fakeContext() {
     scopedEvents,
     listeners,
     live,
+    answeredQuestions,
     /** Fire an event into every registered session/event listener. */
     fire(session, event) {
       for (const listener of listeners) listener(session, event)
@@ -52,6 +54,13 @@ function fakeContext() {
           const index = listeners.indexOf(listener)
           if (index >= 0) listeners.splice(index, 1)
         }
+      },
+      /** DSH 的 continued-question 入口（超时后补答时会用到）。 */
+      userQuestions: {
+        answer(...args) {
+          answeredQuestions.push(args)
+          return true
+        },
       },
       agents: {
         get: id => live.get(id),
@@ -96,7 +105,7 @@ function fakeContext() {
   }
 }
 
-function makeBridge({ config = {}, fire } = {}) {
+function makeBridge({ config = {}, fire, ...options } = {}) {
   const fake = fakeContext()
   const events = []
   let idCounter = 0
@@ -121,6 +130,7 @@ function makeBridge({ config = {}, fire } = {}) {
     // Mirrors `createUserMessage` from @deepseek-ai/dsh-llm: it freezes the
     // message and attaches the unique id the agent inbox deduplicates on.
     createUserMessage: input => Object.freeze({ ...input, role: 'user', id: `msg_${++idCounter}` }),
+    ...options,
   })
   bridge.start()
   // v2.3.0: the gateway owns the device→session binding and passes `sessionId`
@@ -672,3 +682,138 @@ test('attachments are described with a path relative to the working directory', 
   assert.match(text, /read/, 'the model must be told it can read the file')
 })
 
+
+// ---------------------------------------------------------------------------
+// v3.0.0: structured questions (ask_user_question / plan review)
+// ---------------------------------------------------------------------------
+
+/** The two-question batch every question test uses. */
+function questionRequest(overrides = {}) {
+  return {
+    questions: [
+      { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+      { id: 'q2', question: '补充一下', multiSelect: true, options: [{ label: 'X' }, { label: 'Y' }] },
+    ],
+    agent: { id: 'agent-1' },
+    ...overrides,
+  }
+}
+
+/** @param {any} fake */
+function questionHandler(fake) {
+  const entry = fake.scopedEvents.find(item => item.event === 'user-questions/request')
+  assert.ok(entry, 'the bridge must register a question answerer on the agent scope')
+  return entry
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+test('a question is forwarded to the phone and its answers go back to DSH', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+
+  const answerPromise = handler.listener(questionRequest(), async () => {
+    throw new Error('the phone is online; the bridge must not delegate')
+  })
+  await delay(20)
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.ok(ask, 'a question/ask must be emitted')
+  assert.equal(ask.sessionId, 'ow-dev_a')
+  assert.deepEqual(ask.items.map(item => item.id), ['q1', 'q2'])
+
+  const accepted = bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: [
+      { id: 'q1', selected: ['B'] },
+      { id: 'q2', selected: ['X'], custom: '补充' },
+    ],
+  })
+  assert.equal(accepted, true)
+  const result = await answerPromise
+  assert.deepEqual(result, {
+    answers: [
+      { id: 'q1', selected: ['B'] },
+      { id: 'q2', selected: ['X'], custom: '补充' },
+    ],
+  })
+  const resolved = events.filter(event => event.kind === 'question-resolved')
+  assert.equal(resolved.length, 1)
+  assert.equal(resolved[0].outcome, 'answered')
+  assert.equal(resolved[0].source, 'phone')
+})
+
+test('a question with no phone online delegates instead of claiming it', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => [] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const result = await handler.listener(questionRequest(), async () => 'delegated')
+  assert.equal(result, 'delegated')
+  assert.equal(events.some(event => event.kind === 'question-ask'), false)
+})
+
+test('an invalid answer is refused and the question stays open', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const answerPromise = handler.listener(questionRequest(), async () => 'delegated')
+  await delay(20)
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.equal(bridge.answerQuestion({ questionId: ask.questionId, answers: [{ id: 'q1', selected: ['A'] }] }), false)
+  assert.equal(bridge.answerQuestion({ questionId: 'unknown', answers: [] }), false)
+  bridge.answerQuestion({
+    questionId: ask.questionId,
+    answers: [
+      { id: 'q1', selected: ['A'] },
+      { id: 'q2', selected: [] },
+    ],
+  })
+  const result = await answerPromise
+  assert.deepEqual(result.answers[0], { id: 'q1', selected: ['A'] })
+})
+
+test('a timed-out question still accepts a late answer through userQuestions.answer', async () => {
+  const { bridge, fake, events } = makeBridge({
+    devicesInSession: () => ['dev_a'],
+    questionTimeoutMs: 20,
+    questionLateWindowMs: 1_000,
+  })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const result = await handler.listener(
+    questionRequest({ wait: { callId: 'call-9', timed: true } }),
+    async () => 'delegated',
+  )
+  assert.equal(result, 'delegated', 'a timeout always hands the question back to the desktop')
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.equal(ask.canAnswerLate, true)
+  assert.equal(events.find(event => event.kind === 'question-resolved').outcome, 'timeout')
+
+  const accepted = bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: [
+      { id: 'q1', selected: ['A'] },
+      { id: 'q2', selected: [] },
+    ],
+  })
+  assert.equal(accepted, true)
+  assert.equal(fake.answeredQuestions.length, 1, 'the late answer must be steered into the agent')
+  assert.equal(fake.answeredQuestions[0][1], 'call-9')
+  const late = events.filter(event => event.kind === 'question-resolved').at(-1)
+  assert.equal(late.source, 'phone-late')
+})
+
+test('a blocking question that times out is not kept for late answers', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 10 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const result = await handler.listener(questionRequest(), async () => 'delegated')
+  assert.equal(result, 'delegated')
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.equal(ask.canAnswerLate, false)
+  assert.equal(bridge.answerQuestion({ questionId: ask.questionId, answers: [] }), false)
+})

@@ -18,6 +18,7 @@
 import { enqueueApproval, normalizeApprovalAsk, pruneExpiredApprovals, resolveApproval, type ApprovalPrompt } from './approvals.mts'
 import { base64ByteLength } from './files.mts'
 import { MAX_FILE_BYTES, SERVER_FRAME } from './frames.mts'
+import { enqueueQuestion, normalizeQuestionAsk, pruneExpiredQuestions, resolveQuestion, type QuestionItem, type QuestionPrompt } from './questions.mts'
 import { normalizeSessionsFrame, type SessionListState } from './sessions.mts'
 
 export type MessageKind = 'user' | 'assistant' | 'system'
@@ -164,6 +165,8 @@ export interface ChatState {
   resetOnNextSnapshot: boolean
   /** 等待手机回答的权限请求（按到达顺序，多条的不能互相覆盖）。 */
   approvals: ApprovalPrompt[]
+  /** 等待手机回答的结构化提问（3.0.0，同样按到达顺序排队）。 */
+  questions: QuestionPrompt[]
   /** messageId → 助手消息 id（chat/message upsert 索引）。 */
   messageIndex: Record<string, string>
   /** callId → 助手消息 id 列表（同一回合可能有多条 messageId 消息）。 */
@@ -307,6 +310,26 @@ export type WireEvent =
       source?: string
       at?: number
     }
+  | {
+      /** 电脑端转发来的一条结构化提问（3.0.0）。 */
+      t: 'question/ask'
+      sessionId?: string
+      questionId: string
+      items: QuestionItem[]
+      callId?: string
+      expiresAt?: number
+      canAnswerLate?: boolean
+      at?: number
+    }
+  | {
+      /** 那条提问已经被回答/交回桌面/超时。 */
+      t: 'question/resolved'
+      sessionId?: string
+      questionId: string
+      outcome?: string
+      source?: string
+      at?: number
+    }
   | { t: 'file/offered'; fileId: string; name: string; size: number; mime?: string; url?: string; from?: string; seq?: number; at?: number }
   | { t: 'file/meta'; fileId: string; name: string; size: number; mime?: string; at?: number }
   | { t: 'file/chunk'; fileId: string; seq: number; dataBase64: string; at?: number }
@@ -413,6 +436,7 @@ export function emptyChatState(assistantId: string): ChatState {
     sessionList: undefined,
     resetOnNextSnapshot: false,
     approvals: [],
+    questions: [],
     messageIndex: {},
     turnMessages: {},
     uploads: {},
@@ -508,7 +532,7 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
       )
       // 断线后这条请求已经不可能由手机作答（电脑端超时会把提示交回桌面），
       // 卡片留着只会让用户点一个永远发不出去的按钮。
-      return { state: { ...state, messages, typing: null, approvals: [], lastEventAt: at }, effects: none }
+      return { state: { ...state, messages, typing: null, approvals: [], questions: [], lastEventAt: at }, effects: none }
     }
 
     case 'session/reset': {
@@ -928,6 +952,25 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
       const approvals = pruneExpiredApprovals(state.approvals, at)
       if (approvals === state.approvals) return { state, effects: none }
       return { state: { ...state, approvals, lastEventAt: at }, effects: none }
+    }
+
+    case 'question/ask': {
+      const prompt = normalizeQuestionAsk(event, at)
+      if (!prompt) return { state: { ...state, lastEventAt: at }, effects: none }
+      const questions = enqueueQuestion(pruneExpiredQuestions(state.questions, at), prompt)
+      return { state: { ...state, questions, lastEventAt: at }, effects: none }
+    }
+
+    case 'question/resolved': {
+      const questions = resolveQuestion(state.questions, event.questionId)
+      if (questions === state.questions) return { state: { ...state, lastEventAt: at }, effects: none }
+      return { state: { ...state, questions, lastEventAt: at }, effects: none }
+    }
+
+    case 'question/tick': {
+      const questions = pruneExpiredQuestions(state.questions, at)
+      if (questions === state.questions) return { state, effects: none }
+      return { state: { ...state, questions, lastEventAt: at }, effects: none }
     }
 
     case 'transfer/offered': {
@@ -1564,6 +1607,7 @@ function clearConversation(state: ChatState, at: number): ChatState {
     deltaBuffers: {},
     gapCount: 0,
     approvals: [],
+    questions: [],
     uploads: {},
     sessionCursor: 0,
     lastEventAt: at,

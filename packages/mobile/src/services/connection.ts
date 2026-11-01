@@ -17,6 +17,7 @@ import { AppState, type AppStateStatus } from 'react-native'
 
 import { isRetryAllowed, nextBackoffMs } from '../core/backoff.mts'
 import { buildApprovalReplyFrame, type ApprovalOutcome } from '../core/approvals.mts'
+import type { QuestionReplyFrame } from '../core/questions.mts'
 import { failureReport, onRaceFailed, onRaceWon, planRace, createRetryState, type RetryState } from '../core/connection-plan.mts'
 import { getConnectionPolicy } from '../core/connection-policy.mts'
 import { endpointKind, endpointLadder, missingModeHint, wsUrlFor } from '../core/endpoint.mts'
@@ -295,6 +296,11 @@ export class AssistantLink {
   replyApproval(approvalId: string, outcome: ApprovalOutcome): boolean {
     const frame = buildApprovalReplyFrame(approvalId, outcome)
     if (!frame) return false
+    return this.send(frame)
+  }
+
+  /** 发一条已经拼好/校验过的 `question/reply`（拼装在 core/questions.mts）。 */
+  replyQuestion(frame: QuestionReplyFrame): boolean {
     return this.send(frame)
   }
 

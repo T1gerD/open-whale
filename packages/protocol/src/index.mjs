@@ -39,8 +39,11 @@
  *
  * 3.0.0 is the release that unified every version string in this repository
  * (packages, plugin, mobile app, webchat and this wire contract) on `3.0.0`.
- * The wire format is byte-for-byte the 1.3.0 one — no frame was added, removed
- * or changed — so a 2.4 client still connects; only the version label moved.
+ * It also adds structured questions (`questions-v1`: `question/ask`,
+ * `question/reply`, `question/resolved`), which is how a phone answers DSH's
+ * `ask_user_question` / plan-review prompts instead of only yes/no approvals.
+ * Everything else is the 1.3.0 wire format, so a 2.4 client still connects —
+ * it simply never receives the new frames.
  */
 export const PROTOCOL_VERSION = '3.0.0'
 
@@ -68,6 +71,12 @@ export const CAPABILITIES = /** @type {const} */ ({
   SESSIONS: 'sessions-v1',
   /** `approval/ask` / `approval/reply`: the phone answers DSH permission prompts. */
   APPROVAL: 'approval-v1',
+  /**
+   * `question/ask` / `question/reply` / `question/resolved`: the phone answers
+   * DSH's structured questions (`ask_user_question` / plan review), not just
+   * yes/no approvals.
+   */
+  QUESTIONS: 'questions-v1',
   /**
    * `session/watch` + `session/snapshot` + `sessionId` on conversation frames:
    * several tabs stay live at once, like the desktop sidebar.
@@ -113,6 +122,11 @@ export const CLIENT_FRAME = /** @type {const} */ ({
   SESSION_SNAPSHOT: 'session/snapshot',
   /** Answer a pending `approval/ask` (`outcome` is `allowed-once` or `rejected`). */
   APPROVAL_REPLY: 'approval/reply',
+  /**
+   * Answer a pending `question/ask`. One entry per question, in the order the
+   * computer sent them; skipping a question means sending `selected: []`.
+   */
+  QUESTION_REPLY: 'question/reply',
 })
 
 /** Frames that the computer may send to a client. */
@@ -149,6 +163,10 @@ export const SERVER_FRAME = /** @type {const} */ ({
   APPROVAL_ASK: 'approval/ask',
   /** That prompt was settled (answered here, on the computer, or by a timeout). */
   APPROVAL_RESOLVED: 'approval/resolved',
+  /** A structured question (ask_user_question / plan review) is waiting for this device. */
+  QUESTION_ASK: 'question/ask',
+  /** That question was settled (answered here, on the computer, or by a timeout). */
+  QUESTION_RESOLVED: 'question/resolved',
   /** Upload handshake replies. */
   UPLOAD_READY: 'upload/ready',
   UPLOAD_PROGRESS: 'upload/progress',
@@ -542,6 +560,57 @@ export function helloAckProofMessage(nonce, deviceId) {
  */
 
 /**
+ * @typedef {object} QuestionOption
+ * @property {string} label
+ * @property {string} [description]
+ */
+
+/**
+ * @typedef {object} QuestionItem
+ * One question of a batch. `intent` is passed through untouched: a client that
+ * recognises `plan-review` may render it as a plan approval card, one that does
+ * not just shows the options.
+ * @property {string} id
+ * @property {string} question
+ * @property {string} [detail]
+ * @property {string} [header]
+ * @property {QuestionOption[]} [options]
+ * @property {boolean} [multiSelect]
+ * @property {{kind: 'plan-review', approve: string, callId?: string}} [intent]
+ */
+
+/**
+ * @typedef {object} QuestionAskFrame
+ * A structured question forwarded to the phone. The phone answers with
+ * `question/reply`; the computer also pushes `question/resolved` when the batch is
+ * settled elsewhere (desktop, timeout, cancellation) so the UI can dismiss it.
+ * @property {'question/ask'} t
+ * @property {string} sessionId
+ * @property {string} questionId   Opaque id of this batch (echoed in the reply).
+ * @property {QuestionItem[]} items
+ * @property {string} [callId]     Tool call this batch belongs to, when known.
+ * @property {number} expiresAt    Unix ms after which the computer hides the card.
+ * @property {boolean} [canAnswerLate] True when the batch stays answerable after
+ *                                 `expiresAt` (DSH keeps `askTimed` questions open).
+ */
+
+/**
+ * @typedef {object} QuestionReplyFrame
+ * @property {'question/reply'} t
+ * @property {string} questionId
+ * @property {Array<{id: string, selected: string[], custom?: string}>} answers
+ */
+
+/**
+ * @typedef {object} QuestionResolvedFrame
+ * @property {'question/resolved'} t
+ * @property {string} sessionId
+ * @property {string} questionId
+ * @property {'answered'|'timeout'|'cancelled'} outcome
+ * @property {string} [source]     `phone` | `desktop` | `timeout` | `cancelled`.
+ */
+
+/**
  * @typedef {object} UploadStartFrame
  * @property {'upload/start'} t
  * @property {string} uploadId
@@ -757,6 +826,62 @@ export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'
  * from subscribing to every session on the computer and melting the socket.
  */
 export const SESSION_WATCH_LIMIT = 8
+
+/**
+ * How long a forwarded structured question waits for the phone before the computer
+ * hands it back to its own UI. Slightly longer than an approval: a question may
+ * carry several items, options and a custom text box, so tapping takes longer.
+ */
+export const QUESTION_TIMEOUT_MS = 90_000
+
+/**
+ * After the phone-side wait expires, the computer still accepts an answer for this
+ * long and steers it into the agent (`userQuestions.answer`) — DSH keeps `askTimed`
+ * questions answerable after the foreground wait ends. Beyond that the batch is
+ * dropped: the model has already been told the question timed out.
+ */
+export const QUESTION_LATE_WINDOW_MS = 5 * 60_000
+
+/** Upper bounds so one frame cannot carry an unbounded question batch. */
+export const QUESTION_MAX_ITEMS = 10
+export const QUESTION_MAX_OPTIONS = 20
+export const QUESTION_MAX_TEXT = 2_000
+
+/**
+ * One answer is valid only when it names every question of the batch exactly once
+ * and never selects an option the computer did not offer. Returns the normalised
+ * batch or `null`, so both the plugin and the clients can share the rule.
+ * @param {Array<{id: string, options?: Array<{label: string}>}>} questions
+ * @param {unknown} value
+ * @returns {Array<{id: string, selected: string[], custom?: string}> | null}
+ */
+export function normalizeQuestionAnswers(questions, value) {
+  if (!Array.isArray(questions) || !Array.isArray(value)) return null
+  const byId = new Map()
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') return null
+    const item = /** @type {Record<string, unknown>} */ (entry)
+    if (typeof item.id !== 'string' || byId.has(item.id)) return null
+    const selected = Array.isArray(item.selected)
+      ? item.selected.filter(label => typeof label === 'string')
+      : []
+    const trimmedCustom = typeof item.custom === 'string' ? item.custom.trim() : ''
+    const custom = trimmedCustom !== '' ? trimmedCustom.slice(0, QUESTION_MAX_TEXT) : undefined
+    byId.set(item.id, { selected, ...(custom ? { custom } : {}) })
+  }
+  if (byId.size !== questions.length) return null
+  const answers = []
+  for (const question of questions) {
+    const answer = byId.get(question.id)
+    if (!answer) return null
+    const allowed = new Set((question.options ?? []).map(option => option.label))
+    // Tolerate a client that sends labels it was not offered: drop them instead of
+    // failing the whole batch (the user would otherwise see "answer rejected").
+    const selected = answer.selected.filter(label => allowed.has(label))
+    answers.push({ id: question.id, selected, ...(answer.custom ? { custom: answer.custom } : {}) })
+  }
+  return answers
+}
 
 /** Where the plugin serves the web/PWA client (HarmonyOS, iOS, any browser). */
 export const WEB_CLIENT_PATH = '/openwhale/app'

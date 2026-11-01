@@ -794,6 +794,8 @@ export class Gateway {
         return this.#handleSessionSnapshot(session, frame)
       case 'approval/reply':
         return this.#handleApprovalReply(session, frame)
+      case 'question/reply':
+        return this.#handleQuestionReply(session, frame)
       case 'upload/start':
         return this.#handleUploadStart(session, frame)
       case 'upload/chunk':
@@ -1355,6 +1357,28 @@ export class Gateway {
     return undefined
   }
 
+  /**
+   * `question/reply`：手机对一条结构化提问作答。
+   *
+   * 答案校验（每个问题恰好一条、选项必须合法）在 bridge 里用协议共享的
+   * `normalizeQuestionAnswers()` 完成；这里只做能力位与形状检查。
+   * @param {Session} session
+   * @param {any} frame
+   */
+  async #handleQuestionReply(session, frame) {
+    if (!session.hasCap(CAPABILITIES.QUESTIONS)) return undefined
+    const questionId = String(frame.questionId ?? '')
+    if (!questionId) return session.sendError('bad-frame', 'question/reply 缺少 questionId')
+    if (!Array.isArray(frame.answers)) return session.sendError('bad-frame', 'question/reply 缺少 answers')
+    const accepted = this.bridge.answerQuestion?.({
+      questionId,
+      deviceId: /** @type {string} */ (session.deviceId),
+      answers: frame.answers,
+    }) === true
+    if (!accepted) this.log(`question: 忽略无效或已过期的作答 ${questionId}`)
+    return undefined
+  }
+
   // ---------------------------------------------------------------------------
   // Chunked uploads
   // ---------------------------------------------------------------------------
@@ -1779,6 +1803,22 @@ export class Gateway {
           outcome: event.outcome,
           ...(event.source !== undefined ? { source: event.source } : {}),
         }, { requireCapability: CAPABILITIES.APPROVAL }) > 0
+      case 'question-ask':
+        return this.#broadcastToConversation(conversationId, {
+          t: SERVER_FRAME.QUESTION_ASK,
+          questionId: event.questionId,
+          items: Array.isArray(event.items) ? event.items : [],
+          ...(event.callId !== undefined ? { callId: event.callId } : {}),
+          expiresAt: event.expiresAt,
+          ...(event.canAnswerLate === true ? { canAnswerLate: true } : {}),
+        }, { requireCapability: CAPABILITIES.QUESTIONS }) > 0
+      case 'question-resolved':
+        return this.#broadcastToConversation(conversationId, {
+          t: SERVER_FRAME.QUESTION_RESOLVED,
+          questionId: event.questionId,
+          outcome: event.outcome,
+          ...(event.source !== undefined ? { source: event.source } : {}),
+        }, { requireCapability: CAPABILITIES.QUESTIONS }) > 0
       default:
         return false
     }

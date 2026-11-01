@@ -25,8 +25,14 @@ import { pathToFileURL } from 'node:url'
 import {
   APPROVAL_TIMEOUT_MS,
   IdempotencyCache,
+  QUESTION_LATE_WINDOW_MS,
+  QUESTION_MAX_ITEMS,
+  QUESTION_MAX_OPTIONS,
+  QUESTION_MAX_TEXT,
+  QUESTION_TIMEOUT_MS,
   SESSION_LIST_LIMIT,
   SESSION_SNAPSHOT_LIMIT,
+  normalizeQuestionAnswers,
 } from './protocol.mjs'
 import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from './voice.mjs'
 
@@ -39,7 +45,7 @@ const FILE_TOOL_HINTS = ['write', 'image', 'docx', 'xlsx', 'pptx', 'pdf', 'expor
  * event belongs to; the gateway broadcasts chat-level frames to every device
  * bound to that conversation and only the bridge knows which conversation DSH
  * just spoke in.
- * @property {'message'|'delta'|'done'|'tool'|'typing'|'error'|'approval-ask'|'approval-resolved'} kind
+ * @property {'message'|'delta'|'done'|'tool'|'typing'|'error'|'approval-ask'|'approval-resolved'|'question-ask'|'question-resolved'} kind
  * @property {string} sessionId
  * @property {string} [deviceId]   The device whose turn produced the event.
  * @property {string} callId
@@ -95,6 +101,14 @@ export class DshBridge {
     this.approvalTimeoutMs = Number.isFinite(options.approvalTimeoutMs)
       ? Math.max(0, Number(options.approvalTimeoutMs))
       : APPROVAL_TIMEOUT_MS
+    // 结构化提问（ask_user_question / 计划审阅）的转发窗口：比审批长一点，
+    // 因为一张卡里可能有多个问题、选项和自定义输入。
+    this.questionTimeoutMs = Number.isFinite(options.questionTimeoutMs)
+      ? Math.max(0, Number(options.questionTimeoutMs))
+      : QUESTION_TIMEOUT_MS
+    this.questionLateWindowMs = Number.isFinite(options.questionLateWindowMs)
+      ? Math.max(0, Number(options.questionLateWindowMs))
+      : QUESTION_LATE_WINDOW_MS
     this.now = options.now ?? (() => Date.now())
     /** sessionId → {agent, handle}：一个会话一个 agent，绝不重复创建 */
     this.agents = new Map()
@@ -110,6 +124,10 @@ export class DshBridge {
     this.turnCalls = new Map()
     /** approvalId → 等待手机作答的请求 */
     this.approvals = new Map()
+    /** questionId → 等待手机作答的结构化提问（前台等待期间） */
+    this.questions = new Map()
+    /** questionId → 前台等待超时后仍可补答的提问（DSH 的 askTimed/continued） */
+    this.lateQuestions = new Map()
     this.disposed = false
     this.subscriptions = []
   }
@@ -135,8 +153,10 @@ export class DshBridge {
       } catch { /* already unwound */ }
     }
     this.subscriptions = []
-    // 有待作答的审批时必须先结掉，否则那个工具调用会一直挂到超时。
+    // 有待作答的审批/提问时必须先结掉，否则那个工具调用会一直挂到超时。
     for (const approvalId of [...this.approvals.keys()]) this.#settleApproval(approvalId, 'cancelled')
+    for (const questionId of [...this.questions.keys()]) this.#settleQuestion(questionId, 'cancelled')
+    for (const questionId of [...this.lateQuestions.keys()]) this.#dropLateQuestion(questionId)
     const handlers = [...new Set([...this.agents.values()].map(entry => entry.handle))].filter(Boolean)
     const disposals = handlers.map(handle => handle.dispose().catch(() => {}))
     this.agents.clear()
@@ -331,6 +351,15 @@ export class DshBridge {
         text: assistantVoiceSection({ assistantName: this.config.assistantName }),
       })
     }
+    // 结构化提问（`ask_user_question` / 计划审阅）是独立于审批的一条 seam：
+    // autoApproveTools 只影响「允许/拒绝」，不能让提问也被自动放行，否则模型
+    // 会拿到一个空答案。所以这里总是注册转发者。
+    agentCtx.on(
+      'user-questions/request',
+      /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
+      (req, next) => this.#onUserQuestion(sessionId, req, next),
+      { prepend: true },
+    )
     if (this.config.autoApproveTools) {
       // Approval is granted by *answering* the approval waterfall, never by a
       // guard. `ctx.tools.guard()` is deny-only: its declared type is
@@ -436,6 +465,195 @@ export class DshBridge {
       entry.signal.removeEventListener('abort', entry.onAbort)
     }
     entry.resolve(outcome)
+  }
+
+  // ---------------------------------------------------------------------------
+  // 结构化提问转发（v3.0.0）
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 把一条 DSH 提问（`ask_user_question` / 计划审阅）转发给在线手机。
+   *
+   * 与审批同构：没有手机在线就 `next()` 交回桌面；超时也交回桌面，但
+   * `askTimed()` 的问题在 DSH 里仍然可以补答，所以这里额外保留一段
+   * 「迟到可答」窗口，手机晚到的答案会被 steer 进 agent。
+   * @param {string} sessionId
+   * @param {any} request
+   * @param {() => Promise<any>} next
+   * @returns {Promise<any>}
+   */
+  async #onUserQuestion(sessionId, request, next) {
+    if (this.disposed) return next()
+    const devices = this.#approvalDevices(sessionId)
+    if (devices.length === 0) return next()
+    const signal = request?.signal
+    if (signal?.aborted) return next()
+    const items = this.#sanitizeQuestions(request?.questions)
+    if (items.length === 0) return next()
+
+    const questionId = randomUUID()
+    const expiresAt = this.now() + this.questionTimeoutMs
+    const callId = typeof request?.wait?.callId === 'string' ? request.wait.callId : undefined
+    const agent = request?.agent
+    const canAnswerLate = Boolean(callId && agent && request?.wait?.timed)
+    const outcomePromise = new Promise(resolve => {
+      /** @type {any} */
+      const entry = { resolve, sessionId, items, deviceIds: new Set(devices), timer: null, signal, onAbort: null }
+      this.questions.set(questionId, entry)
+      if (this.questionTimeoutMs > 0) {
+        entry.timer = setTimeout(() => this.#settleQuestion(questionId, 'timeout'), this.questionTimeoutMs)
+        entry.timer.unref?.()
+      }
+      if (signal && typeof signal.addEventListener === 'function') {
+        entry.onAbort = () => this.#settleQuestion(questionId, 'aborted')
+        signal.addEventListener('abort', entry.onAbort, { once: true })
+      }
+    })
+    this.emit({
+      kind: 'question-ask',
+      sessionId,
+      questionId,
+      items,
+      ...(callId ? { callId } : {}),
+      expiresAt,
+      canAnswerLate,
+    })
+
+    const outcome = await outcomePromise
+    if (Array.isArray(outcome)) {
+      this.emit({ kind: 'question-resolved', sessionId, questionId, outcome: 'answered', source: 'phone' })
+      return { answers: outcome }
+    }
+    // 超时/中止：前台等待结束。askTimed 的问题保留补答窗口，然后交回桌面。
+    if (outcome === 'timeout' && canAnswerLate) {
+      this.#keepLateQuestion(questionId, {
+        sessionId,
+        items,
+        deviceIds: new Set(devices),
+        agent,
+        callId,
+        expiresAt: this.now() + this.questionLateWindowMs,
+      })
+    }
+    this.emit({
+      kind: 'question-resolved',
+      sessionId,
+      questionId,
+      outcome: outcome === 'timeout' ? 'timeout' : 'cancelled',
+      source: outcome === 'timeout' ? 'timeout' : 'cancelled',
+    })
+    return next()
+  }
+
+  /**
+   * 手机对一条待答提问作答。
+   * @param {{questionId: string, deviceId?: string, answers: unknown}} input
+   * @returns {boolean} 是否真的结算了一条请求
+   */
+  answerQuestion(input) {
+    const questionId = String(input?.questionId ?? '')
+    const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
+    const pending = this.questions.get(questionId)
+    if (pending) {
+      if (deviceId !== '' && !pending.deviceIds.has(deviceId)) return false
+      const answers = normalizeQuestionAnswers(pending.items, input?.answers)
+      if (!answers) return false
+      this.#settleQuestion(questionId, answers)
+      return true
+    }
+    const late = this.lateQuestions.get(questionId)
+    if (late) {
+      if (deviceId !== '' && !late.deviceIds.has(deviceId)) return false
+      const answers = normalizeQuestionAnswers(late.items, input?.answers)
+      if (!answers) return false
+      this.#dropLateQuestion(questionId)
+      try {
+        // DSH 的 continued question：答案作为 user 消息 steer 回该 call。
+        const accepted = this.ctx.userQuestions?.answer?.(late.agent, late.callId, { answers })
+        if (accepted === false) return false
+      } catch (error) {
+        this.log(`bridge: 补答提问失败：${/** @type {Error} */ (error).message}`)
+        return false
+      }
+      this.emit({ kind: 'question-resolved', sessionId: late.sessionId, questionId, outcome: 'answered', source: 'phone-late' })
+      return true
+    }
+    return false
+  }
+
+  /**
+   * 清洗手机端会看到的题目：只保留形状合法的条目，并对数量/长度设上限，
+   * 免得一条恶意或坏掉的帧把手机 UI 和 socket 撑爆。
+   * @param {unknown} raw
+   * @returns {Array<any>}
+   */
+  #sanitizeQuestions(raw) {
+    const items = []
+    for (const candidate of Array.isArray(raw) ? raw : []) {
+      if (items.length >= QUESTION_MAX_ITEMS) break
+      if (!candidate || typeof candidate !== 'object') continue
+      const q = /** @type {Record<string, any>} */ (candidate)
+      if (typeof q.id !== 'string' || q.id === '' || typeof q.question !== 'string') continue
+      const item = {
+        id: q.id.slice(0, 200),
+        question: q.question.slice(0, QUESTION_MAX_TEXT),
+      }
+      if (typeof q.detail === 'string' && q.detail !== '') item.detail = q.detail.slice(0, QUESTION_MAX_TEXT)
+      if (typeof q.header === 'string' && q.header !== '') item.header = q.header.slice(0, 200)
+      if (Array.isArray(q.options)) {
+        const options = q.options
+          .filter(option => option && typeof option.label === 'string' && option.label !== '')
+          .slice(0, QUESTION_MAX_OPTIONS)
+          .map(option => ({
+            label: option.label.slice(0, 200),
+            ...(typeof option.description === 'string' && option.description !== ''
+              ? { description: option.description.slice(0, 500) }
+              : {}),
+          }))
+        if (options.length > 0) item.options = options
+      }
+      if (q.multiSelect === true) item.multiSelect = true
+      if (q.intent && typeof q.intent === 'object' && q.intent.kind === 'plan-review' && typeof q.intent.approve === 'string') {
+        item.intent = {
+          kind: 'plan-review',
+          approve: q.intent.approve.slice(0, 200),
+          ...(typeof q.intent.callId === 'string' ? { callId: q.intent.callId } : {}),
+        }
+      }
+      items.push(item)
+    }
+    return items
+  }
+
+  /** @param {string} questionId @param {'timeout'|'aborted'|'cancelled'|Array<any>} outcome */
+  #settleQuestion(questionId, outcome) {
+    const entry = this.questions.get(questionId)
+    if (!entry) return
+    this.questions.delete(questionId)
+    if (entry.timer) clearTimeout(entry.timer)
+    if (entry.onAbort && typeof entry.signal?.removeEventListener === 'function') {
+      entry.signal.removeEventListener('abort', entry.onAbort)
+    }
+    entry.resolve(outcome)
+  }
+
+  /**
+   * 记录一个超时后仍可补答的问题（DSH 的 askTimed 语义）。
+   * @param {string} questionId
+   * @param {{sessionId: string, items: any[], deviceIds: Set<string>, agent: any, callId: string, expiresAt: number}} entry
+   */
+  #keepLateQuestion(questionId, entry) {
+    const timer = setTimeout(() => this.#dropLateQuestion(questionId), Math.max(1, this.questionLateWindowMs))
+    timer.unref?.()
+    this.lateQuestions.set(questionId, { ...entry, timer })
+  }
+
+  /** @param {string} questionId */
+  #dropLateQuestion(questionId) {
+    const entry = this.lateQuestions.get(questionId)
+    if (!entry) return
+    this.lateQuestions.delete(questionId)
+    if (entry.timer) clearTimeout(entry.timer)
   }
 
   /** @param {string} sessionId */

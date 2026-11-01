@@ -163,12 +163,12 @@ export function tabStripModel(state: TabsState): TabView[] {
   })
 }
 
-/** 其它标签里排队的审批总数（当前标签自己的卡片会直接显示，不算进来）。 */
+/** 其它标签里排队的待办总数（审批 + 提问；当前标签自己的卡片会直接显示，不算进来）。 */
 export function pendingApprovalsElsewhere(state: TabsState): number {
   let sum = 0
   for (const [id, chat] of Object.entries(state.chats)) {
     if (id === state.activeSessionId) continue
-    sum += chat?.approvals.length ?? 0
+    sum += (chat?.approvals.length ?? 0) + (chat?.questions.length ?? 0)
   }
   return sum
 }
@@ -177,6 +177,14 @@ export function pendingApprovalsElsewhere(state: TabsState): number {
 export function sessionOfApproval(state: TabsState, approvalId: string): string | undefined {
   for (const [id, chat] of Object.entries(state.chats)) {
     if (chat?.approvals.some(prompt => prompt.approvalId === approvalId)) return id
+  }
+  return undefined
+}
+
+/** 某个提问属于哪个标签（回答时要把 resolved 送进对的会话）。 */
+export function sessionOfQuestion(state: TabsState, questionId: string): string | undefined {
+  for (const [id, chat] of Object.entries(state.chats)) {
+    if (chat?.questions.some(prompt => prompt.questionId === questionId)) return id
   }
   return undefined
 }
@@ -535,10 +543,13 @@ function tickApprovals(state: TabsState, at: number): TabsReduceResult {
   let chats = state.chats
   const touched: string[] = []
   for (const [id, chat] of Object.entries(state.chats)) {
-    if (!chat || chat.approvals.length === 0) continue
-    const reduced = reduceChat(chat, { t: 'approval/tick', at }, at)
-    if (reduced.state === chat) continue
-    chats = { ...chats, [id]: reduced.state }
+    if (!chat) continue
+    let next = chat
+    // 审批与提问各有自己的过期规则：审批到点就撤，提问要看 canAnswerLate。
+    if (next.approvals.length > 0) next = reduceChat(next, { t: 'approval/tick', at }, at).state
+    if (next.questions.length > 0) next = reduceChat(next, { t: 'question/tick', at }, at).state
+    if (next === chat) continue
+    chats = { ...chats, [id]: next }
     touched.push(id)
   }
   if (touched.length === 0) return done(state, state, [], { activeChanged: false })

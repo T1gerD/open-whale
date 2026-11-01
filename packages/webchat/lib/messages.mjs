@@ -19,7 +19,14 @@
 // 协作（共享会话 / 在线成员 / 昵称前缀）已在 v2.3.0 删除：每台设备只驱动它当前
 // 绑定的那个 DSH 会话，消息里不再有 `speaker`。
 
-import { CLIENT_FRAME, SERVER_FRAME, SESSION_WATCH_LIMIT } from './protocol.mjs'
+import {
+  CLIENT_FRAME,
+  QUESTION_MAX_ITEMS,
+  QUESTION_MAX_OPTIONS,
+  QUESTION_MAX_TEXT,
+  SERVER_FRAME,
+  SESSION_WATCH_LIMIT,
+} from './protocol.mjs'
 import { clampAssistantText } from './protocol.mjs'
 
 /** 用户消息 id 前缀。 */
@@ -34,6 +41,12 @@ export const FILE_MESSAGE_PREFIX = 'file_'
  * 堆积；这里留一个硬上限，保证一个出错的对端也不能把手机内存撑爆。
  */
 export const APPROVAL_QUEUE_LIMIT = 8
+
+/**
+ * 待回答提问的队列上限。一批提问可能有好几道题，正常情况下同时只有一两批；
+ * 这里给一个硬上限，避免坏掉的对端把页面内存撑爆。
+ */
+export const QUESTION_QUEUE_LIMIT = 4
 
 /**
  * 标签条最多同时打开多少个会话：当前会话 + `SESSION_WATCH_LIMIT` 个后台会话。
@@ -159,6 +172,80 @@ export function normalizeApproval(raw, now = Date.now()) {
 }
 
 /**
+ * 归一化一条 `question/ask`（3.0.0 的结构化提问）。
+ * @param {any} raw
+ * @param {number} now
+ * @returns {any | undefined}
+ */
+export function normalizeQuestion(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object') return undefined
+  const questionId = typeof raw.questionId === 'string' ? raw.questionId.trim() : ''
+  if (questionId === '') return undefined
+  const items = []
+  for (const candidate of Array.isArray(raw.items) ? raw.items : []) {
+    if (items.length >= QUESTION_MAX_ITEMS) break
+    if (!candidate || typeof candidate !== 'object') continue
+    if (typeof candidate.id !== 'string' || candidate.id.trim() === '' || typeof candidate.question !== 'string') continue
+    const options = []
+    for (const option of Array.isArray(candidate.options) ? candidate.options : []) {
+      if (options.length >= QUESTION_MAX_OPTIONS) break
+      if (!option || typeof option !== 'object' || typeof option.label !== 'string' || option.label.trim() === '') continue
+      options.push({
+        label: option.label.slice(0, 200),
+        ...(typeof option.description === 'string' && option.description !== ''
+          ? { description: option.description.slice(0, 500) }
+          : {}),
+      })
+    }
+    items.push({
+      id: candidate.id.trim(),
+      question: candidate.question.slice(0, QUESTION_MAX_TEXT),
+      ...(typeof candidate.detail === 'string' && candidate.detail !== '' ? { detail: candidate.detail.slice(0, QUESTION_MAX_TEXT) } : {}),
+      ...(typeof candidate.header === 'string' && candidate.header !== '' ? { header: candidate.header.slice(0, 200) } : {}),
+      ...(options.length > 0 ? { options } : {}),
+      ...(candidate.multiSelect === true ? { multiSelect: true } : {}),
+      ...(candidate.intent && candidate.intent.kind === 'plan-review' && typeof candidate.intent.approve === 'string'
+        ? { intent: { kind: 'plan-review', approve: candidate.intent.approve.slice(0, 200) } }
+        : {}),
+    })
+  }
+  if (items.length === 0) return undefined
+  const expiresAt = Number(raw.expiresAt)
+  return {
+    questionId,
+    items,
+    ...(typeof raw.callId === 'string' && raw.callId !== '' ? { callId: raw.callId } : {}),
+    ...(Number.isFinite(expiresAt) && expiresAt > 0 ? { expiresAt } : {}),
+    canAnswerLate: raw.canAnswerLate === true,
+    at: new Date(now).toISOString(),
+    /** 本地是否已经提交过（避免连点）。 */
+    replied: false,
+  }
+}
+
+/**
+ * 把页面上的草稿拼成 `question/reply`。规则与手机端/core 完全一致：
+ * 每个问题恰好一条；单选填了「其他」时 selected 置空；未答的问题发空答案表示跳过。
+ * @param {any} question
+ * @param {Record<string, {selected?: string[], custom?: string}>} draft
+ * @returns {{questionId: string, answers: Array<{id: string, selected: string[], custom?: string}>} | undefined}
+ */
+export function buildQuestionReply(question, draft = {}) {
+  if (!question || typeof question.questionId !== 'string' || question.questionId === '') return undefined
+  const answers = question.items.map(item => {
+    const entry = draft[item.id] ?? {}
+    const allowed = new Set((item.options ?? []).map(option => option.label))
+    const selected = Array.isArray(entry.selected) ? entry.selected.filter(label => allowed.has(label)) : []
+    const custom = typeof entry.custom === 'string' ? entry.custom.trim().slice(0, QUESTION_MAX_TEXT) : ''
+    if (item.multiSelect !== true) {
+      return { id: item.id, selected: custom !== '' ? [] : selected, ...(custom !== '' ? { custom } : {}) }
+    }
+    return { id: item.id, selected, ...(custom !== '' ? { custom } : {}) }
+  })
+  return { questionId: question.questionId, answers }
+}
+
+/**
  * 把一个附件的各种来源（inline / upload / echo / 文件推送）归一成渲染结构。
  * @param {any} file
  * @returns {{name: string, size: number, mime: string, fileId?: string, uploadId?: string, url?: string} | undefined}
@@ -220,6 +307,10 @@ export class ChatModel {
     this.approvals = []
     /** @type {Map<string, any>} */
     this.approvalsById = new Map()
+    /** @type {any[]} 待回答的结构化提问（3.0.0），队首是最早收到的。 */
+    this.questions = []
+    /** @type {Map<string, any>} */
+    this.questionsById = new Map()
     /** @type {{message: string, code?: string, at: string} | null} */
     this.lastError = null
     this.myDeviceId = options.myDeviceId ?? ''
@@ -296,6 +387,7 @@ export class ChatModel {
     this.cursor = 0
     this.lastError = null
     this.clearApprovals()
+    this.clearQuestions()
     this.#touch()
   }
 
@@ -303,6 +395,31 @@ export class ChatModel {
   clearApprovals() {
     this.approvals = []
     this.approvalsById.clear()
+  }
+
+  /** 清空待回答提问（会话切换、解绑时调用）。 */
+  clearQuestions() {
+    this.questions = []
+    this.questionsById.clear()
+  }
+
+  /**
+   * 本地已经提交了一批回答：标记为已回复，避免连点。
+   * @param {string} questionId
+   * @returns {boolean} false 表示这条提问已经不在队列里
+   */
+  markQuestionReplied(questionId) {
+    const question = this.questionsById.get(String(questionId ?? ''))
+    if (!question || question.replied === true) return false
+    question.replied = true
+    question.repliedAt = new Date().toISOString()
+    this.#touch()
+    return true
+  }
+
+  /** 是否有待回答的提问（决定是否跑倒计时定时器）。 */
+  get hasPendingQuestions() {
+    return this.questions.length > 0
   }
 
   /**
@@ -432,6 +549,10 @@ export class ChatModel {
         return this.#onApprovalAsk(frame, now)
       case SERVER_FRAME.APPROVAL_RESOLVED:
         return this.#onApprovalResolved(frame, now)
+      case SERVER_FRAME.QUESTION_ASK:
+        return this.#onQuestionAsk(frame, now)
+      case SERVER_FRAME.QUESTION_RESOLVED:
+        return this.#onQuestionResolved(frame, now)
       case SERVER_FRAME.FILE_OFFERED:
         return this.#onFileOffered(frame, now)
       case SERVER_FRAME.ERROR:
@@ -817,6 +938,48 @@ export class ChatModel {
     }
   }
 
+  /**
+   * `question/ask`：进待回答队列。同一 questionId 的重发只更新内容（幂等），
+   * 不同批次一律排队。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onQuestionAsk(frame, now) {
+    const question = normalizeQuestion(frame, now)
+    if (!question) return { handled: true, changed: false, frame }
+    const existing = this.questionsById.get(question.questionId)
+    if (existing) {
+      Object.assign(existing, question, { replied: existing.replied === true, repliedAt: existing.repliedAt })
+      this.#touch(now)
+      return { handled: true, changed: true, frame, question: existing }
+    }
+    if (this.questions.length >= QUESTION_QUEUE_LIMIT) {
+      const dropped = this.questions.shift()
+      if (dropped) this.questionsById.delete(dropped.questionId)
+    }
+    this.questions.push(question)
+    this.questionsById.set(question.questionId, question)
+    this.#touch(now)
+    return { handled: true, changed: true, frame, question }
+  }
+
+  /**
+   * `question/resolved`：出队（无论结果如何都不该再显示可点的表单）。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #onQuestionResolved(frame, now) {
+    const questionId = String(frame.questionId ?? '')
+    if (questionId === '') return { handled: true, changed: false, frame }
+    const index = this.questions.findIndex(item => item.questionId === questionId)
+    this.questionsById.delete(questionId)
+    if (index >= 0) this.questions.splice(index, 1)
+    const outcome = typeof frame.outcome === 'string' ? frame.outcome : ''
+    const source = typeof frame.source === 'string' ? frame.source : ''
+    if (index >= 0) this.#touch(now)
+    return { handled: true, changed: index >= 0, frame, resolved: { questionId, outcome, source } }
+  }
+
   /** @param {any} frame @param {number} now */
   #onFileOffered(frame, now) {
     const fileId = String(frame.fileId ?? '')
@@ -1047,6 +1210,18 @@ export class ChatTabsModel {
 
   get hasPendingApprovals() {
     return (this.active?.approvals.length ?? 0) > 0
+  }
+
+  get questions() {
+    return this.active?.questions ?? EMPTY_ARRAY
+  }
+
+  get questionsById() {
+    return this.active?.questionsById ?? EMPTY_MAP
+  }
+
+  get hasPendingQuestions() {
+    return (this.active?.questions.length ?? 0) > 0
   }
 
   get cursor() {
@@ -1494,6 +1669,27 @@ export class ChatTabsModel {
     const found = this.findApproval(approvalId)
     if (!found) return false
     return found.chat.markApprovalReplied(approvalId, outcome)
+  }
+
+  /**
+   * 在任意标签里找一批提问（question/reply 只带 questionId）。
+   * @param {string} questionId
+   */
+  findQuestion(questionId) {
+    const id = String(questionId ?? '')
+    if (id === '') return undefined
+    for (const [sessionId, chat] of this.chats) {
+      const question = chat.questionsById.get(id)
+      if (question) return { sessionId, question, chat }
+    }
+    return undefined
+  }
+
+  /** 标记一批提问已经提交（避免连点）。 */
+  markQuestionReplied(questionId) {
+    const found = this.findQuestion(questionId)
+    if (!found) return false
+    return found.chat.markQuestionReplied(questionId)
   }
 
   /** 清空当前标签的消息（「清空本机聊天记录」）。 */
