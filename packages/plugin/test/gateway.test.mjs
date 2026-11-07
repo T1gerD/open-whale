@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, randomUUID, sign } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { connect } from 'node:net'
@@ -14,6 +14,7 @@ import {
   helloSignatureMessage,
 } from '../src/protocol.mjs'
 import { Gateway, mergeSnapshotMessages, PLUGIN_VERSION, WS_PATH } from '../src/gateway.mjs'
+import { renderPageHtml } from '../src/page.mjs'
 import { StateStore } from '../src/state.mjs'
 
 /** A bridge that records calls and lets tests inject events / canned answers. */
@@ -2221,4 +2222,87 @@ test('question/resolved dismisses the card for every device in the conversation'
   assert.equal(resolved.questionId, 'qst_4')
   assert.equal(resolved.outcome, 'answered')
   client.close()
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.0: 幂等表落盘（重启后仍然识别重复消息）
+// ---------------------------------------------------------------------------
+
+test('the idempotency table survives a gateway restart on the same data dir', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'openwhale-gw-dedupe-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const store = new StateStore({ dir, hostName: '测试电脑' })
+  const harness = makeBridge()
+  const first = new Gateway({ store, bridge: harness.bridge, lanUrls: () => ['http://127.0.0.1:1'] })
+  t.after(() => first.close().catch(() => {}))
+  const firstPort = await first.listen(0, '127.0.0.1')
+  const device = freshDevice()
+  const { client } = await pairDevice(firstPort, device)
+  client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  assert.ok(await client.waitFor(f => f.t === 'chat/ack'))
+  await delay(50)
+  assert.equal(harness.sent.length, 1)
+  client.close()
+  await first.close()
+  assert.equal(existsSync(join(dir, 'dedupe.json')), true, 'the table must be flushed on dispose')
+
+  // 插件重启：内存表清空，但同一个 dataDir 上的新网关必须还认得这条 msgId。
+  const second = new Gateway({ store, bridge: harness.bridge, lanUrls: () => ['http://127.0.0.1:1'] })
+  t.after(() => second.close().catch(() => {}))
+  const secondPort = await second.listen(0, '127.0.0.1')
+  const again = await reconnectWith(secondPort, device)
+  again.client.send({ t: 'chat/send', rid: 'r1', callId: 'c1', msgId: 'm1', text: '你好' })
+  const duplicate = await again.client.waitFor(f => f.t === 'chat/ack' && f.duplicate === true)
+  assert.ok(duplicate, 'a retried msgId must be recognised after a restart')
+  await delay(50)
+  assert.equal(harness.sent.length, 1, 'the assistant must not be woken a second time')
+  again.client.close()
+})
+
+test('a corrupt idempotency file is ignored instead of breaking the gateway', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'openwhale-gw-dedupe-bad-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  writeFileSync(join(dir, 'dedupe.json'), '{ this is not json')
+  const { gateway, port } = await makeGateway({ dir })
+  t.after(() => gateway.close())
+  assert.equal(gateway.dedupeRecords.size, 0)
+  assert.equal((await fetch(`http://127.0.0.1:${port}/openwhale/health`)).status, 200)
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.0: 绑定页模板已抽到 page.mjs
+// ---------------------------------------------------------------------------
+
+test('the page renderer escapes untrusted values and hides local-only controls remotely', () => {
+  const view = {
+    payload: { ok: false, message: 'x' },
+    qr: null,
+    webEntries: [],
+    webUrl: undefined,
+    endpoints: [{ url: 'http://192.168.1.9:8787', kind: 'lan' }],
+    local: true,
+  }
+  const deps = {
+    version: '0.0.0-test',
+    mode: 'auto',
+    report: { detected: { lan: ['http://192.168.1.9:8787'] } },
+    devices: [{ id: 'd1', label: '<script>alert(1)</script>' }],
+    online: () => true,
+    computerName: '<img src=x>',
+    computerId: 'cmp_test',
+    fingerprint: 'abcdef',
+    webClientAvailable: false,
+    port: 8787,
+  }
+  const local = renderPageHtml(view, deps)
+  assert.equal(local.includes('<script>alert(1)</script>'), false, 'device labels must be escaped')
+  assert.match(local, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/)
+  assert.match(local, /&lt;img src=x&gt;/)
+  assert.match(local, /data-unbind="d1"/)
+  assert.match(local, /id="send-file-btn"/)
+
+  const remote = renderPageHtml({ ...view, local: false }, deps)
+  assert.match(remote, /请在本机浏览器/)
+  assert.equal(remote.includes('id="send-file-btn"'), false)
+  assert.equal(remote.includes('data-unbind="d1"'), false)
 })

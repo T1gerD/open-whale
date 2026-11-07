@@ -179,6 +179,9 @@ export class PowerManager {
    * @param {(command: string, args: string[]) => void} [options.run] Override for tests.
    * @param {NodeJS.Platform} [options.platform]
    * @param {(message: string) => void} [options.log]
+   * @param {(fn: () => void, ms: number) => any} [options.setTimer] Timer seam (tests).
+   * @param {(handle: any) => void} [options.clearTimer] Timer seam (tests).
+   * @param {(platform: NodeJS.Platform) => void} [options.abort] OS-abort seam (tests).
    */
   constructor(options = {}) {
     this.now = options.now ?? (() => Date.now())
@@ -189,7 +192,20 @@ export class PowerManager {
         if (error) this.log(`power: ${command} failed: ${error.message}`)
       })
     })
-    /** @type {{action: 'shutdown'|'restart', executeAt: number, token: string, delaySeconds: number, timer: NodeJS.Timeout} | null} */
+    this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms))
+    this.clearTimer = options.clearTimer ?? (handle => clearTimeout(handle))
+    this.abort = options.abort ?? (platform => {
+      if (platform === 'win32') {
+        try {
+          execFileSync('shutdown.exe', ['/a'], { windowsHide: true, stdio: 'ignore' })
+        } catch { /* nothing scheduled at the OS level, or already too late */ }
+      } else if (platform === 'linux' || platform === 'darwin') {
+        try {
+          execFileSync('shutdown', ['-c'], { stdio: 'ignore' })
+        } catch { /* ignore */ }
+      }
+    })
+    /** @type {{action: 'shutdown'|'restart', executeAt: number, token: string, delaySeconds: number, timer: any} | null} */
     this.pending = null
     /** Refuse actions on platforms we have not verified. */
     this.supported = this.platform === 'win32' || this.platform === 'darwin' || this.platform === 'linux'
@@ -228,18 +244,22 @@ export class PowerManager {
     const requested = Number.isFinite(input.delaySeconds) ? Number(input.delaySeconds) : DEFAULT_DELAY_SECONDS
     const delaySeconds = Math.min(MAX_DELAY_SECONDS, Math.max(MIN_DELAY_SECONDS, Math.round(requested)))
     const comment = input.reason ? String(input.reason).slice(0, 200) : '通过 Open Whale 远程执行'
-    const { command, args } = shutdownCommand(input.action, delaySeconds, comment, this.platform)
+    // 宽限期只由我们自己的 timer 负责。旧实现先等 timer 再 `shutdown /t delaySeconds`，
+    // 于是实际生效时间是 2×delaySeconds（用户看到的倒计时和真实关机时间对不上）。
+    // 现在触发时才生成命令，并且用 /t 0 立即执行。
+    const { command, args } = shutdownCommand(input.action, 0, comment, this.platform)
 
     const token = `pw_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+    /** @type {any} */
     let timer
     const record = {
       action: input.action,
       delaySeconds,
       executeAt: this.now() + delaySeconds * 1000,
       token,
-      timer: /** @type {any} */ (null),
+      timer: null,
     }
-    timer = setTimeout(() => {
+    timer = this.setTimer(() => {
       this.log(`power: executing ${input.action} now`)
       this.pending = null
       try {
@@ -248,7 +268,7 @@ export class PowerManager {
         this.log(`power: failed to run ${command}: ${/** @type {Error} */ (error).message}`)
       }
     }, delaySeconds * 1000)
-    timer.unref?.()
+    timer?.unref?.()
     record.timer = timer
     this.pending = record
 
@@ -274,20 +294,12 @@ export class PowerManager {
     if (token && token !== this.pending.token) {
       return { accepted: false, reason: POWER_REFUSAL.FAILED, message: '取消失败：令牌不匹配' }
     }
-    clearTimeout(this.pending.timer)
+    this.clearTimer(this.pending.timer)
     const cancelled = this.pending.action
     this.pending = null
     // Ask the OS to abort too: our own timer only covers the window we own, and
     // a restart may already have been handed to the OS by a previous run.
-    if (this.platform === 'win32') {
-      try {
-        execFileSync('shutdown.exe', ['/a'], { windowsHide: true, stdio: 'ignore' })
-      } catch { /* nothing scheduled at the OS level, or already too late */ }
-    } else if (this.platform === 'linux' || this.platform === 'darwin') {
-      try {
-        execFileSync('shutdown', ['-c'], { stdio: 'ignore' })
-      } catch { /* ignore */ }
-    }
+    this.abort(this.platform)
     this.log(`power: cancelled pending ${cancelled}`)
     return { accepted: true, message: `已取消${cancelled === 'restart' ? '重启' : '关机'}${reason ? `（${reason}）` : ''}` }
   }
@@ -305,7 +317,7 @@ export class PowerManager {
 
   /** Release the timer without running the action (plugin unload). */
   dispose() {
-    if (this.pending) clearTimeout(this.pending.timer)
+    if (this.pending) this.clearTimer(this.pending.timer)
     this.pending = null
   }
 }

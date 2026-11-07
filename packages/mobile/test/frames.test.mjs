@@ -5,6 +5,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import * as realProtocol from '../../protocol/src/index.mjs'
+import * as mirrorFrames from '../src/core/frames.mts'
 import {
   ACTIVITY_KIND,
   ALL_CAPABILITIES,
@@ -80,6 +82,17 @@ test('mirrored capability names match the protocol exactly', () => {
 test('mirrored connection modes and endpoint kinds match the protocol exactly', () => {
   assert.deepEqual(MIRROR_CONNECTION_MODE, CONNECTION_MODE)
   assert.deepEqual(MIRROR_ENDPOINT_KIND, ENDPOINT_KIND)
+})
+
+test('镜像里已有的原始常量都必须与协议同值（不靠手写清单兜底）', () => {
+  const isPrimitive = value => ['number', 'string', 'boolean'].includes(typeof value)
+  for (const [key, value] of Object.entries(realProtocol)) {
+    if (!(key in mirrorFrames)) continue
+    if (isPrimitive(value)) assert.equal(mirrorFrames[key], value, `镜像常量 ${key} 与协议不一致`)
+    if (Array.isArray(value) && value.every(isPrimitive)) {
+      assert.deepEqual(mirrorFrames[key], value, `镜像常量 ${key} 与协议不一致`)
+    }
+  }
 })
 
 test('mirrored numeric constants match the protocol exactly', () => {

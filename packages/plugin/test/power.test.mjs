@@ -208,3 +208,68 @@ test('dispose clears a pending action', () => {
   manager.dispose()
   assert.equal(manager.state().pending, false)
 })
+
+// ---------------------------------------------------------------------------
+// v3.0.0: 单 timer / 触发即 /t 0 / cancel 清 timer 并 shutdown /a
+// ---------------------------------------------------------------------------
+
+function makeTimerManager(options = {}) {
+  const timers = []
+  const executed = []
+  const aborts = []
+  const manager = new PowerManager({
+    platform: 'win32',
+    now: () => 1_000_000,
+    run: (command, args) => executed.push({ command, args }),
+    setTimer: (fn, ms) => {
+      const timer = { fn, ms, cleared: false }
+      timers.push(timer)
+      return timer
+    },
+    clearTimer: timer => {
+      if (timer) timer.cleared = true
+    },
+    abort: platform => aborts.push(platform),
+    ...options,
+  })
+  return { manager, timers, executed, aborts }
+}
+
+test('a shutdown uses exactly one timer and fires as /t 0 (no double delay)', () => {
+  const { manager, timers, executed } = makeTimerManager()
+  const accepted = manager.request({ action: 'shutdown', delaySeconds: 45 })
+  assert.equal(accepted.accepted, true)
+  assert.equal(timers.length, 1, 'the grace window must be exactly one timer')
+  assert.equal(timers[0].ms, 45_000, 'the timer owns the whole grace window')
+  assert.deepEqual(executed, [], 'nothing may be handed to the OS before the grace window ends')
+
+  // 到点：只执行一次，且是 /t 0 —— 宽限期已经被我们的 timer 等掉了，
+  // 旧实现再传 delaySeconds 会让实际关机时间翻倍。
+  timers[0].fn()
+  assert.equal(executed.length, 1)
+  assert.deepEqual(executed[0].args, ['/s', '/t', '0', '/d', 'p:0:0', '/c', '通过 Open Whale 远程执行'])
+  assert.equal(manager.state().pending, false)
+  const cancelled = manager.request({ action: 'cancel' })
+  assert.equal(cancelled.accepted, false, 'after firing there is nothing left to cancel')
+})
+
+test('cancelling clears the single timer and aborts an OS action', () => {
+  const { manager, timers, aborts, executed } = makeTimerManager()
+  manager.request({ action: 'restart', delaySeconds: 30 })
+  const cancelled = manager.request({ action: 'cancel', reason: '按错了' })
+  assert.equal(cancelled.accepted, true)
+  assert.equal(timers.length, 1)
+  assert.equal(timers[0].cleared, true)
+  assert.deepEqual(executed, [], 'cancel must prevent the action from ever running')
+  assert.deepEqual(aborts, ['win32'], 'cancel must also try shutdown /a')
+  assert.equal(manager.state().pending, false)
+})
+
+test('dispose clears the timer without executing the action', () => {
+  const { manager, timers, executed } = makeTimerManager()
+  manager.request({ action: 'shutdown' })
+  manager.dispose()
+  assert.equal(timers[0].cleared, true)
+  assert.deepEqual(executed, [])
+  assert.equal(manager.state().pending, false)
+})

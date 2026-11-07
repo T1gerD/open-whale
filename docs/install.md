@@ -54,6 +54,10 @@ dsh --profile <你的profile> --dump-config | grep -A2 openwhale
 | `connectionMode` | `auto` | 连接方式偏好：`auto`（Tailscale → 局域网 → 隧道）、`lan`、`tailscale`、`tunnel`；也可在配对页选择，保存在 state.json |
 | `tunnelMode` | `off` | `off` 或 `quick`（cloudflared 快速隧道） |
 | `cloudflaredPath` | 空 | cloudflared 可执行文件路径；留空自动探测 |
+| `approvalTimeoutMs` | `20000` | 审批请求等手机作答的时长（clamp 5s–120s）；超时交回桌面 |
+| `questionTimeoutMs` | `90000` | 阻塞式提问（`ask()`）等手机的时长 |
+| `questionTimedTimeoutMs` | `30000` | `askTimed()` 提问的等待时长（必须短于调用方超时） |
+| `questionLateWindowMs` | `300000` | 超时后仍接受补答的窗口 |
 
 覆盖示例（追加到 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 的数组里）：
 
@@ -179,7 +183,7 @@ Tailscale 的典型用法：电脑和手机都登录同一个 tailnet，电脑�
 
 ### 手机处理权限请求（v2.3.0）
 
-电脑上的 DSH 要审批某个工具调用时，请求会转到绑定了该会话的在线手机：显示工具名与原因，可选「允许一次 / 拒绝」。60 秒没人作答、手机离线或请求被中止时，请求自动交回电脑端的 DSH 弹窗，不会把一轮卡死。审批只授权这一次调用，**不改变沙箱边界**。
+电脑上的 DSH 要审批某个工具调用时，请求会转到绑定了该会话的在线手机：显示工具名与原因，可选「允许一次 / 拒绝」。20 秒没人作答（`approvalTimeoutMs` 可配置）、手机离线或请求被中止时，请求自动交回电脑端的 DSH 弹窗，不会把一轮卡死。审批只授权这一次调用，**不改变沙箱边界**。
 
 ### 手机回答 DSH 的提问（v3.0.0）
 

@@ -1,11 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, sign, verify } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { StateStore, fingerprintOf, newToken } from '../src/state.mjs'
+import { STATE_VERSION, StateStore, fingerprintOf, newToken } from '../src/state.mjs'
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'openwhale-state-'))
@@ -52,16 +52,32 @@ test('a corrupt state file is moved aside instead of bricking the plugin', () =>
   writeFileSync(join(dir, 'state.json'), '{ this is not json')
   const store = new StateStore({ dir, now: () => nowRef.value })
   assert.match(store.computerId, /^cmp_/)
+  // 旧内容必须留档，供用户/支持人员检查，而不是被新状态覆盖。
+  const backups = readdirSync(dir).filter(name => name.startsWith('state.json.corrupt-'))
+  assert.equal(backups.length, 1, 'the unreadable file must be kept for inspection')
+  assert.equal(readFileSync(join(dir, backups[0]), 'utf8'), '{ this is not json')
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('a state file from a future schema version is not silently reused', () => {
+test('a state file from a future schema version is backed up, not silently replaced', () => {
   const { store, dir, nowRef } = makeStore()
   const raw = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'))
+  const previousDevices = raw.devices
   raw.version = 99
   writeFileSync(join(dir, 'state.json'), JSON.stringify(raw))
   const reopened = new StateStore({ dir, now: () => nowRef.value })
   assert.notEqual(reopened.computerId, store.computerId)
+  assert.equal(reopened.data.version, STATE_VERSION)
+
+  const backups = readdirSync(dir).filter(name => name.startsWith('state.json.version-99-'))
+  assert.equal(backups.length, 1, 'the old-version file must be preserved as .bak')
+  assert.match(backups[0], /\.bak$/)
+  const saved = JSON.parse(readFileSync(join(dir, backups[0]), 'utf8'))
+  assert.equal(saved.version, 99, 'the backup keeps the original document')
+  assert.equal(saved.identity.id, store.computerId, 'the bound computer identity is still recoverable')
+  assert.deepEqual(saved.devices, previousDevices)
+  // A fresh state was written for the running plugin.
+  assert.equal(JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8')).version, STATE_VERSION)
   rmSync(dir, { recursive: true, force: true })
 })
 

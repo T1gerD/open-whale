@@ -1,10 +1,14 @@
 // 离线发送队列（纯逻辑）。
 //
-// 手机是网络断续的一侧：消息可能刚发出去就断线，而电脑端**没有**去重，
-// 所以“重发”必须由这一层决定边界：
+// 手机是网络断续的一侧，而电脑端**没有**去重之外的可靠性机制，所以“重发”的边界
+// 必须由这一层决定：
 //  * 未确认的消息在重连后重发，但同一个 rid 只保留一条；
-//  * 每条消息的重试次数有上限，超过就交给用户手动重试（避免断网时无限空转、耗电）；
-//  * 断线时“飞行中”的条目退回 pending，否则它们会永远卡住。
+//  * `inflight` 有 ack 超时（{@link expireInflight}）：半死连接不会触发 onclose，
+//    没有这层兜底，消息会永远停在「发送中…」；
+//  * 每条消息的自动重试次数有上限，用尽后交给用户：UI 显示「重试用尽」，
+//    手动「重新发送」换一个新的 msgId（{@link rotateEntryIds}）才会真的被电脑端执行；
+//  * 断线时“飞行中”的条目退回 pending，否则它们会永远卡住；
+//  * 旧 msgId 留在 `previousMsgIds` 里，只为认回可能迟到的回执。
 
 export type OutboxState = 'pending' | 'inflight' | 'sent' | 'failed'
 
@@ -37,6 +41,12 @@ export interface OutboxEntry {
   text: string
   /** 电脑端幂等键；老实现缺省时回落到 rid。 */
   msgId?: string
+  /**
+   * 这条消息历史上用过的 msgId（手动「重新发送」会换一个新的幂等键）。
+   * 只用于接收迟到的 `chat/ack`：电脑端可能还在回执上一轮的 id，认不出来就会
+   * 让气泡一直停在「发送中」，而队列里其实已经被移除了。
+   */
+  previousMsgIds?: string[]
   files?: OutboxFile[]
   /** 已经上传完成的附件（重发时直接引用 uploadId，不重复上传）。 */
   uploads?: OutboxUploadRef[]
@@ -55,6 +65,22 @@ export interface Outbox {
 }
 
 export const DEFAULT_OUTBOX_LIMIT = 200
+
+/**
+ * 发出消息后等 `chat/ack` 的上限。
+ *
+ * 为什么必须有它：`inflight` 条目只在**断线**时才会退回 pending。如果连接一直是
+ * “半死”的（TCP 还在、电脑端却已经丢掉这条帧，或反向代理吞了请求），条目会永远
+ * 停在 inflight —— UI 上就是一条永远「发送中…」的消息，而且重连也救不回来。
+ * 15 秒是「正常往返（秒级）」与「让用户以为卡死」之间的折中。
+ */
+export const ACK_TIMEOUT_MS = 15_000
+
+/**
+ * 确认超时后自动重发的等待时间。
+ * 不做立即重发：电脑端可能正在忙，立刻重发只会把同一条消息再塞一遍。
+ */
+export const ACK_RETRY_DELAY_MS = 2_000
 
 /**
  * 自动重发上限。
@@ -150,12 +176,108 @@ export function releaseInflight(outbox: Outbox): Outbox {
 }
 
 /**
+ * 确认超时检查（纯逻辑，由服务层每秒调用一次）。
+ *
+ * 对每条 `inflight` 且超过 `timeoutMs` 没收到 ack 的条目：
+ *  * 还有自动重试配额 → 退回 `pending`（attempts+1，退避 `retryDelayMs`），下一次 pump 会重发；
+ *  * 配额用尽 → 标 `failed` 并写明原因，UI 显示「重试用尽」并给手动「重新发送」。
+ *
+ * 注意这里**不换 msgId**：自动重发必须沿用同一个幂等键，否则第一次其实送达、
+ * 只是 ack 丢了的消息会在电脑端被注入两次。
+ */
+export function expireInflight(
+  outbox: Outbox,
+  options: {
+    now: number
+    timeoutMs?: number
+    maxAttempts?: number
+    retryDelayMs?: number
+  },
+): { outbox: Outbox; timedOut: OutboxEntry[]; exhausted: OutboxEntry[] } {
+  const now = options.now
+  const timeoutMs = options.timeoutMs ?? ACK_TIMEOUT_MS
+  const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+  const retryDelayMs = options.retryDelayMs ?? ACK_RETRY_DELAY_MS
+  const timedOut: OutboxEntry[] = []
+  const exhausted: OutboxEntry[] = []
+  let changed = false
+  const entries = outbox.entries.map(entry => {
+    if (entry.state !== 'inflight') return entry
+    const sentAt = typeof entry.lastAttemptAt === 'number' ? entry.lastAttemptAt : entry.createdAt
+    if (!Number.isFinite(sentAt) || now - sentAt < timeoutMs) return entry
+    changed = true
+    const attempts = entry.attempts + 1
+    if (attempts >= maxAttempts) {
+      const failed: OutboxEntry = {
+        ...entry,
+        state: 'failed',
+        attempts,
+        error: `电脑端一直没有确认（${Math.round(timeoutMs / 1000)} 秒无响应），自动重试已用尽`,
+        retryAfter: undefined,
+      }
+      timedOut.push(failed)
+      exhausted.push(failed)
+      return failed
+    }
+    const pending: OutboxEntry = {
+      ...entry,
+      state: 'pending',
+      attempts,
+      error: `电脑端没有确认，${Math.round(retryDelayMs / 1000)} 秒后自动重发（第 ${attempts} 次）`,
+      retryAfter: now + retryDelayMs,
+    }
+    timedOut.push(pending)
+    return pending
+  })
+  return { outbox: changed ? { ...outbox, entries } : outbox, timedOut, exhausted }
+}
+
+/**
+ * 手动「重新发送」：换一个**全新的 msgId**（电脑端幂等表的键），保留 rid。
+ *
+ * 为什么必须换：电脑端按 `(deviceId, msgId)` 去重，用旧 msgId 重发会被当成重放、
+ * 直接回一个 duplicate ack —— 按钮看起来点得动，实际上什么也没发生（就是本次要修的 bug）。
+ * 旧 msgId 留进 `previousMsgIds`，只为认回可能迟到的回执。
+ *
+ * rid 不变：本地气泡 id 是 `usr_<rid>`（reducer 的 `outbox/retry` 按 rid 找回同一条），
+ * 所以气泡会从「发送失败」平滑变回「发送中」，不会多出一条重复消息。
+ * `createdAt` 也不变：重发不应该把消息插到后面那些更晚的消息之后。
+ */
+export function rotateEntryIds(
+  outbox: Outbox,
+  key: string,
+  next: { msgId: string; rid?: string },
+): Outbox {
+  const newMsgId = typeof next.msgId === 'string' ? next.msgId.trim() : ''
+  if (!newMsgId) return outbox
+  return patch(outbox, key, entry => {
+    const nextRid = typeof next.rid === 'string' && next.rid !== '' ? next.rid : entry.rid
+    const previous = new Set(entry.previousMsgIds ?? [])
+    // 旧 msgId 进别名表（迟到的回执可能还带着它）；rid 只在真的换了的时候才记。
+    if (entry.msgId && entry.msgId !== newMsgId) previous.add(entry.msgId)
+    if (nextRid !== entry.rid && entry.rid !== newMsgId) previous.add(entry.rid)
+    previous.delete(newMsgId)
+    previous.delete(nextRid)
+    return {
+      ...entry,
+      rid: nextRid,
+      msgId: newMsgId,
+      previousMsgIds: [...previous],
+      state: 'pending',
+      attempts: 0,
+      error: undefined,
+      retryAfter: undefined,
+      lastAttemptAt: undefined,
+    }
+  })
+}
+
+/**
  * 重连后可以重发的条目（按入队顺序，保证聊天顺序）。
  * 只考虑 `pending`：`inflight` 表示这条消息在**当前**连接上已经发出去了，正在等 ack，
  * 断线时调用方必须先 `releaseInflight` 把它退回 pending，重发才是安全的。
  * @param maxAttempts 自动重发上限，超过后由用户在聊天页手动点“重试”。
- */
-export function resendableEntries(
+ */export function resendableEntries(
   outbox: Outbox,
   options: { now: number; maxAttempts?: number } = { now: Date.now() },
 ): OutboxEntry[] {
@@ -173,7 +295,11 @@ export function exhaustedEntries(outbox: Outbox, maxAttempts: number = DEFAULT_M
 }
 
 /**
- * 手动重试：**真正清零计数**并允许立即重发。
+ * 手动重试：**真正清零计数**并允许立即重发（沿用原 msgId）。
+ *
+ * 注意：界面上的「重新发送」现在走 {@link rotateEntryIds}——它会换一个新的幂等键，
+ * 否则电脑端的去重表会把重发当成重放、按钮等于空操作。这个原语留给"同一个消息
+ * 明确想原地重放"的调用方（以及测试）。
  *
  * 以前这里只把状态改回 pending，忘记重置 `attempts`，
  * 而 `resendableEntries` 会用 `attempts < maxAttempts` 过滤，
@@ -255,6 +381,9 @@ function normalizeEntry(entry: Partial<OutboxEntry> & { rid: string; text: strin
     callId: typeof entry.callId === 'string' ? entry.callId : entry.rid,
     text: entry.text,
     msgId: typeof entry.msgId === 'string' ? entry.msgId : undefined,
+    previousMsgIds: Array.isArray(entry.previousMsgIds)
+      ? entry.previousMsgIds.filter((id: unknown): id is string => typeof id === 'string' && id !== '')
+      : undefined,
     files: Array.isArray(entry.files) ? entry.files : undefined,
     uploads: Array.isArray(entry.uploads) ? entry.uploads : undefined,
     createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now(),
@@ -276,8 +405,14 @@ function patch(outbox: Outbox, key: string, update: (entry: OutboxEntry) => Outb
   return touched ? { ...outbox, entries } : outbox
 }
 
-/** 队列条目按 rid 或 msgId 寻址（chat/ack 可能只带其中一个）。 */
+/**
+ * 队列条目按 rid / msgId / 历史 msgId 寻址。
+ *
+ * `chat/ack` 可能只带 rid 或只带 msgId；手动重发换过 msgId 之后，电脑端仍可能
+ * 回执上一轮的旧 id —— 认不出来就会把条目留在队列里，气泡永远停在「发送中」。
+ */
 function matches(entry: OutboxEntry, key: string): boolean {
   if (!key) return false
-  return entry.rid === key || entry.msgId === key
+  if (entry.rid === key || entry.msgId === key) return true
+  return Array.isArray(entry.previousMsgIds) && entry.previousMsgIds.includes(key)
 }

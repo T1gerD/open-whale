@@ -11,7 +11,16 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { Config, DEFAULT_CONFIG, readProfileDefaultModel, resolveModelSelection } from '../src/index.mjs'
+import {
+  APPROVAL_TIMEOUT_MAX_MS,
+  APPROVAL_TIMEOUT_MIN_MS,
+  Config,
+  DEFAULT_CONFIG,
+  readProfileDefaultModel,
+  resolveForwardTimeouts,
+  resolveModelSelection,
+  volatilize,
+} from '../src/index.mjs'
 
 /**
  * A fake ctx exposing only what the resolver looks at.
@@ -269,4 +278,68 @@ test('resolveModelSelection falls back to the profile file when the service is a
     else process.env.DSH_HOME = previous
     rmSync(home, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.0: 转发窗口可配置（审批 / 提问）
+// ---------------------------------------------------------------------------
+
+test('forwarding windows have safe defaults that match the protocol constants', () => {
+  assert.equal(DEFAULT_CONFIG.approvalTimeoutMs, 20000)
+  assert.equal(DEFAULT_CONFIG.questionTimeoutMs, 90000)
+  assert.equal(DEFAULT_CONFIG.questionTimedTimeoutMs, 30000)
+  assert.equal(DEFAULT_CONFIG.questionLateWindowMs, 300000)
+  assert.deepEqual(resolveForwardTimeouts({}), {
+    approvalTimeoutMs: 20000,
+    questionTimeoutMs: 90000,
+    questionTimedTimeoutMs: 30000,
+    questionLateWindowMs: 300000,
+  })
+})
+
+test('the approval window is clamped into 5s..120s', () => {
+  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 1 }).approvalTimeoutMs, APPROVAL_TIMEOUT_MIN_MS)
+  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 999_999 }).approvalTimeoutMs, APPROVAL_TIMEOUT_MAX_MS)
+  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 30_000 }).approvalTimeoutMs, 30_000)
+  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: '45000' }).approvalTimeoutMs, 45_000)
+  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 'nope' }).approvalTimeoutMs, DEFAULT_CONFIG.approvalTimeoutMs)
+})
+
+test('question windows keep their configured value but refuse garbage', () => {
+  const resolved = resolveForwardTimeouts({
+    questionTimeoutMs: 60_000,
+    questionTimedTimeoutMs: 15_000,
+    questionLateWindowMs: 120_000,
+  })
+  assert.equal(resolved.questionTimeoutMs, 60_000)
+  assert.equal(resolved.questionTimedTimeoutMs, 15_000)
+  assert.equal(resolved.questionLateWindowMs, 120_000)
+
+  const fallback = resolveForwardTimeouts({
+    questionTimeoutMs: -1,
+    questionTimedTimeoutMs: 'x',
+    questionLateWindowMs: Number.NaN,
+  })
+  assert.equal(fallback.questionTimeoutMs, DEFAULT_CONFIG.questionTimeoutMs)
+  assert.equal(fallback.questionTimedTimeoutMs, DEFAULT_CONFIG.questionTimedTimeoutMs)
+  assert.equal(fallback.questionLateWindowMs, DEFAULT_CONFIG.questionLateWindowMs)
+  // 0 是合法的「不设超时」，不能被当成缺失值。
+  assert.equal(resolveForwardTimeouts({ questionTimeoutMs: 0 }).questionTimeoutMs, 0)
+})
+
+test('the new timeout fields are listed as live-editable candidates', () => {
+  const volatile = () => ({ type: 'number' })
+  const schema = {
+    dict: {
+      approvalTimeoutMs: { volatile },
+      questionTimeoutMs: { volatile },
+      questionTimedTimeoutMs: { volatile },
+      questionLateWindowMs: { volatile },
+    },
+  }
+  const patches = volatilize(schema)
+  for (const key of ['approvalTimeoutMs', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
+    assert.ok(patches[key], `${key} must be volatilizable`)
+  }
+  assert.deepEqual(volatilize({ dict: {} }), {})
 })

@@ -4,10 +4,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  ACK_RETRY_DELAY_MS,
+  ACK_TIMEOUT_MS,
   createOutbox,
   deserializeOutbox,
   enqueue,
   exhaustedEntries,
+  expireInflight,
   getEntry,
   markFailed,
   markInflight,
@@ -19,6 +22,7 @@ import {
   releaseInflight,
   resendableEntries,
   retryEntry,
+  rotateEntryIds,
   serializeOutbox,
 } from '../src/core/outbox.mts'
 
@@ -131,6 +135,88 @@ test('entries are addressable by msgId as well as rid (chat/ack may only carry o
   assert.equal(getEntry(outbox, 'm1').state, 'inflight')
   outbox = markSent(outbox, 'm1')
   assert.equal(outboxSize(outbox), 0)
+})
+
+// ---------------------------------------------------------------------------
+// ack 超时（半死连接）与手动重新发送
+// ---------------------------------------------------------------------------
+
+test('an in-flight message with no ack expires back to pending with the same msgId', () => {
+  let outbox = enqueue(createOutbox(), { ...entry('r1'), msgId: 'm1' })
+  outbox = markInflight(outbox, 'r1', 1_000)
+  // 还没到超时阈值：不动它
+  const early = expireInflight(outbox, { now: 1_000 + ACK_TIMEOUT_MS - 1 })
+  assert.equal(early.outbox, outbox)
+  assert.deepEqual(early.timedOut, [])
+
+  const { outbox: expired, timedOut, exhausted } = expireInflight(outbox, { now: 1_000 + ACK_TIMEOUT_MS })
+  assert.equal(expired.entries[0].state, 'pending')
+  assert.equal(expired.entries[0].attempts, 1)
+  assert.equal(expired.entries[0].msgId, 'm1', '自动重发必须沿用同一个幂等键，防止重复注入')
+  assert.equal(expired.entries[0].retryAfter, 1_000 + ACK_TIMEOUT_MS + ACK_RETRY_DELAY_MS)
+  assert.match(expired.entries[0].error, /没有确认/)
+  assert.equal(timedOut.length, 1)
+  assert.deepEqual(exhausted, [])
+  // 退避没到之前不会重发；到点后可以重发
+  assert.deepEqual(resendableEntries(expired, { now: 1_000 + ACK_TIMEOUT_MS }), [])
+  assert.deepEqual(
+    resendableEntries(expired, { now: 1_000 + ACK_TIMEOUT_MS + ACK_RETRY_DELAY_MS }).map(item => item.rid),
+    ['r1'],
+  )
+})
+
+test('auto retry gives up after the attempt cap and marks the entry failed', () => {
+  let outbox = enqueue(createOutbox(), { ...entry('r1'), msgId: 'm1' })
+  let now = 0
+  const expiredAll = []
+  for (let i = 0; i < 8; i++) {
+    outbox = markInflight(outbox, 'r1', now)
+    const result = expireInflight(outbox, { now: now + ACK_TIMEOUT_MS, maxAttempts: 8 })
+    outbox = result.outbox
+    expiredAll.push(...result.exhausted)
+    if (getEntry(outbox, 'r1').state === 'failed') break
+    now = getEntry(outbox, 'r1').retryAfter
+  }
+  const final = getEntry(outbox, 'r1')
+  assert.equal(final.state, 'failed')
+  assert.equal(final.attempts, 8)
+  assert.equal(final.msgId, 'm1')
+  assert.match(final.error, /自动重试已用尽/)
+  assert.equal(expiredAll.length, 1)
+  assert.deepEqual(exhaustedEntries(outbox).map(item => item.rid), ['r1'])
+  // 用尽的条目不再进入自动重发
+  assert.deepEqual(resendableEntries(outbox, { now: now + 1_000_000 }), [])
+})
+
+test('manual resend rotates the msgId but still matches a late ack for the old one', () => {
+  let outbox = enqueue(createOutbox(), { ...entry('r1'), msgId: 'm1' })
+  outbox = markInflight(outbox, 'r1', 100)
+  outbox = markFailed(outbox, 'r1', '发送失败', undefined)
+  // 用尽后手动重新发送：换新幂等键，状态回到 pending、计数清零
+  outbox = rotateEntryIds(outbox, 'r1', { msgId: 'm2', rid: 'r1' })
+  const rotated = getEntry(outbox, 'r1')
+  assert.equal(rotated.state, 'pending')
+  assert.equal(rotated.msgId, 'm2')
+  assert.equal(rotated.attempts, 0)
+  assert.equal(rotated.error, undefined)
+  assert.deepEqual(rotated.previousMsgIds, ['m1'])
+  // 电脑端可能还在回执上一轮的 msgId：必须能认回来并移除条目
+  outbox = markSent(outbox, 'm1')
+  assert.equal(outboxSize(outbox), 0)
+
+  // 空 msgId 的轮换是无效操作（不把条目搞坏）
+  const untouched = enqueue(createOutbox(), entry('r2'))
+  assert.equal(rotateEntryIds(untouched, 'r2', { msgId: '   ' }), untouched)
+})
+
+test('rotated ids survive a JSON round-trip (ack alias must not be lost on restart)', () => {
+  let outbox = enqueue(createOutbox(), { ...entry('r1'), msgId: 'm1' })
+  outbox = rotateEntryIds(outbox, 'r1', { msgId: 'm2' })
+  const restored = deserializeOutbox(serializeOutbox(outbox))
+  assert.deepEqual(getEntry(restored, 'r1').previousMsgIds, ['m1'])
+  assert.equal(getEntry(restored, 'r1').msgId, 'm2')
+  // 反序列化后的旧 msgId 仍能命中（否则重启后一条迟到的 ack 会让气泡卡在「发送中」）
+  assert.equal(getEntry(restored, 'm1').rid, 'r1')
 })
 
 test('uploaded attachments are remembered so a retry does not upload twice', () => {

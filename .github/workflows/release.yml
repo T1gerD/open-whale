@@ -47,15 +47,28 @@ jobs:
 
       - name: Read versions from the repository
         id: meta
+        env:
+          # 发布时真正会被打上的 ref：tag 推送取 ref_name；手动触发取输入（可以为空，
+          # 表示"只构建不发布"）。绝不取分支名，所以分支上手动跑不会误判。
+          EXPECTED_TAG: "${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}"
         run: |
           node -e "
             const p=require('./packages/plugin/package.json');
             const m=require('./packages/mobile/package.json');
+            const r=require('./package.json');
             if(p.version!==m.version) throw new Error('plugin and mobile versions differ: '+p.version+' vs '+m.version);
+            if(p.version!==r.version) throw new Error('root and plugin versions differ: '+r.version+' vs '+p.version);
+            const expected='v'+p.version;
+            const ref=(process.env.EXPECTED_TAG||'').trim();
+            if(ref && ref!==expected) throw new Error('tag '+ref+' does not match '+expected+' (version in package.json)');
+            console.log('version '+p.version+', publishing as '+(ref||'(no tag: build only)'));
             const fs=require('fs');
             fs.appendFileSync(process.env.GITHUB_OUTPUT,'version='+p.version+'\n');
-            fs.appendFileSync(process.env.GITHUB_OUTPUT,'tag=v'+p.version+'\n');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,'tag='+expected+'\n');
           "
+
+      - name: Check versions and documentation against the code
+        run: node scripts/check-docs.mjs
 
       # No install step: every suite in this repository runs against a bare Node.
       - name: Run all test suites
@@ -76,17 +89,16 @@ jobs:
         # Installed at the repo root so the workspace link for
         # `@openwhale/protocol` resolves. The mobile app's Metro config also points
         # at the root `node_modules`, which is how Expo expects a pnpm monorepo.
-        run: pnpm install --no-frozen-lockfile
+        # Frozen: the lockfile is the only thing that makes the APK reproducible, so
+        # a commit that changes dependency versions has to update it too.
+        run: pnpm install --frozen-lockfile
 
-      - name: Align Expo package versions
+      - name: Check Expo package versions
         working-directory: packages/mobile
-        # A few Expo packages are declared as "*". Pin them to the versions that
-        # match the pinned Expo SDK so a brand-new upstream release cannot break
-        # the build. Advisory: if the Expo CLI cannot reach the registry we carry
-        # on with what the resolver installed and let prebuild/Gradle decide.
-        run: |
-          npx --yes expo install --check || true
-          npx --yes expo install --fix || true
+        # 只校验、不改依赖树。老的 `expo install --check/--fix || true` 会在发布途中
+        # 改写 package.json 与依赖树，产物因此对不上任何一次提交；版本号现在钉在
+        # 仓库里，不匹配就让 job 红（不再 `|| true`）。
+        run: npx --yes expo install --check
 
       - uses: actions/setup-java@v4
         with:
@@ -149,14 +161,28 @@ jobs:
       - name: Checksums
         run: |
           cd release
-          sha256sum * > SHA256SUMS.txt
+          # 只哈希发布资产：`release/*` 还会匹配到 npm staging 目录（下面创建）。
+          sha256sum *.tgz *.apk > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: open-whale-${{ steps.meta.outputs.version }}
-          path: release/*
+          # Explicit list: `release/*` would also match the staged npm directory
+          # created below (and any local leftovers on a re-run).
+          path: |
+            release/*.tgz
+            release/*.apk
+            release/SHA256SUMS.txt
           if-no-files-found: error
+
+      # 与是否配置 NPM_TOKEN 无关：每次发布会跑真实的 packer，断言 tarball 里有
+      # src / lib / webchat / cordis.patch.yml 且不含 test。`files` 白名单写错的
+      # 代价是用户装上插件后静态资源 404，这种错误必须在发布前变红。
+      - name: Verify the npm package layout
+        run: |
+          node scripts/build-plugin-package.mjs --npm-dir
+          node scripts/check-npm-package.mjs release/npm-package
 
       # Optional: publish `dsh-openwhale` to npm when the repository carries an
       # NPM_TOKEN secret. The plugin-market catalog picks the package up from the
@@ -171,7 +197,7 @@ jobs:
             echo "NPM_TOKEN is not configured for this repository — skipping npm publish."
             exit 0
           fi
-          node scripts/build-plugin-package.mjs --npm-dir
+          # release/npm-package was staged and verified by the previous step.
           npm publish release/npm-package --access public --registry=https://registry.npmjs.org/
 
       # Publish when there is a tag to publish: either this run was triggered by a tag
@@ -185,4 +211,8 @@ jobs:
           body_path: CHANGELOG.md
           draft: false
           prerelease: false
-          files: release/*
+          # Explicit list: the npm staging directory lives under release/ too.
+          files: |
+            release/*.tgz
+            release/*.apk
+            release/SHA256SUMS.txt

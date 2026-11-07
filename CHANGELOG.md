@@ -30,10 +30,36 @@
 - 发版产物名相应变为 `dsh-openwhale-3.0.0.tgz` / `open-whale-3.0.0.apk`；
   版本统一后 tag 应为 `v3.0.0`。
 
+### 修复（本版同时补上的稳定性问题）
+
+- **接管桌面已打开的会话**：`selectSession` / `#ensureAgent` 的 live 分支现在会给接管到的
+  agent 在其 scoped ctx 上补注册审批 / 提问转发者（`{prepend:true}`，同一 agent 只注册一次，
+  release/dispose 解绑），修掉「手机续上桌面正在跑的会话时，审批与提问只在桌面弹」的缺口。
+- **审批等待从 60 秒降到 20 秒**（`APPROVAL_TIMEOUT_MS`），并新增 `approvalTimeoutMs` /
+  `questionTimeoutMs` / `questionTimedTimeoutMs` / `questionLateWindowMs` 四个插件配置项
+  （审批 clamp 5s–120s），减少「手机在线但没人看」时桌面像卡住的窗口。
+- **幂等表落盘**：`<dataDir>/dedupe.json`（启动加载、TTL/容量、去抖原子写、失败只记日志），
+  插件重启后同一条重发不会再执行一次。
+- **上传串行化 + 单句柄写入**：同一 uploadId 的 chunk 走 promise 链，start 打开 FileHandle、
+  chunk 写到 `received` 偏移、end 排空后关闭再 rename；cancel/dispose 关闭句柄。
+- **state 不再静默覆盖**：版本不符 / 损坏 / 不可读时先备份 `state.json.*.bak` 再新建。
+- **电源时序**：宽限期只由一个本地 timer 承担，到点用 `shutdown /t 0` 执行（不再双倍延时）；
+  `cancel` 清 timer 并执行 `shutdown /a`。
+- **网关拆分**：绑定页 HTML 移到 `src/page.mjs`，文件分片 / 下载 token 移到 `src/files.mjs`
+  （帧分发未动，行为不变）。
+- **手机端消息可靠性**：ack 15 秒超时回退重试、`attempts>=8` 显示「重试用尽」、手动「重新发送」
+  改用新 msgId（避免被幂等表吃掉）、端点候选去重 + 上限 + 连败淘汰。
+- **Android 明文流量**：改为 `network_security_config.xml`（NSC 不支持 CIDR，私网 http 仍需
+  全局允许；公网隧道只走 https/wss），保留 manifest 属性作 API 23 兜底。
+- **工程门禁**：测试运行器不再只看摘要（摘要 + 非零退出码判红）并新增 `--self-test`；
+  release 断言 tag == v${version}、`--frozen-lockfile`、`expo install --check` 失败即红、
+  `npm pack --dry-run` 文件清单校验；新增 `scripts/check-docs.mjs`（版本 / 产物名 / 计数一致性）。
+
 ### 测试
 
-- 51 个测试文件 / 789 项测试全绿：新增协议答案校验、插件转发（含无手机/超时/迟到补答）、
-  手机端提问队列/草稿/回包、网页版提问模型与协议镜像等用例；版本断言同步改为 `3.0.0`。
+- 52 个测试文件 / 822 项测试全绿（插件 15 / 384，其余见各包）；新增协议答案校验、插件转发
+  （无手机 / 超时 / 迟到补答 / 接管 live agent）、幂等持久化、上传并发、state 备份、power 时序、
+  手机端 ack 超时与端点池、runner 自检、文档一致性检查等用例；版本断言同步为 `3.0.0`。
 
 ## [2.4.1] - 2026-10-30
 

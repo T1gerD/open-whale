@@ -8,7 +8,7 @@
 //  · 保留原始扩展名（`photo.jpg` 不能变成 `photo`，否则图片工具识别不了）；
 //  · 临时名写入、完成后 rename；空闲 3 分钟清理，避免半截文件永久堆在磁盘上。
 import { createHash, randomBytes } from 'node:crypto'
-import { appendFile, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, rename, rm, stat } from 'node:fs/promises'
 import { join, extname } from 'node:path'
 
 import {
@@ -35,6 +35,8 @@ const CLEANUP_INTERVAL_MS = 60 * 1000
  * @property {string} [mime]
  * @property {string} [expectedSha256]
  * @property {string} tempPath
+ * @property {import('node:fs/promises').FileHandle | null} handle  打开中的临时文件句柄
+ * @property {Promise<void>} chain  同一 uploadId 的写入串行链
  * @property {number} received
  * @property {number} nextSeq
  * @property {import('node:crypto').Hash} hash
@@ -124,10 +126,14 @@ export class UploadManager {
     }
 
     const dir = this.directory()
+    let handle
     try {
       await mkdir(dir, { recursive: true })
       const tempPath = join(dir, `.upload-${uploadId}.part`)
-      await writeFile(tempPath, Buffer.alloc(0))
+      // 用 fd 写整个上传过程（而不是每块 appendFile 重新打开）：
+      //  · 少一次「按路径打开」的竞态，也便于 cancel/dispose 时确定地关掉句柄；
+      //  · received/nextSeq 只在 write 真正完成后推进，并发帧不会写重。
+      handle = await open(tempPath, 'w')
       const now = this.now()
       /** @type {UploadState} */
       const state = {
@@ -138,6 +144,8 @@ export class UploadManager {
         mime: typeof input.mime === 'string' && input.mime ? input.mime : undefined,
         expectedSha256: normalizeSha256(input.sha256),
         tempPath,
+        handle,
+        chain: Promise.resolve(),
         received: 0,
         nextSeq: 0,
         hash: createHash('sha256'),
@@ -152,18 +160,44 @@ export class UploadManager {
         ready: { uploadId, chunkBytes: this.chunkBytes, maxBytes: this.maxBytes },
       }
     } catch (error) {
+      // 打开失败时不留半截文件/句柄。
+      if (handle) {
+        try { await handle.close() } catch { /* 打不开就没有句柄 */ }
+      }
       return { ok: false, code: 'io-error', message: `无法准备上传目录：${/** @type {Error} */ (error).message}` }
     }
   }
 
   /**
    * 接收一块数据。返回的 `nextSeq` 就是背压信号。
+   *
+   * 同一个 `uploadId` 的块按到达顺序**串行**写入：手机重试/并发帧可能让
+   * seq 0 的两帧同时在飞，若并行 `appendFile` 会把同一块写两遍、`received`
+   * 也翻倍。这里用 per-upload promise 链排队，下一块永远等上一块写完。
    * @param {{uploadId: string, deviceId: string, seq: number, dataBase64: string}} input
    */
   async chunk(input) {
     const state = this.#owned(input.uploadId, input.deviceId)
     if (!state) return { ok: false, code: 'not-found', message: '找不到这个上传任务' }
+    const run = () => this.#writeChunk(state, input)
+    const result = state.chain.then(run, run)
+    // 链本身必须永远 settle，否则一个失败会把后续块全卡住。
+    state.chain = result.then(() => {}, () => {})
+    return result
+  }
+
+  /**
+   * 串行链里的真正写入：校验 seq、写 fd、成功后推进 received/nextSeq。
+   * @param {UploadState} state
+   * @param {{seq: unknown, dataBase64: unknown}} input
+   */
+  async #writeChunk(state, input) {
+    // 排队期间上传可能已经被 cancel/dispose/清掉：那时按 not-found 回答。
+    if (this.uploads.get(state.uploadId) !== state) {
+      return { ok: false, code: 'not-found', message: '找不到这个上传任务' }
+    }
     if (state.completed) return { ok: false, code: 'already-completed', message: '该文件已上传完成' }
+    if (!state.handle) return { ok: false, code: 'io-error', message: '上传文件句柄已关闭，请重新上传' }
     const seq = Number(input.seq)
     if (!Number.isInteger(seq) || seq < 0) {
       return { ok: false, code: 'bad-seq', message: '分块序号不合法' }
@@ -188,7 +222,9 @@ export class UploadManager {
       return { ok: false, code: 'overflow', message: '收到的数据超过声明的大小，已丢弃该上传' }
     }
     try {
-      await appendFile(state.tempPath, bytes)
+      // 显式 position：句柄是 'w' 打开的，但用 received 定位可以保证即便
+      // 有重放/乱序帧也不会覆盖已写入的数据。
+      await state.handle.write(bytes, 0, bytes.length, state.received)
     } catch (error) {
       await this.#discard(state)
       return { ok: false, code: 'io-error', message: `写入失败：${/** @type {Error} */ (error).message}` }
@@ -211,6 +247,12 @@ export class UploadManager {
     const state = this.#owned(input.uploadId, input.deviceId)
     if (!state) return { ok: false, code: 'not-found', message: '找不到这个上传任务' }
     if (state.completed) return { ok: true, done: this.#doneFrame(state) }
+    // 收尾可能赶在最后一块的写入前面（客户端并发/重试）：先让队列排空，
+    // 否则会对着还没 flush 的 received 做 incomplete 判断。
+    await state.chain
+    if (this.uploads.get(state.uploadId) !== state) {
+      return { ok: false, code: 'not-found', message: '找不到这个上传任务' }
+    }
     if (state.received !== state.size) {
       return {
         ok: false,
@@ -225,6 +267,8 @@ export class UploadManager {
       await this.#discard(state)
       return { ok: false, code: 'sha256-mismatch', message: '文件校验失败（sha256 不一致），请重新上传' }
     }
+    // rename 之前必须关掉句柄：Windows 上打开中的文件不能被改名。
+    await this.#closeHandle(state)
     const dir = this.directory()
     const finalPath = join(dir, `${this.now()}-${randomBytes(3).toString('hex')}-${state.name}`)
     try {
@@ -315,7 +359,7 @@ export class UploadManager {
     }
   }
 
-  /** 丢弃一个上传：删临时文件 + 删记录。 @param {UploadState} state */
+  /** 丢弃一个上传：关句柄 + 删临时文件 + 删记录。 @param {UploadState} state */
   async #discard(state) {
     await this.#removeTemp(state)
     this.uploads.delete(state.uploadId)
@@ -323,9 +367,24 @@ export class UploadManager {
 
   /** @param {UploadState} state */
   async #removeTemp(state) {
+    await this.#closeHandle(state)
     try {
       await rm(state.tempPath, { force: true })
     } catch { /* 临时文件可能已经不在 */ }
+  }
+
+  /**
+   * 关闭临时文件句柄（幂等）。不关句柄会泄漏 fd，并且 Windows 上 rename 会
+   * 因为「文件被占用」失败。
+   * @param {UploadState} state
+   */
+  async #closeHandle(state) {
+    const handle = state.handle
+    state.handle = null
+    if (!handle) return
+    try {
+      await handle.close()
+    } catch { /* 已经关掉 */ }
   }
 }
 

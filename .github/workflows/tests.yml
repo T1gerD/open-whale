@@ -31,6 +31,15 @@ jobs:
       - name: Check that the in-package protocol copy is in sync
         run: node packages/plugin/scripts/sync-protocol.mjs --check
 
+      # The runner used to trust a printed node:test summary even when the child
+      # exited non-zero. The self-test mounts that exact shape and asserts it is
+      # reported as a failing file, so the gate cannot regress silently.
+      - name: Self-test the test runner
+        run: node scripts/run-tests.mjs --self-test
+
+      - name: Check versions and documentation against the code
+        run: node scripts/check-docs.mjs
+
   mobile-syntax:
     runs-on: ubuntu-latest
     steps:

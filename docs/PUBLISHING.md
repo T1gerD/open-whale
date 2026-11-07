@@ -18,11 +18,19 @@
 ## 1. 发布前门禁（必须全绿才打 tag）
 
 ```bash
-node scripts/run-tests.mjs                 # 51 文件 / 789 项（3.0.0 基线）
+node scripts/run-tests.mjs                 # 52 文件 / 822 项（3.0.0 基线）
+node scripts/run-tests.mjs --self-test     # 运行器自检：摘要 + exit 1 必须判红（改过 run-tests.mjs 必跑）
+node scripts/check-docs.mjs                # 版本 / 产物名 / README 与本文的测试计数一致
 node packages/mobile/scripts/check-syntax.mjs
 node packages/plugin/scripts/sync-protocol.mjs --check
 node scripts/build-plugin-package.mjs --check
+node scripts/build-plugin-package.mjs --npm-dir && node scripts/check-npm-package.mjs release/npm-package
 ```
+
+后两条分别校验插件 tarball 的文件清单，以及 `npm pack` 真正会发出去的文件清单
+（必须含 `src` / `lib` / `webchat` / `cordis.patch.yml`，且不含 `test`）。`check-docs.mjs`
+与 `--self-test` 在 `tests` 工作流的每个矩阵任务里都会跑，`check-npm-package.mjs` 在
+`release` 工作流里无条件跑（与是否配置 `NPM_TOKEN` 无关）。
 
 本机还可以做一次**真实装机验收**（隔离 DSH_HOME，不会动你正在用的 DSH）：
 
@@ -44,11 +52,15 @@ git push origin main
 git push origin v3.0.0
 ```
 
-- `tests` 工作流：三平台（ubuntu / windows / macos）× Node 22/24 跑全部测试与协议副本检查。
+- `tests` 工作流：三平台（ubuntu / windows / macos）× Node 22/24 跑全部测试、协议副本检查、
+  运行器自检与版本/文档一致性检查。
 - `release` 工作流：在 tag 上构建
+  - 先断言「tag == `v${version}`」（tag 推送与手动输入都校验，不一致直接失败），
+    依赖用 `pnpm install --frozen-lockfile` 安装，`expo install` 只做 `--check`、不改依赖树；
   - `dsh-openwhale-3.0.0.tgz` + 固定名 `dsh-openwhale.tgz`（插件，含网页版）
   - `open-whale-3.0.0.apk` + 固定名 `open-whale.apk`（debug keystore 签名的 arm64 包装配包）
   - `SHA256SUMS.txt`，并创建 GitHub Release（release body 取 `CHANGELOG.md`）
+  - 发布前用 `npm pack --dry-run` 校验 npm 包文件清单（`scripts/check-npm-package.mjs`）
 - `ios` 工作流：手动触发或 tag 时构建**未签名模拟器 .app**（真机/TestFlight 需要 Apple 账号走 EAS）。
 
 > 本机没有 JDK / Android SDK，**不要**尝试本地出 APK；CI 是唯一构建通道。

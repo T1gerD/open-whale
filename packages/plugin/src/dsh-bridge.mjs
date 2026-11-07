@@ -117,6 +117,17 @@ export class DshBridge {
     this.now = options.now ?? (() => Date.now())
     /** sessionId → {agent, handle}：一个会话一个 agent，绝不重复创建 */
     this.agents = new Map()
+    /**
+     * 被「接管」的 live agent → 它作用域上的转发者 disposer。
+     *
+     * 本插件 create/resume 的 agent 由 setup 注册转发者（作用域销毁时一起走）；
+     * 但用户在手机会话列表里选中的可能是**桌面上已经在跑**的会话，它的
+     * `setup` 早就跑完了。不补注册的话，这个会话里的审批/结构化提问永远不会
+     * 转发到手机。用 WeakMap 保证同一个 agent 只注册一次，并在 release/dispose
+     * 时解绑（agent 本身归桌面所有，不能替它 dispose）。
+     * @type {WeakMap<any, {offs: Function[], sessionId: string}>}
+     */
+    this.adoptedAgents = new WeakMap()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
     /** `${deviceId}\u0000${callId}` → 进行中的回合 */
@@ -164,6 +175,8 @@ export class DshBridge {
     for (const questionId of [...this.lateQuestions.keys()]) this.#dropLateQuestion(questionId)
     const handlers = [...new Set([...this.agents.values()].map(entry => entry.handle))].filter(Boolean)
     const disposals = handlers.map(handle => handle.dispose().catch(() => {}))
+    // 接管的 agent 归桌面所有：只解绑我们加的转发者，绝不 dispose 它。
+    for (const entry of this.agents.values()) this.#detachAdopted(entry.agent)
     this.agents.clear()
     this.calls.clear()
     this.files.clear()
@@ -239,7 +252,10 @@ export class DshBridge {
     const live = this.ctx.agents.get(id)
     if (live) {
       const entry = this.agents.get(id)
-      this.agents.set(id, { agent: live, handle: entry?.handle ?? null })
+      // 只有「本插件没为这个 agent 跑过 setup」时才需要补注册转发者；
+      // 已在 map 里的 agent 是我们自己 create/resume 的，setup 已经注册过。
+      const adopted = entry?.agent === live ? entry : this.#adoptLiveAgent(id, live)
+      this.agents.set(id, adopted)
       return { ok: true, sessionId: id, ...(await this.#selectedTitle(id)) }
     }
 
@@ -341,6 +357,51 @@ export class DshBridge {
   }
 
   /**
+   * 把一个 agent 的转发者注册到它自己的作用域上（幂等：同一个 agent 只注册一次）。
+   * @param {any} agentCtx
+   * @param {string} sessionId
+   * @returns {Function[]} 解绑函数
+   */
+  #registerForwarders(agentCtx, sessionId) {
+    /** @type {Function[]} */
+    const offs = []
+    if (!agentCtx || typeof agentCtx.on !== 'function') {
+      this.log('bridge: agent 作用域不可用，审批/提问无法转发到手机')
+      return offs
+    }
+    // 结构化提问（`ask_user_question` / 计划审阅）是独立于审批的一条 seam：
+    // autoApproveTools 只影响「允许/拒绝」，不能让提问也被自动放行，否则模型
+    // 会拿到一个空答案。所以这里总是注册转发者。
+    offs.push(agentCtx.on(
+      'user-questions/request',
+      /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
+      (req, next) => this.#onUserQuestion(sessionId, req, next),
+      { prepend: true },
+    ))
+    if (this.config.autoApproveTools) {
+      // Approval is granted by *answering* the approval waterfall, never by a
+      // guard. `ctx.tools.guard()` is deny-only: its declared type is
+      // `(execution) => string | undefined` and `guardReason()` turns any
+      // non-undefined return into the denial reason, so returning
+      // `{kind:'allow'}` from a guard denies every tool call with
+      // "Error: [object Object]" (measured on a real dsh instance).
+      // `{prepend:true}` makes this answerer run before any other and return
+      // its grant without chaining; `'allowed-once'` is the only outcome the
+      // approval service treats as a grant.
+      offs.push(agentCtx.on('approval/request', () => Promise.resolve('allowed-once'), { prepend: true }))
+    } else {
+      // 只对本插件创建/接管的 agent 注册（agentCtx 天然按 agent 隔离）。
+      offs.push(agentCtx.on(
+        'approval/request',
+        /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
+        (req, next) => this.#onApprovalRequest(sessionId, req, next),
+        { prepend: true },
+      ))
+    }
+    return offs
+  }
+
+  /**
    * @param {any} agentCtx
    * @param {any} _agent
    * @param {string} sessionId
@@ -356,35 +417,46 @@ export class DshBridge {
         text: assistantVoiceSection({ assistantName: this.config.assistantName }),
       })
     }
-    // 结构化提问（`ask_user_question` / 计划审阅）是独立于审批的一条 seam：
-    // autoApproveTools 只影响「允许/拒绝」，不能让提问也被自动放行，否则模型
-    // 会拿到一个空答案。所以这里总是注册转发者。
-    agentCtx.on(
-      'user-questions/request',
-      /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
-      (req, next) => this.#onUserQuestion(sessionId, req, next),
-      { prepend: true },
-    )
-    if (this.config.autoApproveTools) {
-      // Approval is granted by *answering* the approval waterfall, never by a
-      // guard. `ctx.tools.guard()` is deny-only: its declared type is
-      // `(execution) => string | undefined` and `guardReason()` turns any
-      // non-undefined return into the denial reason, so returning
-      // `{kind:'allow'}` from a guard denies every tool call with
-      // "Error: [object Object]" (measured on a real dsh instance).
-      // `{prepend:true}` makes this answerer run before any other and return
-      // its grant without chaining; `'allowed-once'` is the only outcome the
-      // approval service treats as a grant.
-      agentCtx.on('approval/request', () => Promise.resolve('allowed-once'), { prepend: true })
-      return
+    this.#registerForwarders(agentCtx, sessionId)
+  }
+
+  /**
+   * 接管一个已经在跑的 live agent：进 map，并在它自己的作用域上补注册转发者。
+   * @param {string} sessionId
+   * @param {any} agent
+   * @returns {{agent: any, handle: any}}
+   */
+  #adoptLiveAgent(sessionId, agent) {
+    const entry = { agent, handle: this.agents.get(sessionId)?.handle ?? null }
+    this.agents.set(sessionId, entry)
+    this.#ensureAdoptedForwarders(sessionId, agent)
+    return entry
+  }
+
+  /**
+   * 给接管的 live agent 注册转发者（同一个 agent 只注册一次）。
+   * @param {string} sessionId
+   * @param {any} agent
+   */
+  #ensureAdoptedForwarders(sessionId, agent) {
+    if (!agent || this.adoptedAgents.has(agent)) return
+    const agentCtx = agent.ctx
+    const offs = this.#registerForwarders(agentCtx, sessionId)
+    if (offs.length === 0) return
+    this.adoptedAgents.set(agent, { offs, sessionId })
+    this.log(`bridge: adopted live agent ${sessionId} and registered approval/question forwarders`)
+  }
+
+  /** 解绑一个被接管 agent 上的转发者（agent 本身不 dispose）。 @param {any} agent */
+  #detachAdopted(agent) {
+    const record = agent ? this.adoptedAgents.get(agent) : undefined
+    if (!record) return
+    this.adoptedAgents.delete(agent)
+    for (const off of record.offs) {
+      try {
+        off?.()
+      } catch { /* 作用域可能已被 DSH 释放 */ }
     }
-    // 只对本插件创建/接管的 agent 注册（agentCtx 天然按 agent 隔离）。
-    agentCtx.on(
-      'approval/request',
-      /** @type {(req: any, next: () => Promise<any>) => Promise<any>} */
-      (req, next) => this.#onApprovalRequest(sessionId, req, next),
-      { prepend: true },
-    )
   }
 
   /**
@@ -835,6 +907,8 @@ export class DshBridge {
     const entry = this.agents.get(sessionId)
     if (!entry) return
     this.agents.delete(sessionId)
+    // 接管的 live agent 归桌面所有：只摘掉我们加的转发者，不 dispose 它。
+    this.#detachAdopted(entry.agent)
     for (const call of [...this.calls.values()]) {
       if (call.sessionId === sessionId) this.#retireCall(call)
     }
@@ -912,7 +986,11 @@ export class DshBridge {
 
     const live = this.ctx.agents.get(sessionId)
     if (live) {
-      const entry = { agent: live, handle: this.agents.get(sessionId)?.handle ?? null }
+      // 会话可能是桌面上早就跑着的 agent：setup 已经跑完，必须在这里补注册
+      // 审批/提问转发者，否则手机永远收不到这个会话的审批卡。
+      const entry = this.agents.get(sessionId)?.agent === live
+        ? this.agents.get(sessionId)
+        : this.#adoptLiveAgent(sessionId, live)
       this.agents.set(sessionId, entry)
       return { sessionId, ...entry }
     }

@@ -264,7 +264,8 @@ export default function ChatScreen() {
           key: 'resend',
           label: sheetMessage.state === 'failed' ? '重新发送' : '再次发送',
           icon: '↻',
-          description: sheetMessage.error ?? '用同一条消息再发一次',
+          // 重新发送会用新的幂等键：电脑端不会把它当成重复消息而直接忽略。
+          description: sheetMessage.error ?? '用新的消息 ID 再发一次',
           onPress: () => void controller.resend(sheetMessage.id),
         })
       } else if ((sheetMessage.files?.length ?? 0) > 0) {
@@ -962,9 +963,18 @@ function MessageRow({
                 ) : (
                   <Text style={styles.failedHint}>这条重发也不会成功：可以复制后稍后再发，或去电脑端检查设置。</Text>
                 )
+              ) : message.exhausted ? (
+                <View style={styles.failedBox}>
+                  <Text style={styles.failedHint}>
+                    自动重试用尽（{message.attempts ?? 0} 次都没有被电脑端确认）。可以手动重新发送一次。
+                  </Text>
+                  <Pressable onPress={() => onRetryMessage(message)} accessibilityRole="button" hitSlop={8}>
+                    <Text style={[styles.inlineAction, { color: theme.colors.accent }]}>重新发送</Text>
+                  </Pressable>
+                </View>
               ) : (
                 <Pressable onPress={() => onRetryMessage(message)} accessibilityRole="button" hitSlop={8}>
-                  <Text style={[styles.inlineAction, { color: theme.colors.accent }]}>重试</Text>
+                  <Text style={[styles.inlineAction, { color: theme.colors.accent }]}>重新发送</Text>
                 </Pressable>
               )}
             </View>

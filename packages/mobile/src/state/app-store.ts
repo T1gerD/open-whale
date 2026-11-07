@@ -73,6 +73,8 @@ import {
   deserializeOutbox,
   DEFAULT_MAX_ATTEMPTS,
   enqueue,
+  exhaustedEntries,
+  expireInflight,
   markFailed as markOutboxFailed,
   markInflight,
   markSent as markOutboxSent,
@@ -80,7 +82,7 @@ import {
   pendingCount,
   releaseInflight,
   resendableEntries,
-  retryEntry,
+  rotateEntryIds,
   type Outbox,
   type OutboxEntry,
   type OutboxFile,
@@ -246,6 +248,8 @@ class ChatController {
   private flushTimer: ReturnType<typeof setTimeout> | undefined
   private cursorTimer: ReturnType<typeof setTimeout> | undefined
   private tabsTimer: ReturnType<typeof setTimeout> | undefined
+  /** 每秒检查「发出去了但一直没 ack」的条目（见 core/outbox.mts 的 expireInflight）。 */
+  private ackTimer: ReturnType<typeof setInterval> | undefined
   private persistedTabs = ''
   /** 上次自动拉会话列表的时间（重连风暴时的节流）。 */
   private lastListRequestAt = 0
@@ -309,10 +313,13 @@ class ChatController {
     this.persistedTransfers = { ...allTransfers(this.tabs) }
     // 重启后“飞行中”的条目必须退回 pending，否则它们永远不会被重发。
     this.outbox = releaseInflight(outbox)
+    // 反复重启/断线也可能把自动重试次数耗光：这些条目要显式标成「用尽」。
+    this.markExhausted()
     await saveOutbox(this.assistantId, this.outbox)
     // 老库（2.3.0）没有 tabs 列：把默认标签立刻落盘，下次启动就是完整的了。
     this.persistedTabs = ''
     this.persistTabs(true)
+    this.ensureAckTicker()
   }
 
   /**
@@ -348,7 +355,36 @@ class ChatController {
     this.uploader?.abortAll('网络已断开，上传中断')
     this.dispatch({ t: 'conn/disconnected', at: Date.now() })
     this.outbox = releaseInflight(this.outbox)
+    this.markExhausted()
     void saveOutbox(this.assistantId, this.outbox)
+    this.ensureAckTicker()
+  }
+
+  /**
+   * 把「自动重发次数已经用尽」的条目标成 failed 并通知 UI。
+   *
+   * 两条路径会走到这里：断线 releaseInflight（每次断线算一次未确认发送）和启动时
+   * 的 releaseInflight。以前这些条目只会被 `resendableEntries` 过滤掉、永远不会再
+   * 发，也不会告诉用户 —— 表现就是「这条消息就那样消失了」。现在它们在气泡上显示
+   * 「重试用尽」，用户可以手动重新发送（换新的 msgId）。
+   */
+  private markExhausted(): void {
+    const due = exhaustedEntries(this.outbox, DEFAULT_MAX_ATTEMPTS).filter(entry => entry.state !== 'failed')
+    if (due.length === 0) return
+    const at = Date.now()
+    for (const entry of due) {
+      const reason = `已连续 ${DEFAULT_MAX_ATTEMPTS} 次发送都没有被电脑端确认，自动重试已用尽`
+      this.outbox = markOutboxFailed(this.outbox, entry.rid, reason, undefined)
+      this.dispatch({
+        t: 'outbox/failed',
+        rid: entry.rid,
+        reason,
+        retryable: true,
+        exhausted: true,
+        attempts: entry.attempts,
+        at,
+      })
+    }
   }
 
   onConnected(): void {
@@ -511,37 +547,37 @@ class ChatController {
     this.pumpOutbox()
   }
 
-  /** 用户在气泡上点“重试”（发送失败的本地消息：同一 rid 重发，不新增气泡）。 */
-  async retry(rid: string): Promise<void> {
-    this.outbox = retryEntry(this.outbox, rid)
-    this.dispatch({ t: 'outbox/retry', rid, at: Date.now() })
-    await saveOutbox(this.assistantId, this.outbox)
-    this.pumpOutbox()
-  }
-
-  /** 长按用户消息「重新发送」：按消息 id 找到 rid 后重发。 */
+  /**
+   * 「重新发送」——必须是**新的 msgId**。
+   *
+   * 电脑端按 `(deviceId, msgId)` 去重，用旧 msgId 重发会被判成重放、只回一个
+   * duplicate ack：按钮看起来动了，电脑端其实什么都没执行。所以：
+   *  * 队列里还有这条消息（没 ack 过）→ 就地换一个新 msgId，气泡复用；
+   *  * 已经确认过 / 不在队列里 → 当作一条新消息再发一次（新 rid + 新 msgId）。
+   *
+   * 自动重发（ack 超时、断线 release）**不走这里**：那些路径沿用原 msgId，
+   * 靠电脑端的幂等表防止「其实已送达、只是回执丢了」的消息被注入两次。
+   */
   async resend(messageId: string): Promise<void> {
     const message = this.chat.messages.find(item => item.id === messageId)
     if (!message || message.kind !== 'user') return
     const rid = message.rid ?? message.msgId
-    if (!rid) return
-    const entry = this.outbox.entries.find(item => item.rid === rid || item.msgId === rid)
+    const entry = rid
+      ? this.outbox.entries.find(item => item.rid === rid || item.msgId === rid)
+      : undefined
     if (entry) {
-      await this.retry(rid)
+      this.outbox = rotateEntryIds(this.outbox, entry.rid, { msgId: randomRequestId('msg'), rid: entry.rid })
+      // 本地气泡按 rid 找回（id = usr_<rid>），于是同一条气泡回到「发送中」。
+      this.dispatch({ t: 'outbox/retry', rid: entry.rid, at: Date.now() })
+      await saveOutbox(this.assistantId, this.outbox)
+      this.ensureAckTicker()
+      this.pumpOutbox()
       return
     }
-    // 线上已经确认过的消息再“重发”：重新入队（电脑端按 msgId 判重，不会重复执行）。
-    this.outbox = enqueue(this.outbox, {
-      rid,
-      msgId: rid,
-      assistantId: this.assistantId,
-      callId: rid,
-      text: message.text,
-      createdAt: Date.now(),
-    })
-    this.dispatch({ t: 'outbox/retry', rid, at: Date.now() })
-    await saveOutbox(this.assistantId, this.outbox)
-    this.pumpOutbox()
+    // 已经 ack 过：再发一次就是一条全新的消息，不能复用旧 msgId。
+    const text = message.text.trim()
+    if (text === '') return
+    await this.send({ text })
   }
 
   /** 长按用户消息「删除」：本地隐藏 + 清掉待发队列里的同一条。 */
@@ -639,9 +675,11 @@ class ChatController {
     if (this.flushTimer) clearTimeout(this.flushTimer)
     if (this.cursorTimer) clearTimeout(this.cursorTimer)
     if (this.tabsTimer) clearTimeout(this.tabsTimer)
+    if (this.ackTimer) clearInterval(this.ackTimer)
     this.flushTimer = undefined
     this.cursorTimer = undefined
     this.tabsTimer = undefined
+    this.ackTimer = undefined
     void this.abortAllSinks('页面已销毁')
     this.uploader?.dispose()
     this.sinks.clear()
@@ -665,6 +703,62 @@ class ChatController {
   /** 统一的重发出口：只在连接可用时发；附件先分块上传再发消息。 */
   private pumpOutbox(): void {
     void this.runPump()
+  }
+
+  /**
+   * ack 超时节拍。
+   *
+   * 只在这些情况下需要它：还有 `inflight`（已发出、等回执）或带 `retryAfter`
+   * 的待重发条目。没有就停掉，避免常驻定时器耗电。
+   */
+  private ensureAckTicker(): void {
+    const needs = this.outbox.entries.some(
+      entry =>
+        entry.state === 'inflight' ||
+        (entry.state === 'pending' && typeof entry.retryAfter === 'number' && entry.retryAfter > Date.now()),
+    )
+    if (needs && !this.ackTimer) {
+      this.ackTimer = setInterval(() => this.checkAckTimeouts(), 1_000)
+    }
+    if (!needs && this.ackTimer) {
+      clearInterval(this.ackTimer)
+      this.ackTimer = undefined
+    }
+  }
+
+  /**
+   * 检查「发出去了但一直没有 chat/ack」的条目。
+   *
+   * 半死连接（TCP 还在、帧已经被丢掉）不会触发 onclose，于是 inflight 会永远留着，
+   * UI 上就是一条永远「发送中…」的消息。这里按 ACK_TIMEOUT_MS 兜底：
+   * 有配额 → 退回 pending 自动重发（同一 msgId，电脑端幂等表会挡住重复注入）；
+   * 没配额 → 标失败并标记「重试用尽」，交给用户手动「重新发送」（换新 msgId）。
+   */
+  private checkAckTimeouts(): void {
+    if (this.disposed) return
+    const now = Date.now()
+    const result = expireInflight(this.outbox, { now, maxAttempts: DEFAULT_MAX_ATTEMPTS })
+    if (result.outbox !== this.outbox) {
+      this.outbox = result.outbox
+      void saveOutbox(this.assistantId, this.outbox)
+      for (const entry of result.exhausted) {
+        this.dispatch({
+          t: 'outbox/failed',
+          rid: entry.rid,
+          reason: entry.error ?? '发送失败',
+          retryable: true,
+          exhausted: true,
+          attempts: entry.attempts,
+          at: now,
+        })
+      }
+      if (result.exhausted.length === 0) this.store.notify()
+    }
+    // 退避到点的条目在这里补一次 pump（ack 超时路径不经过 runPump，否则会一直等着）。
+    if (resendableEntries(this.outbox, { now, maxAttempts: DEFAULT_MAX_ATTEMPTS }).length > 0) {
+      this.pumpOutbox()
+    }
+    this.ensureAckTicker()
   }
 
   private async runPump(): Promise<void> {
@@ -698,14 +792,16 @@ class ChatController {
             }
             const currentLink = this.link
             if (!currentLink || !currentLink.isOnline) return
+            // 用户可能在上传期间点了「重新发送」（换过 msgId）：以队列里最新的幂等键为准。
             const sent = currentLink.sendChat({
               rid: entry.rid,
-              msgId: entry.msgId ?? entry.rid,
+              msgId: latest?.msgId ?? entry.msgId ?? entry.rid,
               text: entry.text,
               files: files.length > 0 ? files : undefined,
             })
             if (!sent) break
             this.outbox = markInflight(this.outbox, entry.rid, Date.now())
+            this.ensureAckTicker()
             progressed = true
           }
           await saveOutbox(this.assistantId, this.outbox)
@@ -857,6 +953,8 @@ class ChatController {
     }
     if (tabsChanged) this.persistTabs()
     this.store.notify()
+    // 消息状态可能刚变成 failed/exhausted：ack 节拍要不要继续跑由队列状态决定。
+    this.ensureAckTicker()
   }
 
   // ---------------------------------------------------------------------------

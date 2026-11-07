@@ -61,6 +61,17 @@ test('lib/protocol.mjs 的常量与真实 protocol 逐项一致', () => {
   }
 })
 
+test('镜像里已有的原始常量都必须与协议同值（不靠手写清单兜底）', () => {
+  const isPrimitive = value => ['number', 'string', 'boolean'].includes(typeof value)
+  for (const [key, value] of Object.entries(real)) {
+    if (!(key in mirror)) continue
+    if (isPrimitive(value)) assert.equal(mirror[key], value, `镜像常量 ${key} 与协议不一致`)
+    if (Array.isArray(value) && value.every(isPrimitive)) {
+      assert.deepEqual(mirror[key], value, `镜像常量 ${key} 与协议不一致`)
+    }
+  }
+})
+
 test('协议版本已跟到冻结的 3.0.0（与 packages/protocol 一致）', () => {
   assert.equal(mirror.PROTOCOL_VERSION, '3.0.0')
   assert.equal(mirror.PROTOCOL_VERSION, real.PROTOCOL_VERSION)

@@ -89,18 +89,33 @@ export class StateStore {
   }
 
   #load() {
+    if (!existsSync(this.file)) return this.#freshState()
+    let text
     try {
-      if (existsSync(this.file)) {
-        const parsed = JSON.parse(readFileSync(this.file, 'utf8'))
-        if (parsed && parsed.version === STATE_VERSION) return parsed
-      }
+      text = readFileSync(this.file, 'utf8')
+    } catch (error) {
+      // 读不出来（权限/占用）：尽力备份后新建，绝不让插件因为状态文件起不来。
+      this.#backupFile('unreadable')
+      return this.#freshState()
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(text)
     } catch (error) {
       // A corrupt state file must not brick the plugin; move it aside so the
       // user keeps the old data for inspection and we start clean.
-      try {
-        renameSync(this.file, `${this.file}.corrupt-${Date.now()}`)
-      } catch { /* best effort */ }
+      this.#backupFile('corrupt')
+      return this.#freshState()
     }
+    if (parsed && typeof parsed === 'object' && parsed.version === STATE_VERSION) return parsed
+    // 版本不符：旧版本的数据可能仍有用（身份、已绑定设备都是安全相关），
+    // 必须先改名留档再新建，不能静默覆盖成空状态。
+    this.#backupFile(`version-${parsed && typeof parsed === 'object' ? String(parsed.version ?? 'unknown') : 'unknown'}`)
+    return this.#freshState()
+  }
+
+  /** @returns {any} A brand new state document (identity is filled in later). */
+  #freshState() {
     return {
       version: STATE_VERSION,
       identity: null,
@@ -108,6 +123,22 @@ export class StateStore {
       pairing: null,
       devices: [],
       preferences: {},
+    }
+  }
+
+  /**
+   * 把现有 state.json 改名留档（`<file>.<reason>-<ts>.bak`），失败只忽略。
+   * @param {string} reason
+   * @returns {string | undefined} the backup path, for tests/diagnostics
+   */
+  #backupFile(reason) {
+    const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, '-')
+    const backup = `${this.file}.${reason}-${stamp}.bak`
+    try {
+      renameSync(this.file, backup)
+      return backup
+    } catch {
+      return undefined
     }
   }
 

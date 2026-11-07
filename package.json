@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node scripts/run-tests.mjs",
+    "test:self": "node scripts/run-tests.mjs --self-test",
     "test:protocol": "node packages/protocol/test/protocol.test.mjs",
     "test:plugin": "node scripts/run-tests.mjs packages/plugin",
     "test:mobile": "node packages/mobile/test/run.mjs",
@@ -13,6 +14,8 @@
     "sync:protocol": "node packages/plugin/scripts/sync-protocol.mjs",
     "build:plugin": "node scripts/build-plugin-package.mjs",
     "build:npm": "node scripts/build-plugin-package.mjs --npm-dir",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check:npm-package": "node scripts/check-npm-package.mjs release/npm-package",
     "verify:plugin-package": "node scripts/build-plugin-package.mjs --check",
     "verify:install": "node scripts/verify-install.mjs"
   },

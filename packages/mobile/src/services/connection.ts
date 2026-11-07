@@ -20,7 +20,15 @@ import { buildApprovalReplyFrame, type ApprovalOutcome } from '../core/approvals
 import type { QuestionReplyFrame } from '../core/questions.mts'
 import { failureReport, onRaceFailed, onRaceWon, planRace, createRetryState, type RetryState } from '../core/connection-plan.mts'
 import { getConnectionPolicy } from '../core/connection-policy.mts'
-import { endpointKind, endpointLadder, missingModeHint, wsUrlFor } from '../core/endpoint.mts'
+import {
+  ENDPOINT_FAILURE_LIMIT,
+  endpointKind,
+  endpointLadder,
+  mergeEndpointCandidates,
+  missingModeHint,
+  normalizeEndpoint,
+  wsUrlFor,
+} from '../core/endpoint.mts'
 import { ALL_CAPABILITIES } from '../core/frames.mts'
 import { buildHelloFrame, handshakeErrorHint, helloSignatureMessage, interpretHelloAck } from '../core/pairing.mts'
 import type { AssistantRecord } from '../core/pairing.mts'
@@ -117,6 +125,14 @@ export class AssistantLink {
   private fatal = false
   private capabilities: string[] = []
   private retryState: RetryState = createRetryState()
+  /**
+   * 地址连续失败计数（endpoint → 次数）。
+   *
+   * 用途只有一个：合并候选时丢掉「长期失效」的地址。隧道域名会变、路由器会换 IP，
+   * 老地址如果永远留在库里，每次重连都要先花几秒撞一遍墙才轮到能用的地址。
+   * 成功一次就清零；当前连接/用户手填的地址不会被丢（见 mergeEndpointCandidates）。
+   */
+  private endpointFailures = new Map<string, number>()
   /**
    * 竞速记账器：'谁先 ack 算赢' / '旧轮次与落选者的迟到 close 一律忽略' /
    * '刚连上就被电脑端踢掉时用抖动退避而不是 1s 死循环'。纯逻辑，见 core/race-state.mts。
@@ -581,17 +597,17 @@ export class AssistantLink {
     if (outcome.sessionId) this.sessionId = outcome.sessionId
     this.cursor = outcome.eventCursor ?? this.cursor
     if (this.endpoint) this.assistant = { ...this.assistant, preferredEndpoint: this.endpoint }
+    if (this.endpoint) this.endpointFailures.delete(this.endpoint)
     if (outcome.endpoints.length > 0) {
       /**
-       * 电脑端通告的地址与本地库取并集：隧道域名可能变了，也可能新增了局域网地址。
-       * 但**当前这个已经握手成功的地址必须留在首位**——否则下一轮重连又被切到
+       * 电脑端通告的地址与本地库合并（去重、上限、保留当前地址、丢掉长期失效地址）。
+       * **当前这个已经握手成功的地址必须留在首位**——否则下一轮重连又被切到
        * 不可达的地址（v2.1.0 的「连上就掉」根因之一）。
        */
-      const connected = this.endpoint
-      const merged = Array.from(
-        new Set([...(connected ? [connected] : []), ...outcome.endpoints, ...this.assistant.endpoints]),
-      )
-      this.assistant = { ...this.assistant, endpoints: merged }
+      this.assistant = {
+        ...this.assistant,
+        endpoints: this.mergeEndpoints(outcome.endpoints),
+      }
     }
     this.setStatus({
       status: 'online',
@@ -682,10 +698,36 @@ export class AssistantLink {
     if (this.stopped || this.winner) return
     const endpoints = this.raceAttempts.map(attempt => attempt.endpoint)
     const firstError = this.raceAttempts.find(attempt => attempt.error)?.error
+    for (const attempt of this.raceAttempts) {
+      if (attempt.error) this.noteEndpointFailure(attempt.endpoint)
+    }
     this.closeRace()
     this.retryState = onRaceFailed(this.retryState, endpoints)
     if (firstError) this.lastError = firstError
     this.nextAttempt()
+  }
+
+  /** 记一次地址失败（连续失败达到阈值的地址会在下一次合并时被丢掉）。 */
+  private noteEndpointFailure(endpoint: unknown): void {
+    const normalized = normalizeEndpoint(endpoint)
+    if (!normalized) return
+    this.endpointFailures.set(normalized, (this.endpointFailures.get(normalized) ?? 0) + 1)
+  }
+
+  /**
+   * 合并候选地址（去重 / 上限 8 / 保留当前连接 / 丢掉长期失效地址 / https 不被降级）。
+   * 纯逻辑在 core/endpoint.mts 里，这里只喂数据。
+   */
+  private mergeEndpoints(discovered: unknown): string[] {
+    const failed = [...this.endpointFailures.entries()]
+      .filter(([endpoint, count]) => count >= ENDPOINT_FAILURE_LIMIT && endpoint !== this.endpoint)
+      .map(([endpoint]) => endpoint)
+    return mergeEndpointCandidates({
+      preferred: this.endpoint,
+      discovered,
+      current: this.assistant.endpoints,
+      failed,
+    })
   }
 
   /** 还有候选没结束就继续等；都失败了才整轮失败。 */

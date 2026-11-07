@@ -233,3 +233,56 @@ test('mime types are guessed so the phone renders the right preview', () => {
 function requireFiles(dir) {
   return readdirSync(dir)
 }
+
+// ---------------------------------------------------------------------------
+// v3.0.0: 并发块串行化 / 文件句柄生命周期
+// ---------------------------------------------------------------------------
+
+test('two concurrent chunks with the same seq write the bytes once', async t => {
+  const { manager, dir } = makeManager()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const bytes = Buffer.from('hello serial', 'utf8')
+  await manager.start({ uploadId: 'up_serial', deviceId: 'dev_a', name: 'a.txt', size: bytes.length })
+  const first = manager.chunk({ uploadId: 'up_serial', deviceId: 'dev_a', seq: 0, dataBase64: bytes.toString('base64') })
+  const second = manager.chunk({ uploadId: 'up_serial', deviceId: 'dev_a', seq: 0, dataBase64: bytes.toString('base64') })
+  const results = await Promise.all([first, second])
+  assert.equal(results.filter(result => result.ok).length, 1, 'only one of the racing frames may win')
+  assert.equal(results.find(result => !result.ok).code, 'out-of-order')
+  assert.equal(manager.uploads.get('up_serial').received, bytes.length, 'received must count the bytes once')
+  const ended = await manager.end({ uploadId: 'up_serial', deviceId: 'dev_a' })
+  assert.equal(ended.ok, true, ended.message)
+  assert.equal(readFileSync(ended.done.path, 'utf8'), 'hello serial')
+  await manager.dispose()
+})
+
+test('the temp file handle is closed on end, cancel and dispose', async t => {
+  const { manager, dir } = makeManager()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const assertClosed = async handle => {
+    await assert.rejects(async () => { await handle.write(Buffer.from('x')) }, undefined, 'the file handle must be closed')
+  }
+
+  // end 之后句柄关闭。
+  await manager.start({ uploadId: 'up_end', deviceId: 'dev_a', name: 'a.txt', size: 1 })
+  const endHandle = manager.uploads.get('up_end').handle
+  assert.ok(endHandle, 'start must open a file handle')
+  await manager.chunk({ uploadId: 'up_end', deviceId: 'dev_a', seq: 0, dataBase64: Buffer.from('x').toString('base64') })
+  const ended = await manager.end({ uploadId: 'up_end', deviceId: 'dev_a' })
+  assert.equal(ended.ok, true, ended.message)
+  assert.equal(manager.uploads.get('up_end').handle, null)
+  await assertClosed(endHandle)
+
+  // cancel 关闭句柄并删除临时文件。
+  await manager.start({ uploadId: 'up_cancel', deviceId: 'dev_a', name: 'b.bin', size: 8 })
+  const cancelHandle = manager.uploads.get('up_cancel').handle
+  await manager.cancel({ uploadId: 'up_cancel', deviceId: 'dev_a' })
+  assert.equal(manager.uploads.size, 1, 'only the completed upload record remains')
+  await assertClosed(cancelHandle)
+
+  // dispose 关闭正在进行的上传句柄，且不留半截临时文件。
+  await manager.start({ uploadId: 'up_dispose', deviceId: 'dev_a', name: 'c.bin', size: 8 })
+  const disposeHandle = manager.uploads.get('up_dispose').handle
+  await manager.dispose()
+  await assertClosed(disposeHandle)
+  assert.deepEqual(requireFiles(dir).filter(name => name.includes('.part')), [], 'no half-finished temp file may be left behind')
+})

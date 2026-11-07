@@ -83,6 +83,12 @@ export interface ChatMessage {
    * 网络断开/超时 = true；电脑端拒绝、文件过大、本地文件读不出来 = false。
    */
   retryable?: boolean
+  /**
+   * 自动重发已经用尽（ack 一直没来，重试次数达到上限）。
+   * UI 要把「重试」换成「重新发送」并说明原因——重试是同一个 msgId 的自动重放，
+   * 而重新发送会换一个新的幂等键，电脑端才会真的再处理一次。
+   */
+  exhausted?: boolean
   /** 助手消息内的小活动行，按到达顺序。 */
   activity?: ActivityItem[]
   /** 已连续消费到的 delta 序号。 */
@@ -364,7 +370,16 @@ export type LocalEvent =
       at: number
     }
   | { t: 'outbox/acked'; rid: string; callId?: string; duplicate?: boolean; cancelled?: boolean; at?: number }
-  | { t: 'outbox/failed'; rid: string; reason: string; retryable?: boolean; at: number }
+  | {
+      t: 'outbox/failed'
+      rid: string
+      reason: string
+      retryable?: boolean
+      exhausted?: boolean
+      /** 已经尝试过的自动重发次数（UI 显示「重试用尽（N 次）」）。 */
+      attempts?: number
+      at: number
+    }
   | { t: 'outbox/retry'; rid: string; at: number }
   | { t: 'conn/disconnected'; at: number; reason?: string }
   | { t: 'conn/connected'; at: number }
@@ -611,7 +626,14 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
       const id = userMessageId(event.rid)
       const messages = state.messages.map(message =>
         message.id === id
-          ? { ...message, state: 'failed' as MessageSendState, error: event.reason, retryable: event.retryable !== false }
+          ? {
+              ...message,
+              state: 'failed' as MessageSendState,
+              error: event.reason,
+              retryable: event.retryable !== false,
+              exhausted: event.exhausted === true ? true : undefined,
+              attempts: typeof event.attempts === 'number' ? event.attempts : message.attempts,
+            }
           : message,
       )
       return { state: { ...state, messages, lastEventAt: at }, effects: none }
@@ -627,6 +649,7 @@ export function reduceChat(state: ChatState, event: ChatEvent, now: number = Dat
               attempts: (message.attempts ?? 0) + 1,
               error: undefined,
               retryable: undefined,
+              exhausted: undefined,
             }
           : message,
       )

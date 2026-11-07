@@ -176,10 +176,39 @@ test('failed sends can be retried and remembered as failed', () => {
   state = run([{ t: 'outbox/failed', rid: 'r1', reason: '手机没有网络' }], state)
   assert.equal(state.messages[0].state, 'failed')
   assert.equal(state.messages[0].error, '手机没有网络')
+  assert.equal(state.messages[0].exhausted, undefined)
   assert.equal(unconfirmedMessages(state).length, 1)
   state = run([{ t: 'outbox/retry', rid: 'r1' }], state)
   assert.equal(state.messages[0].state, 'pending')
   assert.equal(state.messages[0].attempts, 1)
+})
+
+test('an exhausted send says so, and a manual resend clears the flag', () => {
+  let state = run([{ t: 'user/send', rid: 'r1', text: 'hi', at: 1 }])
+  // 自动重试用尽（ack 一直没有来）：UI 要显示「重试用尽」而不是普通的「重试」。
+  state = run(
+    [
+      {
+        t: 'outbox/failed',
+        rid: 'r1',
+        reason: '电脑端一直没有确认（15 秒无响应），自动重试已用尽',
+        retryable: true,
+        exhausted: true,
+        attempts: 8,
+        at: 2,
+      },
+    ],
+    state,
+  )
+  assert.equal(state.messages[0].state, 'failed')
+  assert.equal(state.messages[0].exhausted, true)
+  assert.equal(state.messages[0].attempts, 8)
+  assert.match(state.messages[0].error, /自动重试已用尽/)
+  // 手动「重新发送」：回到发送中，并清掉用尽标记。
+  state = run([{ t: 'outbox/retry', rid: 'r1', at: 3 }], state)
+  assert.equal(state.messages[0].state, 'pending')
+  assert.equal(state.messages[0].exhausted, undefined)
+  assert.equal(state.messages[0].error, undefined)
 })
 
 test('a cancelled request is visible in the timeline', () => {

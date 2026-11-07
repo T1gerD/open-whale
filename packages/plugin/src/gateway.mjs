@@ -26,10 +26,10 @@
 //    web/PWA client under `/openwhale/app`.
 import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { createReadStream } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
-import { basename, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 import {
   ALL_CAPABILITIES,
@@ -37,9 +37,10 @@ import {
   CAPABILITIES,
   CONNECTION_MODE,
   CONNECTION_MODES,
+  DEDUPE_MAX_ENTRIES,
+  DEDUPE_TTL_MS,
   DEFAULT_HEARTBEAT_MS,
   DOWNLOAD_PATH,
-  FILE_CHUNK_BYTES,
   IdempotencyCache,
   MAX_FILE_BYTES,
   MAX_UPLOAD_ATTACHMENTS,
@@ -64,6 +65,8 @@ import {
   timingSafeEqual,
 } from './protocol.mjs'
 import { pairingAvailability, renderPairingQr, renderQrContent } from './pairer.mjs'
+import { renderPageHtml } from './page.mjs'
+import { FileService } from './files.mjs'
 import { MAX_DEVICES } from './state.mjs'
 import { UploadManager, guessMimeType, sanitizeFileName } from './upload.mjs'
 import { WebClientServer, webClientCandidates } from './webchat.mjs'
@@ -119,6 +122,8 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
  *           Log-backed history for `session/state` (degrades to `[]` on failure).
  * @property {(input: {approvalId: string, deviceId?: string, outcome: string}) => boolean} [answerApproval]
  *           Settle a forwarded approval with the phone's answer.
+ * @property {(input: {questionId: string, deviceId?: string, answers: unknown}) => boolean} [answerQuestion]
+ *           Settle a forwarded structured question with the phone's answers.
  * @property {(sessionId: string) => Promise<void>} [releaseSession]
  *           Tear down an agent no device is bound to any more.
  * @property {(listener: (event: object) => void) => () => void} [onEvent]
@@ -272,8 +277,6 @@ export class Gateway {
     this.sessions = new Set()
     /** @type {Map<string, Set<Session>>} deviceId → live sessions (see MAX_SESSIONS_PER_DEVICE) */
     this.byDevice = new Map()
-    /** One-shot download tokens for phone-side file pulls. */
-    this.downloadTokens = new Map()
     /** Rejects a replayed `hello` from an already-bound device. */
     this.nonces = new NonceReplayGuard()
     this.gatewayEvents = new EventEmitter()
@@ -285,12 +288,33 @@ export class Gateway {
 
     /** `(deviceId, msgId)` → already accepted message. Fixes duplicate delivery. */
     this.dedupe = new IdempotencyCache()
+    this.now = options.now ?? (() => Date.now())
+    /**
+     * 幂等表的落盘副本。
+     *
+     * 内存里的 IdempotencyCache 只活一个进程：插件重启后手机 outbox 重试同一
+     * msgId，会被当成新消息再喂给模型一次（用户看到两条一样的回答）。这里把
+     * 已受理的消息镜像到 `<dataDir>/dedupe.json`，启动时加载、变化后去抖落盘、
+     * dispose 时同步 flush。失败只记日志——幂等是体验优化，绝不能拖垮收消息。
+     */
+    this.dedupeFile = this.store?.dir ? join(this.store.dir, 'dedupe.json') : null
+    /** @type {Map<string, {value: any, at: number}>} */
+    this.dedupeRecords = new Map()
+    /** @type {any} */
+    this.dedupeFlushTimer = null
+    this.#loadDedupe()
     /** @type {Map<string, SessionEventLog>} conversationId → durable event log */
     this.eventLogs = new Map()
     /** conversationId → in-flight assistant turn shown by session/state snapshots. */
     this.activeCalls = new Map()
     /** fileId → file the computer offered to the phones (computer → phone send). */
     this.offeredFiles = new Map()
+    /** 文件出站（分片推送 + 一次性下载链接）的 I/O 半层，见 files.mjs。 */
+    this.files = new FileService({
+      bridge: this.bridge,
+      offeredFiles: this.offeredFiles,
+      log: this.log,
+    })
 
     this.uploads = new UploadManager({
       dir: options.uploadDir ?? (() => join(this.cwd(), '.openwhale', 'uploads')),
@@ -708,7 +732,7 @@ export class Gateway {
     }
 
     if (path === '/openwhale/download') {
-      return this.#handleDownload(url, res)
+      return this.files.handleDownload(url, res)
     }
 
     return false
@@ -744,6 +768,8 @@ export class Gateway {
   }
 
   async close() {
+    // 关服前把幂等表同步落盘：dispose 之后不可能再 flush，丢的会是最新那批。
+    this.#flushDedupe()
     for (const session of this.sessions) session.close(1001, 'server shutting down')
     this.sessions.clear()
     this.byDevice.clear()
@@ -759,6 +785,99 @@ export class Gateway {
     }
     this.server = null
     this.secondary = null
+  }
+
+  // ---------------------------------------------------------------------------
+  // Durable idempotency table (v3.0.0)
+  // ---------------------------------------------------------------------------
+
+  /** 启动时从 `<dataDir>/dedupe.json` 恢复未过期的幂等记录（坏文件只忽略）。 */
+  #loadDedupe() {
+    if (!this.dedupeFile) return
+    let parsed
+    try {
+      parsed = JSON.parse(readFileSync(this.dedupeFile, 'utf8'))
+    } catch (error) {
+      // 首次运行没有文件是正常的；有文件但读不出来才是异常，记一条日志即可。
+      if (existsSync(this.dedupeFile)) {
+        this.log(`dedupe: 幂等表不可读，已忽略：${/** @type {Error} */ (error).message}`)
+      }
+      return
+    }
+    const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+    const now = this.now()
+    for (const entry of entries) {
+      if (!entry || typeof entry.key !== 'string' || entry.key === '') continue
+      if (!Number.isFinite(entry.at) || now - entry.at > DEDUPE_TTL_MS) continue
+      const value = entry.value && typeof entry.value === 'object' ? entry.value : undefined
+      if (!value) continue
+      this.dedupeRecords.set(entry.key, { value, at: entry.at })
+    }
+    // 超出容量时保留最新的（Map 的顺序＝写入顺序）。
+    while (this.dedupeRecords.size > DEDUPE_MAX_ENTRIES) {
+      const oldest = this.dedupeRecords.keys().next().value
+      if (oldest === undefined) break
+      this.dedupeRecords.delete(oldest)
+    }
+    for (const [key, record] of this.dedupeRecords) this.dedupe.remember(key, record.value)
+    if (this.dedupeRecords.size > 0) this.log(`dedupe: 从磁盘恢复了 ${this.dedupeRecords.size} 条幂等记录`)
+  }
+
+  /**
+   * 记住一条已受理的消息（内存 + 落盘镜像）。
+   * @param {string} key
+   * @param {any} value
+   */
+  #rememberDedupe(key, value) {
+    this.dedupe.remember(key, value)
+    this.dedupeRecords.set(key, { value, at: this.now() })
+    while (this.dedupeRecords.size > DEDUPE_MAX_ENTRIES) {
+      const oldest = this.dedupeRecords.keys().next().value
+      if (oldest === undefined) break
+      this.dedupeRecords.delete(oldest)
+    }
+    this.#scheduleDedupeFlush()
+  }
+
+  /** 去抖：burst 里的多条消息只写一次盘。 */
+  #scheduleDedupeFlush() {
+    if (!this.dedupeFile || this.dedupeFlushTimer) return
+    this.dedupeFlushTimer = setTimeout(() => {
+      this.dedupeFlushTimer = null
+      this.#flushDedupe()
+    }, 250)
+    this.dedupeFlushTimer.unref?.()
+  }
+
+  /**
+   * 原子写幂等表（tmp + rename）。任何失败只记日志：幂等表是体验优化，
+   * 绝不能因为磁盘只读/配额满而让收消息失败。
+   */
+  #flushDedupe() {
+    if (this.dedupeFlushTimer) {
+      clearTimeout(this.dedupeFlushTimer)
+      this.dedupeFlushTimer = null
+    }
+    if (!this.dedupeFile) return
+    try {
+      const now = this.now()
+      /** @type {Array<{key: string, at: number, value: any}>} */
+      const entries = []
+      for (const [key, record] of this.dedupeRecords) {
+        if (now - record.at > DEDUPE_TTL_MS) {
+          this.dedupeRecords.delete(key)
+          continue
+        }
+        entries.push({ key, at: record.at, value: record.value })
+      }
+      if (entries.length === 0) return
+      mkdirSync(dirname(this.dedupeFile), { recursive: true })
+      const tmp = `${this.dedupeFile}.${process.pid}.tmp`
+      writeFileSync(tmp, `${JSON.stringify({ version: 1, entries })}\n`, { mode: 0o600 })
+      renameSync(tmp, this.dedupeFile)
+    } catch (error) {
+      this.log(`dedupe: 写入幂等表失败（忽略）：${/** @type {Error} */ (error).message}`)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1060,7 +1179,7 @@ export class Gateway {
     // Claim the message, then acknowledge "accepted": the ack no longer waits for
     // the bridge (which may need seconds to resume the DSH conversation), which is
     // what made the phone retry and the assistant answer twice.
-    this.dedupe.remember(key, { callId, msgId })
+    this.#rememberDedupe(key, { callId, msgId })
     session.send({
       t: SERVER_FRAME.CHAT_ACK,
       rid: frame.rid,
@@ -1100,14 +1219,14 @@ export class Gateway {
       // Keep a "failed" marker instead of dropping the claim: a retry gets the
       // duplicate ack it expects (so its outbox clears) AND is delivered again,
       // so one transient DSH error cannot permanently swallow the message.
-      this.dedupe.remember(key, { callId, msgId, failed: true })
+      this.#rememberDedupe(key, { callId, msgId, failed: true })
       const message = /** @type {Error} */ (error).message
       this.log(`chat: 投递失败 rid=${frame.rid} msgId=${msgId} → ${message}`)
       return session.sendError('send-failed', `消息未能送达电脑上的 AI：${message}`)
     }
 
     // A successfully delivered retry is a normal accepted message from now on.
-    if (prior?.failed) this.dedupe.remember(key, { callId, msgId })
+    if (prior?.failed) this.#rememberDedupe(key, { callId, msgId })
     this.log(`chat: 投递成功 rid=${frame.rid} msgId=${msgId}`)
     return undefined
   }
@@ -1463,121 +1582,9 @@ export class Gateway {
   // Frames the assistant produced / files
   // ---------------------------------------------------------------------------
 
-  /** @param {Session} session @param {any} frame */
+  /** 文件分片推送的 I/O 实现已移到 files.mjs。 @param {Session} session @param {any} frame */
   async #handleFileFetch(session, frame) {
-    const fileId = String(frame.fileId ?? '')
-    if (!fileId) return session.sendError('bad-frame', 'file/fetch 缺少 fileId')
-    // Files the assistant produced are registered by the bridge; files the user
-    // explicitly sent from the computer are registered here.
-    const file = (await this.bridge.fileFor?.(fileId)) ?? this.offeredFiles.get(fileId)
-    if (!file) {
-      return session.send({ t: SERVER_FRAME.FILE_ERROR, fileId, code: 'not-found', message: '找不到该文件' })
-    }
-    let size = 0
-    try {
-      size = (await stat(file.path)).size
-    } catch (error) {
-      return session.send({
-        t: SERVER_FRAME.FILE_ERROR,
-        fileId,
-        code: 'unreadable',
-        message: `无法读取文件：${/** @type {Error} */ (error).message}`,
-      })
-    }
-    if (size > MAX_FILE_BYTES) {
-      return session.send({
-        t: SERVER_FRAME.FILE_ERROR,
-        fileId,
-        code: 'too-large',
-        message: `文件过大（${Math.round(size / 1024 / 1024)} MB），上限 ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB`,
-      })
-    }
-
-    session.send({
-      t: SERVER_FRAME.FILE_META,
-      fileId,
-      name: file.name,
-      mime: file.mime,
-      size,
-      // A plain HTTP fallback for clients that cannot or prefer not to reassemble
-      // base64 chunks. The token is single-use and short-lived.
-      downloadPath: `${DOWNLOAD_PATH}?token=${this.#issueDownloadToken(file.path, file.name, file.mime)}`,
-    })
-
-    await this.#streamFileToSession(session, fileId, file.path, size)
-    return undefined
-  }
-
-  /**
-   * Push a file as base64 chunks, aborting if the session drops.
-   * @param {Session} session
-   * @param {string} fileId
-   * @param {string} path
-   * @param {number} size
-   */
-  async #streamFileToSession(session, fileId, path, size) {
-    const stream = createReadStream(path, { highWaterMark: FILE_CHUNK_BYTES })
-    let seq = 0
-    let sent = 0
-    let aborted = false
-    const onClose = () => {
-      aborted = true
-      stream.destroy()
-    }
-    session.connection.once('close', onClose)
-    try {
-      for await (const chunk of stream) {
-        if (aborted || session.connection.closed) {
-          aborted = true
-          break
-        }
-
-        // Respect the socket's write buffer. Pushing a whole large file at a
-        // socket that cannot drain it (a slow phone link, or a host with a smaller
-        // send buffer) queues the remainder in Node's internals, and the transfer
-        // then stalls instead of finishing — observed as a timeout on macOS CI for a
-        // 700 KiB file. Waiting for `drain` bounds memory to one chunk.
-        const frame = JSON.stringify({
-          t: SERVER_FRAME.FILE_CHUNK,
-          fileId,
-          seq,
-          dataBase64: /** @type {Buffer} */ (chunk).toString('base64'),
-        })
-        const accepted = typeof session.connection.sendWithBackpressure === 'function'
-          ? session.connection.sendWithBackpressure(frame)
-          : session.send({
-            t: SERVER_FRAME.FILE_CHUNK,
-            fileId,
-            seq,
-            dataBase64: /** @type {Buffer} */ (chunk).toString('base64'),
-          })
-        if (!accepted) {
-          // Either the connection is gone or the frame buffered. Distinguish them:
-          // a buffered write must be waited for, a dead connection must abort.
-          if (session.connection.closed) {
-            aborted = true
-            break
-          }
-          await session.connection.waitForDrain()
-          if (session.connection.closed || aborted) {
-            aborted = true
-            break
-          }
-        }
-
-        seq += 1
-        sent += /** @type {Buffer} */ (chunk).length
-        // Yield so incoming frames (including the phone's cancel) are never starved.
-        if (seq % 4 === 0) await new Promise(resolve => setImmediate(resolve))
-      }
-    } finally {
-      session.connection.off('close', onClose)
-    }
-    if (aborted) {
-      this.log(`file: transfer of ${fileId} aborted after ${sent}/${size} bytes`)
-      return
-    }
-    session.send({ t: SERVER_FRAME.FILE_END, fileId, seq })
+    return this.files.fetch(session, frame)
   }
 
   /** @param {Session} session @param {any} frame */
@@ -2269,7 +2276,7 @@ export class Gateway {
 
     const name = sanitizeFileName(body.value?.name ?? basename(absolute))
     const mime = guessMimeType(name)
-    const token = this.#issueDownloadToken(absolute, name, mime)
+    const token = this.files.issueDownloadToken(absolute, name, mime)
     const url = `${DOWNLOAD_PATH}?token=${token}`
     const fileId = `f_${createHash('sha256').update(`${absolute}:${info.size}`).digest('hex').slice(0, 16)}`
     this.offeredFiles.set(fileId, { name, path: absolute, mime, size: info.size })
@@ -2377,49 +2384,9 @@ export class Gateway {
     return false
   }
 
-  /** @param {import('node:http').ServerResponse} res */
+  /** 一次性 HTTP 下载的实现已移到 files.mjs。 @param {URL} url @param {import('node:http').ServerResponse} res */
   async #handleDownload(url, res) {
-    const token = url.searchParams.get('token') ?? ''
-    const entry = this.downloadTokens.get(token)
-    if (!entry || entry.expiresAt <= Date.now()) {
-      this.downloadTokens.delete(token)
-      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('下载链接已失效')
-      return true
-    }
-    this.downloadTokens.delete(token)
-    let size
-    try {
-      size = (await stat(entry.path)).size
-    } catch {
-      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
-      res.end('文件不存在')
-      return true
-    }
-    res.writeHead(200, {
-      'content-type': entry.mime ?? 'application/octet-stream',
-      'content-length': String(size),
-      'content-disposition': `attachment; filename="${encodeURIComponent(entry.name)}"`,
-      'cache-control': 'no-store',
-    })
-    createReadStream(entry.path).pipe(res)
-    return true
-  }
-
-  /**
-   * @param {string} path
-   * @param {string} name
-   * @param {string} [mime]
-   */
-  #issueDownloadToken(path, name, mime) {
-    const token = randomBytes(24).toString('base64url')
-    this.downloadTokens.set(token, { path, name, mime, expiresAt: Date.now() + 5 * 60 * 1000 })
-    // Bound the map so a phone looping file/fetch cannot grow memory forever.
-    if (this.downloadTokens.size > 64) {
-      const oldest = [...this.downloadTokens.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt)[0]
-      if (oldest) this.downloadTokens.delete(oldest[0])
-    }
-    return token
+    return this.files.handleDownload(url, res)
   }
 
   /** @param {import('node:http').ServerResponse} res */
@@ -2435,202 +2402,22 @@ export class Gateway {
   // ---------------------------------------------------------------------------
 
   /**
+   * 绑定页 / 插件页 HTML：模板与纯辅助都在 `page.mjs`，这里只收集渲染数据。
    * @param {{payload: any, qr: any, webEntries: Array<{kind: string, label: string, url: string, qr: any}>, webUrl: string | undefined, endpoints: Array<{url: string, kind: string}>, local: boolean}} view
    */
   #pageHtml(view) {
-    const { payload, qr, webEntries, webUrl, endpoints, local } = view
-    const mode = this.#mode()
-    const report = this.connectionModeReport()
-    const boundDevices = this.store.devices ?? []
-    const remaining = Math.max(0, MAX_DEVICES - boundDevices.length)
-    const expiry = payload.ok ? new Date(payload.payload.expires).toLocaleString('zh-CN') : ''
-    const port = this.port || 8787
-
-    const kindLabel = { lan: '局域网', tailscale: 'Tailscale', tunnel: '公网隧道', loopback: '本机回环', unknown: '其它' }
-    const addressList = endpoints.length
-      ? endpoints.map(endpoint => `<li><code>${escapeHtml(endpoint.url)}</code> <span class="tag">${kindLabel[endpoint.kind] ?? endpoint.kind}</span></li>`).join('')
-      : '<li>还没有可用地址（请开启局域网监听，或启动公网隧道）</li>'
-    const detectedSection = ['tailscale', 'lan', 'tunnel', 'loopback']
-      .map(kind => {
-        const urls = report.detected?.[kind] ?? []
-        return `<li><b>${kindLabel[kind]}地址</b>：${urls.length
-          ? urls.map(url => `<code>${escapeHtml(url)}</code>`).join('、')
-          : '<span class="hint">未检测到</span>'}</li>`
-      })
-      .join('')
-
-    const deviceRows = boundDevices.length
-      ? `<ul class="devs">${boundDevices.map(device => `<li><span>${escapeHtml(device.label ?? device.deviceName)}</span>${
-        local
-          ? `<span><button class="btn-sm" data-rename="${escapeHtml(device.id)}">改名</button> <button class="btn-sm" data-unbind="${escapeHtml(device.id)}">移除</button></span>`
-          : `<span class="hint">${this.deviceOnline(device.id) ? '在线' : '离线'}</span>`
-      }</li>`).join('')}</ul>`
-      : '<p class="hint">还没有绑定任何手机。用 Open Whale 应用扫描二维码即可绑定。</p>'
-
-    return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Open Whale ${PLUGIN_VERSION} 绑定</title>
-<style>
- body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;padding:32px;background:#0b1220;color:#e8eefc}
- .wrap{max-width:1000px;margin:0 auto}
- h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:0 0 10px}
- .sub{color:#93a4c8;margin-bottom:24px;font-size:14px}
- .grid{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
- .col{flex:1;min-width:330px;display:flex;flex-direction:column;gap:18px}
- .card{background:#131c31;border:1px solid #24304d;border-radius:14px;padding:18px}
- .qr{background:#fff;padding:12px;border-radius:12px;line-height:0;display:inline-block}
- code{background:#0b1220;padding:2px 6px;border-radius:6px;font-size:13px;word-break:break-all}
- .fp{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:#9ee7c0;word-break:break-all}
- .warn{color:#ffd479} .bad{color:#ff9a9a} .hint{color:#93a4c8;font-size:13px}
- ul{line-height:1.7;font-size:14px;margin:6px 0;padding-left:18px}
- .btn{background:#ef4444;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:14px;cursor:pointer;margin-top:8px}
- .btn:hover{background:#dc2626} .btn[disabled]{background:#475569;cursor:not-allowed}
- .btn-sm{background:#334155;color:#e8eefc;border:0;border-radius:6px;padding:5px 12px;font-size:13px;cursor:pointer}
- .btn-sm:hover{background:#475569} .btn-sm[disabled]{opacity:.5;cursor:not-allowed}
- .devs{list-style:none;padding:0;margin:6px 0 2px}
- .devs li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 10px;background:#0b1220;border:1px solid #24304d;border-radius:8px;margin:6px 0;font-size:14px}
- .tag{display:inline-block;background:#1d4ed8;color:#fff;border-radius:999px;padding:1px 8px;font-size:12px}
- .modes label{display:block;margin:6px 0;font-size:14px}
- .banner{background:#3b1d1d;border:1px solid #7f1d1d;color:#ffb4b4;border-radius:10px;padding:10px 14px;margin-bottom:18px;font-size:13px}
- input[type=text]{background:#0b1220;border:1px solid #24304d;border-radius:8px;color:#e8eefc;padding:8px 10px;font-size:14px;min-width:260px}
- .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
- .ok{color:#9ee7c0}
-</style></head><body><div class="wrap">
-<h1>Open Whale <span class="tag">v${PLUGIN_VERSION}</span></h1>
-<div class="sub">用手机上的 Open Whale 应用扫描二维码绑定；也可以用手机浏览器直接打开网页版（无需安装应用）。</div>
-<p class="hint">本页就是 DSH 设置 → 插件 → Open Whale 的插件页（同一份内容以内嵌 iframe 的方式显示）。</p>
-${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开的。为避免经公网隧道暴露管理能力，配对二维码与所有修改操作（改名/解绑/连接方式/发送文件）都请在本机浏览器操作：<code>http://127.0.0.1:${port}/openwhale</code></div>`}
-<div class="grid">
-  <div class="col" style="flex:0 0 auto">
-    <div class="card">
-      <h2>扫码绑定</h2>
-      ${local
-        ? (qr ? `<div class="qr">${qr.svg}</div>` : `<p class="bad">${escapeHtml(payload.message ?? '当前无法生成二维码')}</p>`)
-        : `<p class="hint">配对二维码包含一次性绑定密钥，只在本机浏览器显示。请在电脑上打开 <code>http://127.0.0.1:${port}/openwhale</code> 扫码。</p>`}
-      ${local && payload.ok ? `<p><b>二维码有效期</b>：${escapeHtml(expiry)}</p><p class="warn">二维码包含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。</p>` : ''}
-    </div>
-    <div class="card">
-      <h2>网页版 / PWA</h2>
-      ${webEntries.length > 0 ? `
-        <p class="hint">扫哪个用哪条线路：同一 Wi-Fi 选「局域网」；外网且手机装了 Tailscale 选「Tailscale」。扫码会自动打开网页版并完成绑定。</p>
-        ${webEntries.map(entry => `
-          <div class="web-entry">
-            <p><b>${escapeHtml(entry.label)}</b> <span class="tag">${escapeHtml(entry.url.replace(/[?#].*$/, ''))}</span></p>
-            <div class="qr">${entry.qr.svg}</div>
-          </div>`).join('')}
-        <p class="hint">${this.webClient.available()
-          ? '鸿蒙 / iOS / 任意浏览器可用；添加到主屏幕即为 PWA。iPhone 第一次访问局域网地址会询问「本地网络」权限，请选「允许」。'
-          : '网页版客户端还没有打包进插件（缺少 webchat 目录）。'}</p>
-      ` : webUrl ? `
-        <p>手机浏览器打开：<br><code>${escapeHtml(webUrl)}</code></p>
-        <p class="hint">二维码只在本机浏览器显示。</p>
-      ` : '<p class="hint">还没有可用地址，无法生成网页版入口。</p>'}
-    </div>
-  </div>
-  <div class="col">
-    <div class="card">
-      <h2>电脑</h2>
-      <p><b>电脑名称</b>：${escapeHtml(this.store.computerName)}</p>
-      <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
-      ${deviceRows}
-      <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.ok ? payload.payload.fp : this.store.fingerprint))}</span></p>
-      <p><b>可用地址</b>：</p><ul>${addressList}</ul>
-    </div>
-    <div class="card">
-      <h2>连接方式</h2>
-      <p class="hint">决定手机优先用哪条线路连这台电脑。自动模式按「上次成功 → Tailscale → 局域网 → 公网隧道」排序；<b>Tailscale 是独立选项，不再算作局域网</b>。</p>
-      <div class="modes">
-        ${['auto', 'lan', 'tailscale', 'tunnel'].map(value => `<label><input type="radio" name="connection-mode" value="${value}" ${mode === value ? 'checked' : ''} ${local ? '' : 'disabled'}> ${connectionModeLabel(value)}</label>`).join('')}
-      </div>
-      ${local ? '<button class="btn-sm" id="save-mode">保存连接方式</button>' : '<p class="hint">连接方式只能在本机浏览器修改。</p>'}
-      <p><b>检测到的地址</b>：</p><ul>${detectedSection}</ul>
-    </div>
-    <div class="card">
-      <h2>发送到手机</h2>
-      ${local ? `
-        <p class="hint">把本会话工作目录里的文件推送到所有已连接的手机（聊天里会出现文件卡片）。</p>
-        <div class="row">
-          <input type="text" id="send-file-path" placeholder="相对路径，例如 report.pdf">
-          <button class="btn-sm" id="send-file-btn">发送</button>
-        </div>
-        <p id="send-file-result" class="hint"></p>
-      ` : '<p class="hint">发送文件需要读取电脑上的路径，只允许在本机浏览器操作。</p>'}
-    </div>
-  </div>
-</div>
-<p class="hint">Open Whale v${PLUGIN_VERSION} · 电脑 ID <code>${escapeHtml(this.store.computerId)}</code> · 状态：${payload.ok ? 'ready' : 'blocked'}</p>
-</div>
-<script>
-  function postJson(url, body) {
-    return fetch(url, { method: 'POST', headers: body ? { 'content-type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined })
-  }
-  document.getElementById('save-mode')?.addEventListener('click', async function (event) {
-    var button = event.currentTarget
-    var selected = document.querySelector('input[name=connection-mode]:checked')
-    if (!selected) return
-    button.disabled = true
-    try {
-      var response = await postJson('/openwhale/connection-mode?mode=' + encodeURIComponent(selected.value))
-      if (!response.ok) throw new Error(await response.text())
-      location.reload()
-    } catch (error) {
-      alert('保存失败：' + error.message)
-      button.disabled = false
-    }
-  })
-  document.getElementById('send-file-btn')?.addEventListener('click', async function (event) {
-    var button = event.currentTarget
-    var input = document.getElementById('send-file-path')
-    var result = document.getElementById('send-file-result')
-    var path = input.value.trim()
-    if (!path) { alert('请填写文件路径'); return }
-    button.disabled = true
-    result.textContent = '正在发送…'
-    try {
-      var response = await postJson('/openwhale/send-file', { path: path })
-      var body = await response.json()
-      if (!response.ok || !body.ok) throw new Error(body.message || body.error || '发送失败')
-      result.innerHTML = '已发送 <b>' + body.name + '</b>（' + body.size + ' 字节）'
-    } catch (error) {
-      result.textContent = '发送失败：' + error.message
-    } finally {
-      button.disabled = false
-    }
-  })
-  document.querySelectorAll('[data-rename]').forEach(function (button) {
-    button.addEventListener('click', async function () {
-      var id = button.getAttribute('data-rename')
-      var name = prompt('给这台设备起个备注名（只用于配对页识别设备，不会出现在对话里）')
-      if (!name) return
-      button.disabled = true
-      try {
-        var response = await fetch('/openwhale/device-rename?deviceId=' + encodeURIComponent(id) + '&label=' + encodeURIComponent(name), { method: 'POST' })
-        if (!response.ok) throw new Error(await response.text())
-        location.reload()
-      } catch (error) {
-        alert('改名失败：' + error.message)
-        button.disabled = false
-      }
+    return renderPageHtml(view, {
+      version: PLUGIN_VERSION,
+      mode: this.#mode(),
+      report: this.connectionModeReport(),
+      devices: this.store.devices ?? [],
+      online: deviceId => this.deviceOnline(deviceId),
+      computerName: this.store.computerName,
+      computerId: this.store.computerId,
+      fingerprint: this.store.fingerprint,
+      webClientAvailable: this.webClient.available(),
+      port: this.port || 8787,
     })
-  })
-  document.querySelectorAll('[data-unbind]').forEach(function (button) {
-    button.addEventListener('click', async function () {
-      var id = button.getAttribute('data-unbind')
-      if (!confirm('确定移除这台设备？移除后它需要重新扫码才能再连。')) return
-      button.disabled = true
-      try {
-        var response = await fetch('/openwhale/unbind?deviceId=' + encodeURIComponent(id), { method: 'POST' })
-        if (!response.ok) throw new Error(await response.text())
-        location.reload()
-      } catch (error) {
-        alert('移除失败：' + error.message)
-        button.disabled = false
-      }
-    })
-  })
-</script>
-</body></html>`
   }
 }
 
@@ -2668,32 +2455,14 @@ export function mergeSnapshotMessages(history, incremental, limit = SESSION_SNAP
   return [...historic, ...extra].slice(-limit)
 }
 
-/** 中文标签：连接方式选择项。 */
-export function connectionModeLabel(mode) {
-  switch (mode) {
-    case CONNECTION_MODE.AUTO: return '自动（Tailscale → 局域网 → 隧道）'
-    case CONNECTION_MODE.LAN: return '只走局域网'
-    case CONNECTION_MODE.TAILSCALE: return '只走 Tailscale（独立于局域网）'
-    case CONNECTION_MODE.TUNNEL: return '只走公网隧道'
-    default: return String(mode)
-  }
-}
+// 绑定页的纯辅助已移到 page.mjs；保持 gateway 的公开导出不变。
+export { connectionModeLabel, escapeHtml, formatFp } from './page.mjs'
 
 /** @param {Gateway} gateway */
 function buildPayload(gateway) {
   const result = gateway.pairingPayload()
   if (!result.ok) throw new Error(result.message)
   return result.payload
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, char => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[char] ?? char)
-}
-
-function formatFp(hex) {
-  return String(hex).toUpperCase().match(/.{1,4}/g)?.slice(0, 16).join(' ') ?? ''
 }
 
 export { buildPayload, pickEndpoint, timingSafeEqual, createHash }

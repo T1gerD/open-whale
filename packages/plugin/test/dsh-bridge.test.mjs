@@ -839,3 +839,126 @@ test('a blocking question that times out is not kept for late answers', async ()
   assert.equal(ask.canAnswerLate, false)
   assert.equal(bridge.answerQuestion({ questionId: ask.questionId, answers: [] }), false)
 })
+
+// ---------------------------------------------------------------------------
+// v3.0.0: live-adopt —— 接管桌面上已经在跑的会话
+// ---------------------------------------------------------------------------
+
+/**
+ * 造一个「已经在跑」的 Desktop agent（带 scoped ctx），用于接管测试。
+ * 结构对齐 DSH 的 Agent：`ctx.on(name, listener, opts)` 返回 disposer。
+ * @param {any} fake
+ * @param {string} sessionId
+ */
+function addLiveAgent(fake, sessionId) {
+  const scopedEvents = []
+  const agent = {
+    id: sessionId,
+    messages: [],
+    cancelled: [],
+    followup(message) {
+      this.messages.push(message)
+    },
+    cancel(cause, opts) {
+      this.cancelled.push({ cause, opts })
+    },
+    ctx: {
+      on(event, listener, opts) {
+        const entry = { event, listener, opts }
+        scopedEvents.push(entry)
+        return () => {
+          const index = scopedEvents.indexOf(entry)
+          if (index >= 0) scopedEvents.splice(index, 1)
+        }
+      },
+    },
+  }
+  fake.live.set(sessionId, agent)
+  return { agent, scopedEvents }
+}
+
+test('adopting a live agent registers working approval and question forwarders', async () => {
+  const { bridge, fake, events } = makeBridge({
+    devicesInSession: () => ['dev_a'],
+    approvalTimeoutMs: 1_000,
+    questionTimeoutMs: 2_000,
+  })
+  const { agent, scopedEvents } = addLiveAgent(fake, 'desk-live')
+  await bridge.send({ deviceId: 'dev_a', sessionId: 'desk-live', callId: 'c1', text: 'hi', attachments: [] })
+
+  const approvalEntry = scopedEvents.find(entry => entry.event === 'approval/request')
+  const questionEntry = scopedEvents.find(entry => entry.event === 'user-questions/request')
+  assert.ok(approvalEntry, 'an adopted agent must get an approval forwarder (setup already ran for it)')
+  assert.ok(questionEntry, 'an adopted agent must get a question forwarder')
+  assert.equal(approvalEntry.opts?.prepend, true)
+  assert.equal(questionEntry.opts?.prepend, true)
+  assert.equal(fake.created.length, 0, 'a live agent must be adopted, never re-created')
+  assert.equal(agent.messages.length, 1, 'the phone message still reaches the adopted agent')
+
+  // 提问转发真的能结算。
+  const questionPromise = questionEntry.listener(questionRequest(), async () => 'delegated')
+  await delay(10)
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.ok(ask, 'the adopted forwarder must emit question-ask')
+  const accepted = bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: [{ id: 'q1', selected: ['A'] }, { id: 'q2', selected: [] }],
+  })
+  assert.equal(accepted, true)
+  assert.deepEqual((await questionPromise).answers[0], { id: 'q1', selected: ['A'] })
+
+  // 审批转发同理：允许只授权这一次调用。
+  const approvalPromise = approvalEntry.listener({ toolName: 'bash' }, async () => 'delegated')
+  await delay(10)
+  const approval = events.filter(event => event.kind === 'approval-ask').at(-1)
+  assert.ok(approval, 'the adopted forwarder must emit approval-ask')
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+})
+
+test('adoption is idempotent: repeated sends and an explicit select register once', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  const { scopedEvents } = addLiveAgent(fake, 'desk-once')
+  await bridge.send({ deviceId: 'dev_a', sessionId: 'desk-once', callId: 'c1', text: 'a', attachments: [] })
+  await bridge.send({ deviceId: 'dev_a', sessionId: 'desk-once', callId: 'c2', text: 'b', attachments: [] })
+  const picked = await bridge.selectSession('desk-once')
+  assert.equal(picked.ok, true)
+  assert.equal(scopedEvents.filter(entry => entry.event === 'approval/request').length, 1)
+  assert.equal(scopedEvents.filter(entry => entry.event === 'user-questions/request').length, 1)
+})
+
+test('selecting a live desktop conversation adopts it and registers forwarders', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  const { agent, scopedEvents } = addLiveAgent(fake, 'desk-select')
+  const picked = await bridge.selectSession('desk-select')
+  assert.equal(picked.ok, true)
+  assert.equal(fake.created.length, 0, 'a live conversation must never be created twice')
+  assert.equal(bridge.agents.get('desk-select').agent, agent)
+  assert.ok(scopedEvents.some(entry => entry.event === 'approval/request'))
+  assert.ok(scopedEvents.some(entry => entry.event === 'user-questions/request'))
+})
+
+test('releasing an adopted session unbinds forwarders without disposing the desktop agent', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  const { agent, scopedEvents } = addLiveAgent(fake, 'desk-release')
+  await bridge.send({ deviceId: 'dev_a', sessionId: 'desk-release', callId: 'c1', text: 'hi', attachments: [] })
+  assert.equal(scopedEvents.length, 2)
+  await bridge.releaseSession('desk-release')
+  assert.equal(scopedEvents.length, 0, 'the adopted listeners must be removed on release')
+  assert.equal(fake.live.get('desk-release'), agent, 'the desktop agent itself is not ours to dispose')
+})
+
+test('disposing the bridge unbinds every adopted agent and keeps the agents alive', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  const first = addLiveAgent(fake, 'desk-one')
+  const second = addLiveAgent(fake, 'desk-two')
+  await bridge.send({ deviceId: 'dev_a', sessionId: 'desk-one', callId: 'c1', text: 'a', attachments: [] })
+  await bridge.send({ deviceId: 'dev_b', sessionId: 'desk-two', callId: 'c2', text: 'b', attachments: [] })
+  assert.equal(first.scopedEvents.length, 2)
+  assert.equal(second.scopedEvents.length, 2)
+  await bridge.dispose()
+  assert.equal(first.scopedEvents.length, 0)
+  assert.equal(second.scopedEvents.length, 0)
+  assert.equal(fake.live.size, 2, 'adopted desktop agents survive a plugin unload')
+})

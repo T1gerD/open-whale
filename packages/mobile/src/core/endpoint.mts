@@ -159,6 +159,97 @@ export function isLoopbackEndpoint(endpoint: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]'
 }
 
+/**
+ * 本地保存的连接候选上限。
+ *
+ * 以前这里是"只增不减"的并集：每次重连都把电脑端通告的地址并进库里，隧道域名每换
+ * 一次就多一条死地址，几个月后一次重连要先试十几个必然失败的地址才轮到能用的。
+ * 8 条足够覆盖「局域网 + Tailscale + 隧道 + 手动地址 + 历史地址」。
+ */
+export const ENDPOINT_POOL_LIMIT = 8
+
+/** 连续失败多少次就认为这个地址「长期失效」（手动地址/当前地址不会被丢掉）。 */
+export const ENDPOINT_FAILURE_LIMIT = 3
+
+export interface MergeEndpointsInput {
+  /** 库里已经保存的候选（旧顺序）。 */
+  current?: unknown
+  /** 电脑端这次 hello/ack 通告的地址。 */
+  discovered?: unknown
+  /** 上次成功/当前连接的地址：永远保留并排在最前。 */
+  preferred?: unknown
+  /** 连续失败达到阈值的地址（长期失效，优先丢掉）。 */
+  failed?: unknown
+}
+
+/**
+ * 合并「电脑端通告的地址」与「本地保存的地址」。
+ *
+ * 规则（都是踩过的坑）：
+ *  1. 同一地址只留一条（规范化后比较）；
+ *  2. **同一主机同时有 http 与 https 时保留 https**——隧道是 https/wss，
+ *     不能因为本地存过一条 http 变体就把它降级成明文；
+ *  3. `preferred`（当前连接）永远在第一位且永不丢弃，否则重连又被切到死地址；
+ *  4. `failed` 里的地址（连续失败 ≥ 阈值）丢弃，除非它就是 preferred；
+ *  5. 截断到 `limit`（默认 8），保证重连不会先试一串必然失败的地址。
+ */
+export function mergeEndpointCandidates(
+  input: MergeEndpointsInput,
+  options: { limit?: number; failed?: unknown } = {},
+): string[] {
+  const limit = Number.isFinite(options.limit) && (options.limit as number) > 0
+    ? Math.floor(options.limit as number)
+    : ENDPOINT_POOL_LIMIT
+  const preferred = normalizeEndpoint(input.preferred)
+  const discovered = normalizeEndpoints(input.discovered)
+  const current = normalizeEndpoints(input.current)
+  const failed = new Set(normalizeEndpoints(input.failed ?? options.failed))
+
+  // 先按"身份"（主机+端口+路径）聚合，保证 https 优先于 http 的同主机变体。
+  const byIdentity = new Map<string, string>()
+  const order: string[] = []
+  const push = (url: string | undefined): void => {
+    if (!url) return
+    const parsed = parseEndpoint(url)
+    if (!parsed) return
+    if (failed.has(url) && url !== preferred) return
+    const identity = `${parsed.host.toLowerCase()}${parsed.port ? `:${parsed.port}` : ''}${parsed.path}`
+    const existing = byIdentity.get(identity)
+    if (!existing) {
+      byIdentity.set(identity, url)
+      order.push(identity)
+      return
+    }
+    // 同一主机：preferred（刚连上的那条）优先，其次安全协议优先。
+    // 只把 http 换成 https，绝不反向降级——隧道是 https/wss，降级等于把明文
+    // 塞进本来加密的通道，而且大概率直接连不上。
+    if (existing === preferred) return
+    if (parsed.isSecure && !(parseEndpoint(existing)?.isSecure ?? false)) {
+      byIdentity.set(identity, url)
+    }
+  }
+
+  push(preferred)
+  for (const url of discovered) push(url)
+  for (const url of current) push(url)
+
+  const merged: string[] = []
+  const seen = new Set<string>()
+  for (const identity of order) {
+    const url = byIdentity.get(identity)
+    if (!url || seen.has(url)) continue
+    seen.add(url)
+    merged.push(url)
+    if (merged.length >= limit) break
+  }
+  // preferred 必须留下来（即使 limit 被填满、或它被聚合逻辑顶掉）。
+  if (preferred && !merged.includes(preferred)) {
+    merged.pop()
+    merged.unshift(preferred)
+  }
+  return merged
+}
+
 // ---------------------------------------------------------------------------
 // 网络类型（委托协议）
 // ---------------------------------------------------------------------------
