@@ -174,8 +174,11 @@ export const SESSION_WATCH_LIMIT = 8
 /** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
 export const APPROVAL_TIMEOUT_MS = 60_000
 
-/** 电脑端等手机回答结构化提问的时长，镜像 `QUESTION_TIMEOUT_MS`。 */
+/** 电脑端等手机回答阻塞式提问（ask()）的时长，镜像 `QUESTION_TIMEOUT_MS`。 */
 export const QUESTION_TIMEOUT_MS = 90_000
+
+/** askTimed() 的提问用更短的窗口（必须小于调用方超时），镜像 `QUESTION_TIMED_TIMEOUT_MS`。 */
+export const QUESTION_TIMED_TIMEOUT_MS = 30_000
 
 /** 超时后电脑端仍接受补答的窗口，镜像 `QUESTION_LATE_WINDOW_MS`。 */
 export const QUESTION_LATE_WINDOW_MS = 5 * 60_000

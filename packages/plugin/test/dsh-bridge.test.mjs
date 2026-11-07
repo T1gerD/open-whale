@@ -807,6 +807,28 @@ test('a timed-out question still accepts a late answer through userQuestions.ans
   assert.equal(late.source, 'phone-late')
 })
 
+test('an askTimed question uses the shorter forwarding window', async () => {
+  const { bridge, fake, events } = makeBridge({
+    devicesInSession: () => ['dev_a'],
+    questionTimeoutMs: 5_000,
+    questionTimedTimeoutMs: 20,
+    questionLateWindowMs: 1_000,
+  })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const startedAt = Date.now()
+  const result = await handler.listener(
+    questionRequest({ wait: { callId: 'call-9', timed: true } }),
+    async () => 'delegated',
+  )
+  const elapsed = Date.now() - startedAt
+  assert.equal(result, 'delegated')
+  assert.ok(elapsed < 2_000, `the timed window must be short, took ${elapsed}ms`)
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.equal(ask.canAnswerLate, true)
+  assert.ok(ask.expiresAt - Date.now() < 5_000, 'the phone must not be told it has the long blocking window')
+})
+
 test('a blocking question that times out is not kept for late answers', async () => {
   const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 10 })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })

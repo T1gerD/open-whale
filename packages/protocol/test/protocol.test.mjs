@@ -20,6 +20,7 @@ import {
   QUESTION_MAX_ITEMS,
   QUESTION_MAX_OPTIONS,
   QUESTION_MAX_TEXT,
+  QUESTION_TIMED_TIMEOUT_MS,
   QUESTION_TIMEOUT_MS,
   normalizeQuestionAnswers,
   SessionEventLog,
@@ -444,6 +445,12 @@ test('question limits keep one frame bounded', () => {
   assert.ok(QUESTION_MAX_ITEMS > 0 && QUESTION_MAX_ITEMS <= 20)
   assert.ok(QUESTION_MAX_OPTIONS > 0 && QUESTION_MAX_OPTIONS <= 50)
   assert.ok(QUESTION_MAX_TEXT > 100)
+})
+
+test('the askTimed window is shorter than the blocking question window', () => {
+  assert.ok(QUESTION_TIMED_TIMEOUT_MS >= 5_000)
+  assert.ok(QUESTION_TIMED_TIMEOUT_MS < QUESTION_TIMEOUT_MS)
+  assert.ok(QUESTION_LATE_WINDOW_MS > QUESTION_TIMEOUT_MS)
 })
 
 test('an answer batch must name every question exactly once', () => {

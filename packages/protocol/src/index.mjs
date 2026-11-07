@@ -828,11 +828,20 @@ export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'
 export const SESSION_WATCH_LIMIT = 8
 
 /**
- * How long a forwarded structured question waits for the phone before the computer
- * hands it back to its own UI. Slightly longer than an approval: a question may
+ * How long a forwarded blocking question (`ask()`) waits for the phone before the
+ * computer hands it back to its own UI. Longer than an approval: a question may
  * carry several items, options and a custom text box, so tapping takes longer.
  */
 export const QUESTION_TIMEOUT_MS = 90_000
+
+/**
+ * The same wait for an `askTimed()` question. It must stay shorter than the
+ * caller's own timeout: DSH releases the model when that deadline passes, so a
+ * longer phone window would leave the desktop with a question whose deadline has
+ * already gone by. Timed questions stay answerable afterwards anyway
+ * (`QUESTION_LATE_WINDOW_MS`), so cutting the foreground wait loses nothing.
+ */
+export const QUESTION_TIMED_TIMEOUT_MS = 30_000
 
 /**
  * After the phone-side wait expires, the computer still accepts an answer for this

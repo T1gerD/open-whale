@@ -224,8 +224,11 @@ export const SESSION_LIST_LIMIT = 200
  */
 export const APPROVAL_TIMEOUT_MS = 60_000
 
-/** 电脑端等手机回答结构化提问的时长（比审批略长：多题、多选项、要打字）。 */
+/** 电脑端等手机回答阻塞式提问（ask()）的时长（比审批略长：多题、多选项、要打字）。 */
 export const QUESTION_TIMEOUT_MS = 90_000
+
+/** askTimed() 的提问用更短的窗口（必须小于调用方超时），否则桌面拿到的是过期等待。 */
+export const QUESTION_TIMED_TIMEOUT_MS = 30_000
 
 /** 超时后电脑端仍接受补答的窗口（DSH 的 askTimed / continued question）。 */
 export const QUESTION_LATE_WINDOW_MS = 5 * 60_000

@@ -29,6 +29,7 @@ import {
   QUESTION_MAX_ITEMS,
   QUESTION_MAX_OPTIONS,
   QUESTION_MAX_TEXT,
+  QUESTION_TIMED_TIMEOUT_MS,
   QUESTION_TIMEOUT_MS,
   SESSION_LIST_LIMIT,
   SESSION_SNAPSHOT_LIMIT,
@@ -101,11 +102,15 @@ export class DshBridge {
     this.approvalTimeoutMs = Number.isFinite(options.approvalTimeoutMs)
       ? Math.max(0, Number(options.approvalTimeoutMs))
       : APPROVAL_TIMEOUT_MS
-    // 结构化提问（ask_user_question / 计划审阅）的转发窗口：比审批长一点，
-    // 因为一张卡里可能有多个问题、选项和自定义输入。
+    // 结构化提问（ask_user_question / 计划审阅）的转发窗口。阻塞式 ask() 可以等久一点
+    // （一张卡里可能有多题、选项和自定义输入）；askTimed() 必须比调用方自己的超时短，
+    // 否则 DSH 已经把模型放行了，桌面拿到的却是一个已经过期的等待。
     this.questionTimeoutMs = Number.isFinite(options.questionTimeoutMs)
       ? Math.max(0, Number(options.questionTimeoutMs))
       : QUESTION_TIMEOUT_MS
+    this.questionTimedTimeoutMs = Number.isFinite(options.questionTimedTimeoutMs)
+      ? Math.max(0, Number(options.questionTimedTimeoutMs))
+      : QUESTION_TIMED_TIMEOUT_MS
     this.questionLateWindowMs = Number.isFinite(options.questionLateWindowMs)
       ? Math.max(0, Number(options.questionLateWindowMs))
       : QUESTION_LATE_WINDOW_MS
@@ -492,16 +497,20 @@ export class DshBridge {
     if (items.length === 0) return next()
 
     const questionId = randomUUID()
-    const expiresAt = this.now() + this.questionTimeoutMs
+    // askTimed() 的调用方自带超时：我们必须更早把问题交回桌面，否则桌面拿到的是
+    // 一个已经过期的等待（模型那时已经被放行）。阻塞式 ask() 没有这个约束。
+    const timed = request?.wait?.timed === true
+    const timeoutMs = timed ? this.questionTimedTimeoutMs : this.questionTimeoutMs
+    const expiresAt = this.now() + timeoutMs
     const callId = typeof request?.wait?.callId === 'string' ? request.wait.callId : undefined
     const agent = request?.agent
-    const canAnswerLate = Boolean(callId && agent && request?.wait?.timed)
+    const canAnswerLate = Boolean(callId && agent && timed)
     const outcomePromise = new Promise(resolve => {
       /** @type {any} */
       const entry = { resolve, sessionId, items, deviceIds: new Set(devices), timer: null, signal, onAbort: null }
       this.questions.set(questionId, entry)
-      if (this.questionTimeoutMs > 0) {
-        entry.timer = setTimeout(() => this.#settleQuestion(questionId, 'timeout'), this.questionTimeoutMs)
+      if (timeoutMs > 0) {
+        entry.timer = setTimeout(() => this.#settleQuestion(questionId, 'timeout'), timeoutMs)
         entry.timer.unref?.()
       }
       if (signal && typeof signal.addEventListener === 'function') {

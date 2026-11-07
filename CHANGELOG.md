@@ -11,7 +11,9 @@
 - **手机 / 网页版回答 DSH 的提问**（`ask_user_question`、计划审阅）：电脑端在 agent 的
   `user-questions/request` 瀑布里注册转发者，把一批问题（含选项、多选、详情、`plan-review`
   意图）转成 `question/ask` 推给在线手机；手机上是「选选项 + 其他文本」的表单，一次整批提交。
-  - 90 秒没人答就交回桌面（`QUESTION_TIMEOUT_MS`）；`askTimed()` 的提问在超时后仍接受补答
+  - 阻塞式提问 90 秒没人答就交回桌面（`QUESTION_TIMEOUT_MS`）；`askTimed()` 的提问只用 **30 秒**
+    （`QUESTION_TIMED_TIMEOUT_MS`，必须早于调用方自己的超时，否则桌面拿到的是过期等待），
+    超时后仍接受补答
     （电脑端保留 5 分钟 `QUESTION_LATE_WINDOW_MS`，手机晚到的答案用
     `ctx.userQuestions.answer()` steer 进 agent）。
   - 答案按 DSH 规则校验：每个问题恰好一条、只能选电脑端给过的选项；未答的显式按「跳过」提交；

@@ -29,7 +29,8 @@ agentCtx.on('user-questions/request', handler, { prepend: true })
 | S→C | `question/ask` | `{ sessionId, questionId, items: QuestionItem[], callId?, expiresAt, canAnswerLate? }` |
 | S→C | `question/resolved` | `{ sessionId, questionId, outcome: 'answered'\|'timeout'\|'cancelled', source? }` |
 
-能力位：`questions-v1`。常量：`QUESTION_TIMEOUT_MS = 90_000`、
+能力位：`questions-v1`。常量：`QUESTION_TIMEOUT_MS = 90_000`（阻塞式 `ask()`）、
+`QUESTION_TIMED_TIMEOUT_MS = 30_000`（`askTimed()` 必须早于调用方超时）、
 `QUESTION_LATE_WINDOW_MS = 5 * 60_000`、`QUESTION_MAX_ITEMS = 10`、
 `QUESTION_MAX_OPTIONS = 20`、`QUESTION_MAX_TEXT = 2000`；
 纯函数 `normalizeQuestionAnswers(questions, value)` 负责「每个问题恰好一条 + 选项必须合法」。
@@ -44,7 +45,8 @@ agentCtx.on('user-questions/request', handler, { prepend: true })
 - 没有在线手机 / 请求被中止 → `next()`（交回桌面 UI）。
 - 有手机 → 发 `question/ask`，等 `question/reply`：
   - 收到合法批次 → 返回 `{answers}`；
-  - 超时（`QUESTION_TIMEOUT_MS`）→ 记入「迟到可答」表（保留 `QUESTION_LATE_WINDOW_MS`），
+  - 超时（`ask()` 用 `QUESTION_TIMEOUT_MS`；`wait.timed` 用 `QUESTION_TIMED_TIMEOUT_MS`）
+    → 记入「迟到可答」表（保留 `QUESTION_LATE_WINDOW_MS`），
     发 `question/resolved {outcome:'timeout'}`，并 `next()` 交回桌面；
   - 超时后手机才回：如果 `wait.callId` 存在且 agent 仍存活，调用
     `ctx.userQuestions.answer(agent, callId, answer)` 把答案 steer 进去，并广播
