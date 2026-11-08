@@ -167,6 +167,16 @@ async function buildConfigSchema() {
 export const Config = await buildConfigSchema()
 
 /**
+ * 同一进程内 DSH 可能重复挂载插件（每次 web boot / 设置保存都会重新 apply）。
+ * 旧实例如果没有被 dispose，会继续占着 8787，新实例绑定失败；手机上连到的却是
+ * 已经 dispose 的旧上下文（表现为 `cannot get required service "agents" in
+ * inactive context`，会话列表/历史全失败）。这里用模块级变量兜底：新实例启动前
+ * 先把上一个实例关干净。
+ * @type {null | (() => Promise<void>)}
+ */
+let currentCleanup = null
+
+/**
  * Patch the injected config with user-editable volatile fields.
  *
  * Fields carrying `.volatile()` become live-editable from the DSH settings page
@@ -210,6 +220,17 @@ export async function apply(ctx, config) {
     const text = 'Open Whale: 已禁用（enabled=false）'
     if (ctx.logger?.info) ctx.logger.info(text)
     return
+  }
+
+  // 先收掉同一进程里的上一个实例（端口、监听器、agent 转发者都在它身上）。
+  if (currentCleanup) {
+    const previous = currentCleanup
+    currentCleanup = null
+    try {
+      await previous()
+    } catch (error) {
+      if (ctx.logger?.warn) ctx.logger.warn(`Open Whale: 关闭上一个实例失败：${/** @type {Error} */ (error).message}`)
+    }
   }
 
   const dataDir = await resolveDataDir(ctx)
@@ -388,12 +409,36 @@ export async function apply(ctx, config) {
     tunnel = await startTunnel({ ctx, settings, gateway, log, onUrl: url => { tunnelUrls = url ? [url] : [] } })
   }
 
-  ctx.on('dispose', async () => {
+  /**
+   * 幂等清理：先关网关（释放 8787 与所有连接），再拆桥和隧道。
+   * 任何一步失败都不能留下监听器——旧实例如若继续占着端口，下一个实例会连不上。
+   */
+  let disposed = false
+  const cleanup = async () => {
+    if (disposed) return
+    disposed = true
     log('正在关闭…')
-    await bridge.dispose()
-    if (tunnel) await tunnel.stop?.().catch(() => {})
-    await gateway.close()
-  })
+    try {
+      await gateway.close()
+    } catch (error) {
+      log(`关闭网关失败：${/** @type {Error} */ (error).message}`)
+    }
+    try {
+      await bridge.dispose()
+    } catch (error) {
+      log(`关闭桥失败：${/** @type {Error} */ (error).message}`)
+    }
+    try {
+      if (tunnel) await tunnel.stop?.()
+    } catch (error) {
+      log(`关闭隧道失败：${/** @type {Error} */ (error).message}`)
+    }
+    if (currentCleanup === cleanup) currentCleanup = null
+  }
+  currentCleanup = cleanup
+  // ctx.effect 是 cordis 的官方清理方式；ctx.on('dispose') 作为兜底（某些宿主不发 effect 清理）。
+  if (typeof ctx.effect === 'function') ctx.effect(() => () => { void cleanup() }, 'openwhale: dispose')
+  ctx.on('dispose', () => { void cleanup() })
 
   log(`就绪（电脑 ID ${store.computerId}，已绑定：${store.isPaired ? '是' : '否'}）`)
 }

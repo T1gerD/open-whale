@@ -183,6 +183,7 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
     <div class="choice-row">${modeButtons}</div>
     <p class="hint" id="mode-note"></p>
     <button class="back" id="back1">← 上一步</button>
+    <button class="back" id="redetect">重新检测线路</button>
   </div>
 </section>
 
@@ -274,6 +275,7 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
     })
   })
   document.getElementById('back1')?.addEventListener('click', function () { show(1) })
+  document.getElementById('redetect')?.addEventListener('click', function () { location.reload() })
   document.getElementById('back2')?.addEventListener('click', function () { show(2) })
   document.getElementById('send-file-btn')?.addEventListener('click', async function (event) {
     var button = event.currentTarget
