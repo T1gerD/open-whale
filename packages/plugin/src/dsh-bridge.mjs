@@ -1509,6 +1509,42 @@ export function extractAssistantText(data) {
 }
 
 /** Text blocks of a user message's `content` array. */
+/**
+ * DSH 会把「runtime context」「skill catalog 变更」这类**内部注入**也写成
+ * `user/message` 事件（role=user，但 `source.kind` 是 runtime-context /
+ * system-prompt / skill-catalog 等）。它们如果原样进手机，就会变成一排蓝色
+ * 的用户气泡——真机反馈「我这边出现了不是我发的消息」。
+ *
+ * 只放行真正由用户/客户端产生的消息；没有 source 的旧数据放行（兼容）。
+ * 文本前缀检查是兜底：万一日志里没有 source 元数据。
+ * @param {any} data
+ * @returns {boolean}
+ */
+export function isInjectedUserMessage(data) {
+  const kind = typeof data?.source?.kind === 'string' ? data.source.kind : ''
+  if (kind !== '' && INJECTED_USER_SOURCES.has(kind)) return true
+  if (typeof data?.role === 'string' && data.role !== 'user') return true
+  const text = extractUserText(data)
+  return /^<system-reminder>/i.test(text) || /^Current runtime context[.:]/i.test(text)
+}
+
+/** 这些 source.kind 是 harness 内部注入，不能当成用户消息展示。 */
+const INJECTED_USER_SOURCES = new Set([
+  'runtime-context',
+  'system-prompt',
+  'system',
+  'system-reminder',
+  'skill-catalog',
+  'tool-registry',
+  'agent-instructions',
+  'hook',
+  'maintenance',
+  'context',
+  'context-summary',
+  'session-summary',
+  'developer',
+])
+
 function extractUserText(data) {
   const blocks = data?.content
   if (!Array.isArray(blocks)) return typeof data?.text === 'string' ? data.text : ''
@@ -1531,6 +1567,8 @@ export function historyMessageOf(event) {
   let kind
   let text
   if (type === 'user/message') {
+    // 内部注入（runtime context / skill catalog 等）不是用户消息，绝不能变成蓝色气泡。
+    if (isInjectedUserMessage(event?.data)) return undefined
     kind = 'user'
     text = extractUserText(event?.data)
   } else if (type === 'assistant/message') {

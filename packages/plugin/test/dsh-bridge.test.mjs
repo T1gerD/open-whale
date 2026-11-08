@@ -6,6 +6,8 @@ import {
   DshBridge,
   describeFailure,
   extractAssistantText,
+  historyMessageOf,
+  isInjectedUserMessage,
   summarizeToolCall,
 } from '../src/dsh-bridge.mjs'
 import { VOICE_SECTION_NAME, assistantVoiceSection } from '../src/voice.mjs'
@@ -962,3 +964,37 @@ test('disposing the bridge unbinds every adopted agent and keeps the agents aliv
   assert.equal(second.scopedEvents.length, 0)
   assert.equal(fake.live.size, 2, 'adopted desktop agents survive a plugin unload')
 })
+
+test('harness-injected user messages never become blue bubbles', () => {
+  // runtime context / skill catalog 都是 DSH 内部注入的 user/message，必须过滤掉。
+  const injected = historyMessageOf({
+    type: 'user/message',
+    seq: 7,
+    time: Date.now(),
+    data: {
+      id: 'm1',
+      role: 'user',
+      source: { kind: 'runtime-context' },
+      content: [{ type: 'text', text: 'Current runtime context. This snapshot supersedes…' }],
+    },
+  })
+  assert.equal(injected, undefined)
+  const reminder = historyMessageOf({
+    type: 'user/message',
+    seq: 8,
+    time: Date.now(),
+    data: { role: 'user', content: [{ type: 'text', text: '<system-reminder>changed</system-reminder>' }] },
+  })
+  assert.equal(reminder, undefined, '无 source 元数据时按文本前缀兜底')
+  // 真正的用户消息照常映射。
+  const real = historyMessageOf({
+    type: 'user/message',
+    seq: 9,
+    time: Date.now(),
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '你好' }] },
+  })
+  assert.ok(real)
+  assert.equal(real.kind, 'user')
+  assert.equal(real.text, '你好')
+})
+
