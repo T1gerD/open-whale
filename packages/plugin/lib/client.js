@@ -61,6 +61,16 @@ window.__ModuleLoader__.load({
           boxSizing: 'border-box',
         },
         head: { display: 'flex', alignItems: 'center', gap: '12px' },
+        openLink: {
+          flex: '0 0 auto',
+          fontSize: '13px',
+          fontWeight: 600,
+          color: ACCENT,
+          textDecoration: 'none',
+          padding: '4px 8px',
+          borderRadius: '6px',
+          background: ACCENT_SOFT,
+        },
         avatar: {
           width: '40px',
           height: '40px',
@@ -162,12 +172,45 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 设置区块内容：直接内嵌与浏览器相同的绑定向导页（宿主 `/openwhale`）。
+       * 设置区块：内嵌与浏览器相同的绑定向导，并在标题行放一个「在浏览器中打开」入口。
        *
        * 向导本身是服务端渲染的三步页面（App/网页版 → 局域网/Tailscale/隧道 → 扫码），
-       * 这里只负责给它一个稳定的容器；不再重复实现二维码/设备列表，避免两套 UI 漂移。
+       * 这里只负责容器；入口用绝对 loopback 地址，桌面壳的 setWindowOpenHandler
+       * 只对 http(s) 调用系统浏览器（相对地址会被 dsh-app 协议吞掉）。
        */
       function OpenWhaleSection() {
+        var urlHook = useState({ url: '', mode: '' })
+        var state = urlHook[0]
+        var setState = urlHook[1]
+
+        useEffect(function () {
+          var alive = true
+          try {
+            fetch(INFO_PATH, { headers: { accept: 'application/json' } })
+              .then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status)
+                return response.json()
+              })
+              .then(function (info) {
+                if (!alive) return
+                var endpoints = info && Array.isArray(info.endpoints) ? info.endpoints : []
+                var loopback = endpoints.filter(function (item) { return item && item.kind === 'loopback' && typeof item.url === 'string' })[0]
+                var lan = endpoints.filter(function (item) { return item && item.kind === 'lan' && typeof item.url === 'string' })[0]
+                var base = (loopback && loopback.url) || (lan && lan.url) || ''
+                setState({
+                  url: base ? String(base).replace(/\/$/, '') + PAIRING_PATH : 'http://127.0.0.1:8787' + PAIRING_PATH,
+                  mode: info && info.connectionMode ? String(info.connectionMode) : '',
+                })
+              })
+              .catch(function () {
+                if (alive) setState({ url: 'http://127.0.0.1:8787' + PAIRING_PATH, mode: '' })
+              })
+          } catch (error) {
+            setState({ url: 'http://127.0.0.1:8787' + PAIRING_PATH, mode: '' })
+          }
+          return function () { alive = false }
+        }, [])
+
         return React.createElement(
           'div',
           { style: styles.root, 'data-plugin': 'dsh-openwhale' },
@@ -181,9 +224,22 @@ window.__ModuleLoader__.load({
               React.createElement(
                 'p',
                 { style: styles.meta },
-                '与在浏览器打开 /openwhale 相同：第 1 步选 App 或网页版，第 2 步选连接方式，第 3 步扫码。',
+                '第 1 步选 App 或网页版，第 2 步选连接方式，第 3 步扫码。',
               ),
             ),
+            state.url
+              ? React.createElement(
+                'a',
+                {
+                  href: state.url,
+                  target: '_blank',
+                  rel: 'noopener noreferrer',
+                  style: styles.openLink,
+                  title: state.url,
+                },
+                '在浏览器中打开 ↗',
+              )
+              : null,
           ),
           React.createElement('iframe', {
             src: PAIRING_PATH,
