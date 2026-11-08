@@ -285,12 +285,12 @@ test('resolveModelSelection falls back to the profile file when the service is a
 // ---------------------------------------------------------------------------
 
 test('forwarding windows have safe defaults that match the protocol constants', () => {
-  assert.equal(DEFAULT_CONFIG.approvalTimeoutMs, 20000)
+  assert.equal(DEFAULT_CONFIG.approvalTimeoutMs, 60000)
   assert.equal(DEFAULT_CONFIG.questionTimeoutMs, 90000)
   assert.equal(DEFAULT_CONFIG.questionTimedTimeoutMs, 30000)
   assert.equal(DEFAULT_CONFIG.questionLateWindowMs, 300000)
   assert.deepEqual(resolveForwardTimeouts({}), {
-    approvalTimeoutMs: 20000,
+    approvalTimeoutMs: 60000,
     questionTimeoutMs: 90000,
     questionTimedTimeoutMs: 30000,
     questionLateWindowMs: 300000,

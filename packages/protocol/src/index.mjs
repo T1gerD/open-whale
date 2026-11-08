@@ -815,7 +815,7 @@ export const SESSION_LIST_LIMIT = 200
  * prompt back to its own UI. Short enough that a phone that is asleep cannot
  * freeze a desktop turn; long enough to unlock a phone and tap.
  */
-export const APPROVAL_TIMEOUT_MS = 20_000
+export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])

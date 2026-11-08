@@ -172,7 +172,7 @@ export const SESSION_LIST_LIMIT = 200
 export const SESSION_WATCH_LIMIT = 8
 
 /** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
-export const APPROVAL_TIMEOUT_MS = 20_000
+export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** 电脑端等手机回答阻塞式提问（ask()）的时长，镜像 `QUESTION_TIMEOUT_MS`。 */
 export const QUESTION_TIMEOUT_MS = 90_000

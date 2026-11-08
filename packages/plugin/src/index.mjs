@@ -77,7 +77,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   cloudflaredPath: '',
   // 转发窗口（毫秒）。默认值与协议常量一致，但做成配置项：用户的网络/作息差别
   // 很大（有人 10 秒就点、有人要开手机解锁），写死一个值总有一边不合适。
-  approvalTimeoutMs: 20000,
+  approvalTimeoutMs: 60000,
   questionTimeoutMs: 90000,
   questionTimedTimeoutMs: 30000,
   questionLateWindowMs: 300000,

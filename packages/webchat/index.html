@@ -152,12 +152,17 @@
           <div class="status-banner-actions" id="status-banner-actions"></div>
         </div>
 
+        <div class="approval-banner" id="approval-banner" hidden>
+          <span class="approval-banner-text" id="approval-banner-text">有权限请求待处理</span>
+          <button class="approval-banner-jump" type="button" id="approval-banner-jump">查看</button>
+        </div>
         <div class="message-area" id="message-area">
           <div class="message-list" id="message-list" role="log" aria-live="polite" aria-relevant="additions text"></div>
         </div>
         <button class="jump-latest" id="jump-latest" type="button" hidden>回到最新</button>
 
         <div class="composer-wrap" id="composer-wrap">
+          <div class="message-queue" id="message-queue" hidden></div>
           <div class="attachment-tray" id="attachment-tray" hidden></div>
           <div class="upload-progress" id="upload-progress" hidden>
             <div class="upload-progress-text" id="upload-progress-text">正在上传…</div>

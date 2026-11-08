@@ -107,6 +107,10 @@ const dom = {
   jumpLatest: document.getElementById('jump-latest'),
   composerWrap: document.getElementById('composer-wrap'),
   composer: document.getElementById('composer'),
+  messageQueue: document.getElementById('message-queue'),
+  approvalBanner: document.getElementById('approval-banner'),
+  approvalBannerText: document.getElementById('approval-banner-text'),
+  approvalBannerJump: document.getElementById('approval-banner-jump'),
   composerInput: document.getElementById('composer-input'),
   sendBtn: document.getElementById('send-btn'),
   stopBtn: document.getElementById('stop-btn'),
@@ -153,6 +157,8 @@ const state = {
   assistants: [],
   outbox: [],
   attachments: [], // 待发送附件 {id, file, name, size, mime, transport}
+  queue: [], // 排队待发的消息 {id, text, attachments}
+  flushing: false,
   uploader: undefined,
   sending: false,
   syncTimer: null,
@@ -1646,6 +1652,7 @@ function handleFrame(frame) {
     }
   }
   if (frame.t === SERVER_FRAME.CHAT_ERROR || frame.t === SERVER_FRAME.CHAT_DONE) renderComposerState()
+  if (frame.t === SERVER_FRAME.CHAT_ERROR || frame.t === SERVER_FRAME.CHAT_DONE) flushQueue()
 
   if (frame.t === SERVER_FRAME.SESSIONS) {
     state.sessionListLoading = false
@@ -1661,6 +1668,7 @@ function handleFrame(frame) {
   }
   if (frame.t === SERVER_FRAME.SESSION_SELECTED) handleSessionSelected(frame)
   if (frame.t === SERVER_FRAME.APPROVAL_ASK) {
+    renderApprovalBanner()
     if (isActiveTarget) {
       syncApprovalTicker()
       if (targetApprovalsCount(frame) > approvalsBefore) {
@@ -1671,6 +1679,7 @@ function handleFrame(frame) {
     }
   }
   if (frame.t === SERVER_FRAME.APPROVAL_RESOLVED) handleApprovalResolved(result.resolved)
+  if (frame.t === SERVER_FRAME.APPROVAL_RESOLVED) renderApprovalBanner()
   if (frame.t === SERVER_FRAME.QUESTION_ASK) {
     syncApprovalTicker()
     if (isActiveTarget) {
@@ -2017,6 +2026,27 @@ async function sendComposer() {
     return
   }
 
+  // 生成中（或上一条排队项正在发出）：先排到输入框上方的本地队列，
+  // 用户可以编辑 / 删除 / 插队发送；本轮结束后自动按序发出。
+  if (state.model.activeCallId || state.flushing) {
+    state.queue.push({ id: uid('q'), text, attachments })
+    dom.composerInput.value = ''
+    autosizeInput()
+    state.attachments = []
+    renderAttachmentsTray()
+    renderComposerState()
+    showToast('已加入排队，当前回复结束后自动发送', '', 2200)
+    return
+  }
+  await deliverMessage(text, attachments)
+}
+
+/**
+ * 真正把一条消息发出去（上传附件 → 本地乐观消息 → outbox → chat/send）。
+ * @param {string} text
+ * @param {any[]} attachments
+ */
+async function deliverMessage(text, attachments) {
   state.sending = true
   renderComposerState()
   try {
@@ -2081,6 +2111,91 @@ async function sendComposer() {
     state.sending = false
     renderComposerState()
   }
+}
+
+/** 输入框上方的排队区：文本预览 + 插队发送 / 编辑 / 删除。 */
+function renderQueue() {
+  if (!dom.messageQueue) return
+  const list = state.queue
+  dom.messageQueue.hidden = list.length === 0
+  if (list.length === 0) {
+    dom.messageQueue.innerHTML = ''
+    return
+  }
+  dom.messageQueue.innerHTML = list
+    .map(entry => {
+      const preview = entry.text !== '' ? entry.text : '（仅附件）'
+      const meta = entry.attachments.length > 0 ? `${entry.attachments.length} 个附件` : ''
+      return `<div class="queue-item" data-queue-id="${escapeHtml(entry.id)}">
+        <span class="queue-text" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
+        ${meta ? `<span class="queue-meta">${escapeHtml(meta)}</span>` : ''}
+        <span class="queue-actions">
+          <button class="queue-btn" type="button" data-action="queue-send" data-queue-id="${escapeHtml(entry.id)}">插队发送</button>
+          <button class="queue-btn" type="button" data-action="queue-edit" data-queue-id="${escapeHtml(entry.id)}">编辑</button>
+          <button class="queue-btn danger" type="button" data-action="queue-delete" data-queue-id="${escapeHtml(entry.id)}">删除</button>
+        </span>
+      </div>`
+    })
+    .join('')
+}
+
+/** 本轮结束：把队首那条发出去（一次一条，避免把多条同时塞给电脑端）。 */
+function flushQueue() {
+  if (state.flushing) return
+  if (state.queue.length === 0) return
+  if (state.model?.activeCallId) return
+  if (!state.connection?.online) return
+  const entry = state.queue.shift()
+  state.flushing = true
+  renderQueue()
+  deliverMessage(entry.text, entry.attachments)
+    .catch(() => {
+      // 发送失败：放回队首，等下一次机会（网络恢复/下一轮结束）。
+      state.queue.unshift(entry)
+    })
+    .finally(() => {
+      state.flushing = false
+      renderComposerState()
+    })
+}
+
+/** @param {string} id */
+function queueEntryById(id) {
+  return state.queue.find(entry => entry.id === id)
+}
+
+/** @param {string} id 插队发送：立刻发这条（电脑端会把它排在当前回合之后）。 */
+function sendQueuedNow(id) {
+  const index = state.queue.findIndex(entry => entry.id === id)
+  if (index < 0) return
+  const [entry] = state.queue.splice(index, 1)
+  deliverMessage(entry.text, entry.attachments).catch(error => {
+    state.queue.splice(index, 0, entry)
+    renderQueue()
+    showToast(`发送失败：${(error && error.message) || error}`, 'error', 3600)
+  }).finally(() => renderComposerState())
+}
+
+/** @param {string} id 编辑：拿回输入框（附件也一并拿回），从队列移除。 */
+function editQueued(id) {
+  const index = state.queue.findIndex(entry => entry.id === id)
+  if (index < 0) return
+  const [entry] = state.queue.splice(index, 1)
+  const existing = dom.composerInput.value.trim()
+  dom.composerInput.value = existing !== '' && entry.text !== '' ? `${existing}\n${entry.text}` : existing || entry.text
+  if (entry.attachments.length > 0) state.attachments.push(...entry.attachments)
+  autosizeInput()
+  renderAttachmentsTray()
+  renderComposerState()
+  dom.composerInput.focus()
+}
+
+/** @param {string} id 删除：直接丢掉这条排队消息。 */
+function deleteQueued(id) {
+  const index = state.queue.findIndex(entry => entry.id === id)
+  if (index < 0) return
+  state.queue.splice(index, 1)
+  renderComposerState()
 }
 
 /** @param {string} msgId */
@@ -2409,7 +2524,24 @@ function setupScrollTracking() {
 
 // 输入区状态 -----------------------------------------------------------
 
+/** 同步审批提醒横幅：有多少条待答请求，就显示多少条。 */
+function renderApprovalBanner() {
+  if (!dom.approvalBanner) return
+  const count = state.model?.approvals?.length ?? 0
+  dom.approvalBanner.hidden = count === 0
+  if (count === 0) return
+  const first = state.model.approvals[0]
+  const tool = first?.toolName ? `（${first.toolName}）` : ''
+  dom.approvalBannerText.textContent = count === 1 ? `电脑在请求权限${tool}，请处理` : `有 ${count} 条权限请求待处理`
+  // 横幅出现时震动一下：手机放桌上/在别的应用里回来更容易注意到。
+  try {
+    if (navigator.vibrate) navigator.vibrate([120, 60, 120])
+  } catch {}
+}
+
 function renderComposerState() {
+  renderQueue()
+  renderApprovalBanner()
   const hasText = dom.composerInput.value.trim() !== ''
   const hasAttachments = state.attachments.length > 0
   const streaming = Boolean(state.model?.activeCallId)
@@ -2710,6 +2842,19 @@ function setupComposerEvents() {
     dom.imageFile.value = ''
   })
   dom.stopBtn.addEventListener('click', stopGeneration)
+  dom.approvalBannerJump?.addEventListener('click', () => {
+    const card = dom.messageList.querySelector('.approval-card')
+    if (card) card.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    else dom.messageArea.scrollTo({ top: 0, behavior: 'smooth' })
+  })
+  dom.messageQueue?.addEventListener('click', event => {
+    const button = event.target.closest('[data-action]')
+    if (!button) return
+    const id = button.dataset.queueId ?? ''
+    if (button.dataset.action === 'queue-send') sendQueuedNow(id)
+    else if (button.dataset.action === 'queue-edit') editQueued(id)
+    else if (button.dataset.action === 'queue-delete') deleteQueued(id)
+  })
   dom.attachmentTray.addEventListener('click', event => {
     const button = event.target.closest('[data-action]')
     if (!button) return

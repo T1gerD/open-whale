@@ -1633,6 +1633,97 @@ pre {
   z-index: 6;
 }
 
+
+
+/* 排队消息：生成中发送的消息先排在输入框上方，可编辑 / 删除 / 插队发送
+   （用户要求：与电脑端一样在下方排队等待）。 */
+/* 审批提醒横幅：手机上审批卡在消息区顶部，用户滚动时容易看不见，
+   这里给一条常驻提示 + 点击跳转（用户反馈「审批无提示」）。 */
+.approval-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+  background: color-mix(in srgb, var(--warn-soft) 60%, var(--surface));
+  color: var(--text);
+  font-size: 13px;
+}
+
+.approval-banner[hidden] {
+  display: none;
+}
+
+.approval-banner-jump {
+  flex: none;
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 10px;
+  background: var(--warn);
+  color: #1b1b1b;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.message-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 2px 8px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.queue-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.queue-meta {
+  flex: none;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.queue-actions {
+  flex: none;
+  display: flex;
+  gap: 2px;
+}
+
+.queue-btn {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  padding: 2px 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.queue-btn.danger {
+  color: var(--danger);
+}
+
 .attachment-tray {
   display: flex;
   gap: 6px;
