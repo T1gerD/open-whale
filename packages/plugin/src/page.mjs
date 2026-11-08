@@ -78,6 +78,20 @@ export function renderPageHtml(view, deps) {
     }</li>`).join('')}</ul>`
     : '<p class="hint">还没有绑定任何手机。用 Open Whale 应用扫描二维码即可绑定。</p>'
 
+  // 向导第二步：只有真的存在对应地址的线路才可点（Tailscale/隧道没开就禁用）。
+  const hasKind = kind => endpoints.some(endpoint => endpoint.kind === kind)
+  const modeList = [
+    { kind: 'lan', title: '局域网', desc: '手机和电脑同一个 Wi-Fi；最省事、延迟最低。' },
+    { kind: 'tailscale', title: 'Tailscale', desc: '外网也能连；手机需安装并登录同一 Tailscale 账号。' },
+    { kind: 'tunnel', title: '公网隧道', desc: '公网 HTTPS 地址；无需装 Tailscale，但需要有隧道进程。' },
+  ]
+  const modeButtons = modeList.map(item => {
+    const usable = hasKind(item.kind) && local
+    return `<button class="choice" data-mode="${item.kind}" ${usable ? '' : 'disabled'}>`
+      + `<b>${item.title}${hasKind(item.kind) ? '' : '（当前不可用）'}</b>`
+      + `<span>${item.desc}</span></button>`
+  }).join('')
+
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -87,9 +101,7 @@ export function renderPageHtml(view, deps) {
  .wrap{max-width:1000px;margin:0 auto}
  h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:0 0 10px}
  .sub{color:#93a4c8;margin-bottom:24px;font-size:14px}
- .grid{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
- .col{flex:1;min-width:330px;display:flex;flex-direction:column;gap:18px}
- .card{background:#131c31;border:1px solid #24304d;border-radius:14px;padding:18px}
+ .card{background:#131c31;border:1px solid #24304d;border-radius:14px;padding:18px;margin-bottom:18px}
  .qr{background:#fff;padding:12px;border-radius:12px;line-height:0;display:inline-block}
  code{background:#0b1220;padding:2px 6px;border-radius:6px;font-size:13px;word-break:break-all}
  .fp{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:#9ee7c0;word-break:break-all}
@@ -102,94 +114,167 @@ export function renderPageHtml(view, deps) {
  .devs{list-style:none;padding:0;margin:6px 0 2px}
  .devs li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 10px;background:#0b1220;border:1px solid #24304d;border-radius:8px;margin:6px 0;font-size:14px}
  .tag{display:inline-block;background:#1d4ed8;color:#fff;border-radius:999px;padding:1px 8px;font-size:12px}
- .modes label{display:block;margin:6px 0;font-size:14px}
  .banner{background:#3b1d1d;border:1px solid #7f1d1d;color:#ffb4b4;border-radius:10px;padding:10px 14px;margin-bottom:18px;font-size:13px}
  input[type=text]{background:#0b1220;border:1px solid #24304d;border-radius:8px;color:#e8eefc;padding:8px 10px;font-size:14px;min-width:260px}
  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
  .ok{color:#9ee7c0}
+ .steps{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px;font-size:13px;color:#64748b}
+ .steps b{color:#e8eefc}
+ .choice-row{display:flex;gap:12px;flex-wrap:wrap}
+ .choice{flex:1 1 240px;text-align:left;background:#131c31;border:1px solid #24304d;border-radius:12px;padding:16px;color:#e8eefc;cursor:pointer;font:inherit}
+ .choice:hover{border-color:#3b82f6}
+ .choice[disabled]{opacity:.45;cursor:not-allowed}
+ .choice b{display:block;font-size:15px;margin-bottom:4px}
+ .choice span{color:#93a4c8;font-size:13px;line-height:1.5}
+ .back{background:#334155;color:#e8eefc;border:0;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;margin-top:12px}
+ .back:hover{background:#475569}
+ .web-entry{margin-top:10px}
 </style></head><body><div class="wrap">
 <h1>Open Whale <span class="tag">v${version}</span></h1>
-<div class="sub">用手机上的 Open Whale 应用扫描二维码绑定；也可以用手机浏览器直接打开网页版（无需安装应用）。</div>
-<p class="hint">本页就是 DSH 设置 → 插件 → Open Whale 的插件页（同一份内容以内嵌 iframe 的方式显示）。</p>
+<div class="sub">第一次连接：选绑定方式 → 选连接方式 → 扫码。之后手机端会记住这次用的连接方式，也可以在手机设置里改。</div>
 ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开的。为避免经公网隧道暴露管理能力，配对二维码与所有修改操作（改名/解绑/连接方式/发送文件）都请在本机浏览器操作：<code>http://127.0.0.1:${port}/openwhale</code></div>`}
-<div class="grid">
-  <div class="col" style="flex:0 0 auto">
-    <div class="card">
-      <h2>扫码绑定</h2>
-      ${local
-    ? (qr ? `<div class="qr">${qr.svg}</div>` : `<p class="bad">${escapeHtml(payload.message ?? '当前无法生成二维码')}</p>`)
-    : `<p class="hint">配对二维码包含一次性绑定密钥，只在本机浏览器显示。请在电脑上打开 <code>http://127.0.0.1:${port}/openwhale</code> 扫码。</p>`}
-      ${local && payload.ok ? `<p><b>二维码有效期</b>：${escapeHtml(expiry)}</p><p class="warn">二维码包含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。</p>` : ''}
-    </div>
-    <div class="card">
-      <h2>网页版 / PWA</h2>
-      ${webEntries.length > 0 ? `
-        <p class="hint">扫哪个用哪条线路：同一 Wi-Fi 选「局域网」；外网且手机装了 Tailscale 选「Tailscale」。扫码会自动打开网页版并完成绑定。</p>
-        ${webEntries.map(entry => `
-          <div class="web-entry">
-            <p><b>${escapeHtml(entry.label)}</b> <span class="tag">${escapeHtml(entry.url.replace(/[?#].*$/, ''))}</span></p>
-            <div class="qr">${entry.qr.svg}</div>
-          </div>`).join('')}
-        <p class="hint">${webClientAvailable
-    ? '鸿蒙 / iOS / 任意浏览器可用；添加到主屏幕即为 PWA。iPhone 第一次访问局域网地址会询问「本地网络」权限，请选「允许」。'
-    : '网页版客户端还没有打包进插件（缺少 webchat 目录）。'}</p>
-      ` : webUrl ? `
-        <p>手机浏览器打开：<br><code>${escapeHtml(webUrl)}</code></p>
-        <p class="hint">二维码只在本机浏览器显示。</p>
-      ` : '<p class="hint">还没有可用地址，无法生成网页版入口。</p>'}
-    </div>
-  </div>
-  <div class="col">
-    <div class="card">
-      <h2>电脑</h2>
-      <p><b>电脑名称</b>：${escapeHtml(computerName)}</p>
-      <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
-      ${deviceRows}
-      <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.ok ? payload.payload.fp : fingerprint))}</span></p>
-      <p><b>可用地址</b>：</p><ul>${addressList}</ul>
-    </div>
-    <div class="card">
-      <h2>连接方式</h2>
-      <p class="hint">决定手机优先用哪条线路连这台电脑。自动模式按「上次成功 → Tailscale → 局域网 → 公网隧道」排序；<b>Tailscale 是独立选项，不再算作局域网</b>。</p>
-      <div class="modes">
-        ${['auto', 'lan', 'tailscale', 'tunnel'].map(value => `<label><input type="radio" name="connection-mode" value="${value}" ${mode === value ? 'checked' : ''} ${local ? '' : 'disabled'}> ${connectionModeLabel(value)}</label>`).join('')}
-      </div>
-      ${local ? '<button class="btn-sm" id="save-mode">保存连接方式</button>' : '<p class="hint">连接方式只能在本机浏览器修改。</p>'}
-      <p><b>检测到的地址</b>：</p><ul>${detectedSection}</ul>
-    </div>
-    <div class="card">
-      <h2>发送到手机</h2>
-      ${local ? `
-        <p class="hint">把本会话工作目录里的文件推送到所有已连接的手机（聊天里会出现文件卡片）。</p>
-        <div class="row">
-          <input type="text" id="send-file-path" placeholder="相对路径，例如 report.pdf">
-          <button class="btn-sm" id="send-file-btn">发送</button>
-        </div>
-        <p id="send-file-result" class="hint"></p>
-      ` : '<p class="hint">发送文件需要读取电脑上的路径，只允许在本机浏览器操作。</p>'}
-    </div>
-  </div>
+<div class="steps">
+  <b id="step-tag">第 1 步 · 选择绑定方式</b>
+  <span>·</span><span>第 2 步 · 选择连接方式</span>
+  <span>·</span><span>第 3 步 · 扫码</span>
 </div>
+
+<section id="step1">
+  <div class="card">
+    <h2>选择绑定方式</h2>
+    <p class="hint">首次连接用哪种方式？绑定后仍可在手机端设置里改成别的线路。</p>
+    <div class="choice-row">
+      <button class="choice" data-bind="app" ${local ? '' : 'disabled'}>
+        <b>App 绑定</b><span>已安装 Open Whale 应用：扫码后在应用中确认即可完成绑定。</span>
+      </button>
+      <button class="choice" data-bind="web" ${local ? '' : 'disabled'}>
+        <b>网页版绑定</b><span>用手机浏览器直接打开网页版（无需安装）；iPhone 首次访问会询问「本地网络」，请选允许。</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>电脑</h2>
+    <p><b>电脑名称</b>：${escapeHtml(computerName)}</p>
+    <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
+    ${deviceRows}
+    <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.ok ? payload.payload.fp : fingerprint))}</span></p>
+    <p><b>可用地址</b>：</p><ul>${addressList}</ul>
+    <p class="hint">检测到的地址：</p><ul>${detectedSection}</ul>
+  </div>
+
+  <div class="card">
+    <h2>发送到手机</h2>
+    ${local ? `
+      <p class="hint">把本会话工作目录里的文件推送到所有已连接的手机（聊天里会出现文件卡片）。</p>
+      <div class="row">
+        <input type="text" id="send-file-path" placeholder="相对路径，例如 report.pdf">
+        <button class="btn-sm" id="send-file-btn">发送</button>
+      </div>
+      <p id="send-file-result" class="hint"></p>
+    ` : '<p class="hint">发送文件需要读取电脑上的路径，只允许在本机浏览器操作。</p>'}
+  </div>
+</section>
+
+<section id="step2" hidden>
+  <div class="card">
+    <h2>选择第一次连接方式</h2>
+    <p class="hint">这一步选定的线路会保存为默认连接方式；手机端设置里仍可修改。灰色表示当前没有该线路的可用地址。</p>
+    <div class="choice-row">${modeButtons}</div>
+    <p class="hint" id="mode-note"></p>
+    <button class="back" id="back1">← 上一步</button>
+  </div>
+</section>
+
+<section id="step3" hidden>
+  <div class="card">
+    <h2>扫码绑定</h2>
+    <p class="hint" id="step3-hint"></p>
+    <div id="app-qr">
+      <img class="app-qr" data-kind="lan" src="/openwhale/qr.png?mode=lan" alt="局域网配对二维码" hidden>
+      <img class="app-qr" data-kind="tailscale" src="/openwhale/qr.png?mode=tailscale" alt="Tailscale 配对二维码" hidden>
+      <img class="app-qr" data-kind="tunnel" src="/openwhale/qr.png?mode=tunnel" alt="公网隧道配对二维码" hidden>
+      <p class="warn">二维码包含一次性绑定密钥，请勿截图外发；绑定成功后立即失效。</p>
+      <p class="hint">二维码有效期：${escapeHtml(expiry)}</p>
+    </div>
+    <div id="web-qr" hidden>
+      ${webEntries.map(entry => `
+        <div class="web-entry" data-kind="${entry.kind}" hidden>
+          <p><b>${escapeHtml(entry.label)}</b> <span class="tag">${escapeHtml(entry.url.replace(/[?#].*$/, ''))}</span></p>
+          <div class="qr">${entry.qr.svg}</div>
+        </div>`).join('')}
+      <p class="hint">扫码会自动打开网页版并完成绑定；同一 Wi-Fi 选局域网，外网且手机装了 Tailscale 选 Tailscale。</p>
+      ${webEntries.length === 0 ? '<p class="bad">网页版客户端还没有就绪（缺少 webchat 或没有可用地址）。</p>' : ''}
+    </div>
+    <p class="bad" id="step3-error" hidden></p>
+    <button class="back" id="back2">← 重新选择</button>
+  </div>
+</section>
+
 <p class="hint">Open Whale v${version} · 电脑 ID <code>${escapeHtml(computerId)}</code> · 状态：${payload.ok ? 'ready' : 'blocked'}</p>
 </div>
 <script>
   function postJson(url, body) {
     return fetch(url, { method: 'POST', headers: body ? { 'content-type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined })
   }
-  document.getElementById('save-mode')?.addEventListener('click', async function (event) {
-    var button = event.currentTarget
-    var selected = document.querySelector('input[name=connection-mode]:checked')
-    if (!selected) return
-    button.disabled = true
-    try {
-      var response = await postJson('/openwhale/connection-mode?mode=' + encodeURIComponent(selected.value))
-      if (!response.ok) throw new Error(await response.text())
-      location.reload()
-    } catch (error) {
-      alert('保存失败：' + error.message)
-      button.disabled = false
+  var wizard = { binding: null, mode: null }
+  var modeNames = { lan: '局域网', tailscale: 'Tailscale', tunnel: '公网隧道' }
+  function show(step) {
+    document.getElementById('step1').hidden = step !== 1
+    document.getElementById('step2').hidden = step !== 2
+    document.getElementById('step3').hidden = step !== 3
+    document.getElementById('step-tag').textContent = step === 1 ? '第 1 步 · 选择绑定方式' : step === 2 ? '第 2 步 · 选择连接方式' : '第 3 步 · 扫码'
+  }
+  function setError(message) {
+    var node = document.getElementById('step3-error')
+    node.textContent = message || ''
+    node.hidden = !message
+  }
+  function renderQr() {
+    setError('')
+    var app = wizard.binding === 'app'
+    document.getElementById('app-qr').hidden = !app
+    document.getElementById('web-qr').hidden = app
+    var hint = app ? '用手机上的 Open Whale 扫描下面的二维码。' : '用手机相机扫描下面的二维码，会打开网页版并自动完成绑定。'
+    document.getElementById('step3-hint').textContent = hint + ' 连接方式：' + (modeNames[wizard.mode] || '')
+    if (app) {
+      document.querySelectorAll('.app-qr').forEach(function (img) {
+        img.hidden = img.getAttribute('data-kind') !== wizard.mode
+      })
+      return
     }
+    var shown = false
+    document.querySelectorAll('#web-qr .web-entry').forEach(function (entry) {
+      var on = entry.getAttribute('data-kind') === wizard.mode
+      entry.hidden = !on
+      if (on) shown = true
+    })
+    if (!shown) setError('这条线路还没有网页版二维码：请先在电脑上启用该线路，或换一个连接方式。')
+  }
+  document.querySelectorAll('[data-bind]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      if (button.disabled) return
+      wizard.binding = button.getAttribute('data-bind')
+      show(2)
+    })
   })
+  document.querySelectorAll('[data-mode]').forEach(function (button) {
+    button.addEventListener('click', async function () {
+      if (button.disabled) return
+      wizard.mode = button.getAttribute('data-mode')
+      // 第一次连接所用方式保存为默认；手机端仍可在设置里覆盖。
+      try {
+        var response = await postJson('/openwhale/connection-mode?mode=' + encodeURIComponent(wizard.mode))
+        if (!response.ok) throw new Error(await response.text())
+      } catch (error) {
+        document.getElementById('mode-note').textContent = '保存默认连接方式失败（不影响本次扫码）：' + error.message
+      }
+      renderQr()
+      show(3)
+    })
+  })
+  document.getElementById('back1')?.addEventListener('click', function () { show(1) })
+  document.getElementById('back2')?.addEventListener('click', function () { show(2) })
   document.getElementById('send-file-btn')?.addEventListener('click', async function (event) {
     var button = event.currentTarget
     var input = document.getElementById('send-file-path')

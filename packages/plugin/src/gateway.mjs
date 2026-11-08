@@ -632,7 +632,8 @@ export class Gateway {
     // on request from this machine — a tunnel visitor must not get it.
     if (path === '/openwhale/qr.svg' || path === '/openwhale/qr.png') {
       if (!this.#requireLocal(req, res)) return true
-      const payload = this.pairingPayload()
+      // 配对向导第三步：按用户选择的线路生成二维码（未选则沿用全部可用地址）。
+      const payload = this.pairingPayload(url.searchParams.get('mode') ?? undefined)
       if (!payload.ok) return this.#json(res, 409, { error: payload.reason, message: payload.message })
       const qr = await renderPairingQr(payload.payload)
       if (path.endsWith('.png')) {
@@ -2135,13 +2136,24 @@ export class Gateway {
    * `/openwhale` command so they can never disagree.
    * @returns {{ok: true, payload: any} | {ok: false, reason: string, message: string}}
    */
-  pairingPayload() {
+  pairingPayload(mode) {
     const availability = pairingAvailability(this.store)
     if (!availability.available) {
       return { ok: false, reason: availability.reason, message: availability.message }
     }
-    const endpoints = this.#reachableEndpoints()
+    /** @type {string | undefined} */
+    const wanted = typeof mode === 'string' && ['lan', 'tailscale', 'tunnel'].includes(mode) ? mode : undefined
+    const all = this.#reachableEndpoints()
+    const endpoints = wanted ? all.filter(endpoint => endpoint.kind === wanted) : all
     if (endpoints.length === 0) {
+      if (wanted) {
+        const label = wanted === 'lan' ? '局域网' : wanted === 'tailscale' ? 'Tailscale' : '公网隧道'
+        return {
+          ok: false,
+          reason: 'mode-unavailable',
+          message: `当前没有可用的${label}地址：请先启用该线路（局域网监听 / Tailscale / 公网隧道）再生成二维码。`,
+        }
+      }
       return {
         ok: false,
         reason: 'no-endpoint',

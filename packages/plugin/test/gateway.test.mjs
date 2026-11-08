@@ -345,7 +345,7 @@ test('the binding page offers one short web QR per address, LAN first', async t 
 
   // iOS 之前的失败：二维码只给了一个地址（通常是 Tailscale），且**没有**绑定参数。
   // 现在每个地址一个二维码，链接里带一次性 secret，扫码即绑定。
-  const entries = html.split('<div class="web-entry">').length - 1
+  const entries = (html.match(/class="web-entry"/g) ?? []).length
   assert.equal(entries, 2, 'one web QR per reachable address')
   const lanAt = html.indexOf('局域网（同一 Wi-Fi）')
   const tsAt = html.indexOf('Tailscale（外网）')
@@ -355,6 +355,29 @@ test('the binding page offers one short web QR per address, LAN first', async t 
   assert.ok(html.includes('100.102.90.23:8787/openwhale/app'), 'Tailscale address is shown')
   assert.equal(html.includes(pairing.payload.secret), false, 'the secret stays inside the QR, not in page text')
   assert.equal(html.includes('#p='), false, 'no dense payload QR is needed for the web client any more')
+})
+
+test('the binding page is a three-step wizard with per-mode QR images', async t => {
+  const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
+  t.after(() => gateway.close())
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
+  // 第一步：两种绑定方式；第二步：三种连接方式；第三步：按线路生成二维码 img。
+  assert.match(html, /data-bind="app"/)
+  assert.match(html, /data-bind="web"/)
+  assert.match(html, /data-mode="lan"/)
+  assert.match(html, /data-mode="tailscale"/)
+  assert.match(html, /data-mode="tunnel"/)
+  assert.match(html, /qr\.png\?mode=lan/)
+  // 只有局域网可用：其它线路按钮禁用。
+  assert.match(html, /data-mode="tailscale"[^>]*disabled/)
+  // 指定线路的二维码路由：有地址的返回 PNG，没有的明确拒绝。
+  const lan = await fetch(`http://127.0.0.1:${port}/openwhale/qr.png?mode=lan`)
+  assert.equal(lan.status, 200)
+  assert.equal(lan.headers.get('content-type'), 'image/png')
+  const tunnel = await fetch(`http://127.0.0.1:${port}/openwhale/qr.png?mode=tunnel`)
+  assert.equal(tunnel.status, 409)
+  const body = await tunnel.json()
+  assert.equal(body.error, 'mode-unavailable')
 })
 
 test('qr routes refuse to mint a code when no endpoint exists', async t => {
