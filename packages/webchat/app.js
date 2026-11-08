@@ -45,7 +45,7 @@ import {
   signHello,
   verifyHelloAckProof,
 } from './lib/keys.mjs'
-import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, normalizeAttachments } from './lib/messages.mjs'
+import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs'
 import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
 import { createStorage } from './lib/storage.mjs'
 import {
@@ -1147,10 +1147,12 @@ function renderTabs() {
   if (signature !== state.lastTabsSignature) {
     state.lastTabsSignature = signature
     const scrollLeft = dom.sessionTabs.scrollLeft
+    // 同名标签追加 #序号，避免一排「会话」无法分辨（手机真机反馈）。
+    const displayTitles = model.tabDisplayTitles?.() ?? new Map()
     const items = model.tabs
       .map(id => {
         const active = id === model.activeSessionId
-        const title = model.titleFor(id)
+        const title = displayTitles.get(id) ?? model.titleFor(id)
         const unread = model.unreadFor(id)
         const typing = model.typingFor(id)
         const live = model.liveFor(id)
@@ -2412,9 +2414,12 @@ function renderComposerState() {
   const hasAttachments = state.attachments.length > 0
   const streaming = Boolean(state.model?.activeCallId)
   const hasSession = Boolean(state.model?.activeSessionId)
-  dom.sendBtn.hidden = streaming
-  dom.stopBtn.hidden = !streaming
-  dom.sendBtn.disabled = !hasSession || state.sending || (!hasText && !hasAttachments)
+  // 用户要求：输入框有内容时右侧永远是「发送」（生成中则排队发送）；
+  // 只有输入框为空且正在生成时，右侧才是「停止」。
+  const action = composerAction({ streaming, hasText, hasAttachments, hasSession, sending: state.sending })
+  dom.sendBtn.hidden = action.showStop
+  dom.stopBtn.hidden = !action.showStop
+  dom.sendBtn.disabled = action.sendDisabled
   if (!hasSession) {
     dom.composerHint.textContent = '还没有打开的会话：用标签条末端的「+」新建，或在「全部会话」里打开一个'
   } else if (state.uploader) {

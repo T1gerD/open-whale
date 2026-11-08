@@ -43,6 +43,26 @@ export const FILE_MESSAGE_PREFIX = 'file_'
 export const APPROVAL_QUEUE_LIMIT = 8
 
 /**
+ * 输入区右侧按钮的决策（用户需求）：
+ *  - 正在生成且输入框为空 → 「停止」；
+ *  - 其余情况（含生成中但已输入文字）→ 「发送」，生成中的消息由电脑端排队。
+ * @param {{streaming?: boolean, hasText?: boolean, hasAttachments?: boolean, hasSession?: boolean, sending?: boolean}} input
+ * @returns {{showStop: boolean, sendDisabled: boolean}}
+ */
+export function composerAction(input = {}) {
+  const streaming = input.streaming === true
+  const hasText = input.hasText === true
+  const hasAttachments = input.hasAttachments === true
+  const hasSession = input.hasSession !== false
+  const sending = input.sending === true
+  const empty = !hasText && !hasAttachments
+  return {
+    showStop: streaming && empty,
+    sendDisabled: !hasSession || sending || empty,
+  }
+}
+
+/**
  * 待回答提问的队列上限。一批提问可能有好几道题，正常情况下同时只有一两批；
  * 这里给一个硬上限，避免坏掉的对端把页面内存撑爆。
  */
@@ -1287,6 +1307,32 @@ export class ChatTabsModel {
     const id = String(sessionId ?? '')
     const summary = this.sessions.find(item => item.id === id)
     return summary?.title || this.chats.get(id)?.sessionTitle || '会话'
+  }
+
+  /**
+   * 标签条显示用的标题：同名标签在后面追加 `#序号`。
+   *
+   * 新建的会话在电脑端取到标题之前都叫「会话」，直接渲染会出现一排一模一样的
+   * 标签，用户无法分辨（真机反馈）。这里只影响**显示**，不影响标题本身。
+   * @returns {Map<string, string>}
+   */
+  tabDisplayTitles() {
+    const ids = Array.isArray(this.tabs) ? this.tabs : []
+    const base = ids.map(id => [id, this.titleFor(id)])
+    const counts = new Map()
+    for (const [, title] of base) counts.set(title, (counts.get(title) ?? 0) + 1)
+    const seen = new Map()
+    const out = new Map()
+    for (const [id, title] of base) {
+      if ((counts.get(title) ?? 0) <= 1) {
+        out.set(id, title)
+        continue
+      }
+      const index = (seen.get(title) ?? 0) + 1
+      seen.set(title, index)
+      out.set(id, `${title} #${index}`)
+    }
+    return out
   }
 
   /** 是否有 agent 正在这个会话里跑（电脑端 live 或本地看到 typing）。 */

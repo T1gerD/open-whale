@@ -11,7 +11,9 @@ import { test } from 'node:test'
 
 import {
   ChatModel,
+  ChatTabsModel,
   MESSAGE_STATUS,
+  composerAction,
   assistantMessageId,
   fileMessageId,
   normalizeAttachment,
@@ -430,4 +432,43 @@ test('markUserMessageFailed / resetUserMessageForRetry 支持重发', () => {
   // 重发沿用同一个 msgId：再收到 echo 仍然只有一条。
   model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '发不出去', at: '2026-10-26T12:00:00.000Z', seq: 1 })
   assert.equal(model.messages.length, 1)
+})
+
+
+test('duplicate tab titles get a #序号 so new sessions are distinguishable', () => {
+  const tabs = new ChatTabsModel()
+  tabs.openTab('ow-a')
+  tabs.openTab('ow-b')
+  tabs.openTab('ow-c')
+  const titles = [...tabs.tabDisplayTitles().values()]
+  assert.deepEqual(titles, ['会话 #1', '会话 #2', '会话 #3'])
+})
+
+test('a unique tab title is left untouched', () => {
+  const tabs = new ChatTabsModel()
+  tabs.openTab('ow-a')
+  tabs.openTab('ow-b')
+  tabs.chats.get('ow-a').sessionTitle = '优化 open-whale'
+  const titles = tabs.tabDisplayTitles()
+  assert.equal(titles.get('ow-a'), '优化 open-whale')
+  assert.equal(titles.get('ow-b'), '会话')
+})
+
+test('the composer is a stop button only while generating with an empty input', () => {
+  // 生成中 + 空输入 → 停止
+  assert.deepEqual(composerAction({ streaming: true, hasText: false, hasAttachments: false }), {
+    showStop: true,
+    sendDisabled: true,
+  })
+  // 生成中 + 有文字 → 发送（电脑端排队）
+  assert.deepEqual(composerAction({ streaming: true, hasText: true, hasAttachments: false }), {
+    showStop: false,
+    sendDisabled: false,
+  })
+  // 空闲 → 发送
+  assert.deepEqual(composerAction({ streaming: false, hasText: true }), { showStop: false, sendDisabled: false })
+  // 没有会话 / 正在发送 / 空输入空闲 → 发送键禁用
+  assert.equal(composerAction({ hasSession: false }).sendDisabled, true)
+  assert.equal(composerAction({ sending: true, hasText: true }).sendDisabled, true)
+  assert.equal(composerAction({ streaming: false }).sendDisabled, true)
 })

@@ -30,6 +30,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { approvalAvailability, approvalRemainingMs } from '../../../src/core/approvals.mts'
 import { questionAvailability, type QuestionDraft } from '../../../src/core/questions.mts'
+import { composerAction } from '../../../src/core/composer.mts'
 import { endpointKindLabel } from '../../../src/core/endpoint.mts'
 import { describeTransfer, formatBytes, transferProgress } from '../../../src/core/files.mts'
 import { formatCountdown } from '../../../src/core/power.mts'
@@ -118,6 +119,15 @@ export default function ChatScreen() {
   // 离线 / 电脑端没有 sessions-v1：面板里的行与「新建会话」都禁用，并明说原因。
   const sessionGate = sessionAvailability(view?.link.online === true, view?.link.capabilities)
   const sessionsDisabledHint = sessionGate.ok ? undefined : `${sessionGate.error}\n${sessionGate.hint}`
+  // 用户需求：输入框有内容时右侧永远是「发送」（生成中则排队发送）；
+  // 只有输入框为空且正在生成时，右侧才是「停止」。
+  const composer = composerAction({
+    streaming,
+    hasText: draft.trim().length > 0,
+    hasAttachments: attachment !== undefined,
+    hasSession: activeSessionId !== '',
+    sending,
+  })
   // 「屏幕顶 → 输入栏容器顶」的距离 = 状态栏 + 标题栏。Android 上窗口是 edge-to-edge 的，
   // 没有这段偏移，KeyboardAvoidingView 会把键盘高度算少一个标题栏，输入栏就被盖住。
   const keyboardOffset = insets.top + HEADER_CONTENT_HEIGHT
@@ -716,7 +726,7 @@ export default function ChatScreen() {
               textAlignVertical="center"
             />
           </View>
-          {streaming ? (
+          {composer.showStop ? (
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="停止生成"
@@ -730,11 +740,11 @@ export default function ChatScreen() {
               accessibilityRole="button"
               accessibilityLabel="发送"
               onPress={() => void onSend()}
-              disabled={sending || (draft.trim().length === 0 && !attachment)}
+              disabled={composer.sendDisabled}
               style={({ pressed }) => [
                 styles.sendButton,
                 { backgroundColor: theme.colors.accent },
-                (sending || (draft.trim().length === 0 && !attachment)) && styles.sendDisabled,
+                composer.sendDisabled && styles.sendDisabled,
                 pressed && styles.pressed,
               ]}
             >

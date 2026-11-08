@@ -327,3 +327,25 @@ test('the active chat view follows the active tab', () => {
     ['b', true],
   ])
 })
+
+
+test('tabs with the same title get #序号 so new sessions are distinguishable', () => {
+  const state = start(['sess_aaaa1111', 'sess_bbbb2222', 'sess_cccc3333'], 'sess_aaaa1111')
+  const listed = {
+    ...state,
+    sessionList: {
+      sessions: [
+        { id: 'sess_aaaa1111', title: '新会话', live: false, cwd: '' },
+        { id: 'sess_bbbb2222', title: '新会话', live: false, cwd: '' },
+        { id: 'sess_cccc3333', title: '新会话', live: false, cwd: '' },
+      ],
+    },
+  }
+  assert.deepEqual(tabStripModel(listed).map(tab => tab.title), ['新会话 #1', '新会话 #2', '新会话 #3'])
+  // 有独立标题的标签不受影响。
+  const titled = {
+    ...listed,
+    sessionList: { sessions: [{ id: 'sess_aaaa1111', title: '优化 open-whale', live: false, cwd: '' }] },
+  }
+  assert.equal(tabStripModel(titled).find(tab => tab.id === 'sess_aaaa1111').title, '优化 open-whale')
+})

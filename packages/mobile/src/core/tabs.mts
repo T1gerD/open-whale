@@ -146,7 +146,7 @@ export function tabTitle(state: TabsState, sessionId: string): string {
 
 /** 标签条的渲染模型（顺序 = 打开顺序）。 */
 export function tabStripModel(state: TabsState): TabView[] {
-  return state.tabs.map(id => {
+  const views = state.tabs.map(id => {
     const activity = activityOf(state, id)
     const chat = state.chats[id]
     const listed = state.sessionList?.sessions.find(session => session.id === id)
@@ -161,6 +161,18 @@ export function tabStripModel(state: TabsState): TabView[] {
       lastAt: activity.lastAt,
     }
   })
+  // 新建会话在电脑端起名前都叫「新会话」/「会话」：同名标签追加 #序号，
+  // 否则标签条上一排一模一样的标题，用户无法分辨（真机反馈）。只改显示。
+  const counts = new Map<string, number>()
+  for (const view of views) counts.set(view.title, (counts.get(view.title) ?? 0) + 1)
+  const seen = new Map<string, number>()
+  for (const view of views) {
+    if ((counts.get(view.title) ?? 0) <= 1) continue
+    const index = (seen.get(view.title) ?? 0) + 1
+    seen.set(view.title, index)
+    view.title = `${view.title} #${index}`
+  }
+  return views
 }
 
 /** 其它标签里排队的待办总数（审批 + 提问；当前标签自己的卡片会直接显示，不算进来）。 */
