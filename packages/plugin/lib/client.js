@@ -64,7 +64,11 @@ window.__ModuleLoader__.load({
        * 插件页内容：内嵌宿主配对页 + 「在浏览器中打开」。
        * 不读取任何 slot props，因此槽位渲染参数变化也不会影响它。
        */
-      function OpenWhalePluginPage() {
+      /**
+       * 完整配置卡：设置 → Open Whale 里显示（标题 + 二维码 + 打开链接）。
+       * 不读取 slot props，settings.section 的注入参数变化不会影响它。
+       */
+      function OpenWhaleSection() {
         return React.createElement(
           'div',
           { style: styles.root, 'data-plugin': 'dsh-openwhale' },
@@ -97,6 +101,24 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 插件详情页只放一行入口，不再把二维码塞进「插件说明」。
+       * settings.section 万一没渲染，这里至少还能点进配对页。
+       */
+      function OpenWhalePluginHint() {
+        return React.createElement(
+          'p',
+          { style: styles.hint, 'data-plugin': 'dsh-openwhale' },
+          '手机配对：',
+          React.createElement(
+            'a',
+            { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
+            '打开配对页',
+          ),
+          '（二维码在 设置 → Open Whale）',
+        )
+      }
+
+      /**
        * 注册插件页。slots 服务可能通过 `ctx.get('slots')` 暴露（官方插件都这么取），
        * 也可能挂成属性；两种都试，拿不到就只警告、绝不抛错。
        * @param {any} ctx 客户端根上下文
@@ -116,11 +138,11 @@ window.__ModuleLoader__.load({
            *    所以即使当前 DSH 还没把 settings.section 挂出来，二维码也有地方看）。
            * 每个槽位单独 try/catch：任何一边接口变化都只影响它自己。
            */
-          var registerInto = function (slot, spec) {
+          var registerInto = function (slot, spec, component) {
             try {
               slots.inject(slot, function () {
                 try {
-                  return slots.register(Object.assign({ name: slot }, spec), OpenWhalePluginPage)
+                  return slots.register(Object.assign({ name: slot }, spec), component)
                 } catch (error) {
                   if (typeof console !== 'undefined') console.warn('[openwhale] 区块注册失败（' + slot + '）：', error)
                   return undefined
@@ -130,8 +152,20 @@ window.__ModuleLoader__.load({
               if (typeof console !== 'undefined') console.warn('[openwhale] 槽位不可用（' + slot + '）：', error)
             }
           }
-          registerInto(SETTINGS_SLOT, { id: 'openwhale', order: 40, label: 'Open Whale' })
-          registerInto(PLUGIN_SLOT, { key: 'dsh-openwhale' })
+          // 设置区块按官方契约（dsh-client-ui-agent-preset）：label 是函数、inject 返回 props。
+          // 之前只给 label 字符串且没有 inject，设置页不会渲染。
+          registerInto(
+            SETTINGS_SLOT,
+            {
+              id: 'openwhale',
+              order: 40,
+              label: function () { return 'Open Whale' },
+              inject: function () { return {} },
+            },
+            OpenWhaleSection,
+          )
+          // 插件详情页兜底：只留一行入口，二维码仍然只在设置区块里。
+          registerInto(PLUGIN_SLOT, { key: 'dsh-openwhale' }, OpenWhalePluginHint)
         } catch (error) {
           // 设置页不可用可以接受；把 DSH 带崩不可以。
           if (typeof console !== 'undefined') console.warn('[openwhale] 插件页挂载失败，已跳过：', error)

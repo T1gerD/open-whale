@@ -49,7 +49,7 @@ test('the client bundle exports apply and an empty inject list', () => {
   assert.deepEqual(mod.inject, [])
 })
 
-test('apply registers both the settings section and the plugin-detail fallback', () => {
+test('apply registers the settings section and a plugin-detail entry point', () => {
   const mod = loadBundle()
   const registered = []
   const injected = []
@@ -58,7 +58,7 @@ test('apply registers both the settings section and the plugin-detail fallback',
       injected.push(name)
       cb()
     },
-    register: (spec) => {
+    register: spec => {
       registered.push(spec)
       return () => {}
     },
@@ -66,12 +66,14 @@ test('apply registers both the settings section and the plugin-detail fallback',
   mod.apply({ get: name => (name === 'slots' ? slots : undefined) })
   assert.deepEqual(injected, ['settings.section', 'plugins.bundle.config'])
   assert.equal(registered.length, 2)
-  // 主入口：设置 → Open Whale 区块
+  // 设置区块：官方契约要求 label 是函数、inject 返回 props（agent-preset 同款）。
   assert.equal(registered[0].name, 'settings.section')
   assert.equal(registered[0].id, 'openwhale')
-  assert.equal(registered[0].label, 'Open Whale')
+  assert.equal(typeof registered[0].label, 'function')
+  assert.equal(registered[0].label(), 'Open Whale')
+  assert.equal(typeof registered[0].inject, 'function')
   assert.ok(Number.isFinite(registered[0].order))
-  // 兜底：插件详情页配置区（上一版实测会渲染，settings 未挂出时仍有地方看二维码）
+  // 插件详情页兜底：只保留一行入口，二维码不在那里。
   assert.equal(registered[1].name, 'plugins.bundle.config')
   assert.equal(registered[1].key, 'dsh-openwhale')
 })
