@@ -1636,8 +1636,19 @@ pre {
 .attachment-tray {
   display: flex;
   gap: 6px;
-  flex-wrap: wrap;
   padding: 2px 2px 8px;
+  /* 附件多时不能把聊天区挤没：单行横向滚动，最多一行高（真机反馈：
+     8 张截图竖向铺开遮住了消息栏，翻不了上文）。 */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-height: 52px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+
+.attachment-tray::-webkit-scrollbar {
+  height: 4px;
 }
 
 .tray-chip {
@@ -1648,8 +1659,11 @@ pre {
   border-radius: var(--radius-xs);
   border: 1px solid var(--line);
   background: var(--surface);
+  /* 单行队列：每个 chip 不再换行，文件名过长就省略。 */
+  flex: 0 0 auto;
+  max-width: min(72vw, 320px);
   font-size: 12px;
-  max-width: 100%;
+  justify-content: flex-start;
 }
 
 .tray-chip .tray-name {

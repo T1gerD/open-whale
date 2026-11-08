@@ -55,3 +55,13 @@ test('inline code and media cannot push the bubble wider than the screen', () =>
   assert.match(block('.bubble-text code'), /overflow-wrap:\s*anywhere/)
   assert.match(css, /\.bubble-text img,[\s\S]*?max-width:\s*100%/)
 })
+
+test('the attachment tray is one scrollable row so it cannot cover the chat', () => {
+  // 真机反馈：8 张截图在 tray 里竖向铺开，把消息区挤没了，翻不了上文。
+  const tray = css.slice(css.indexOf('.attachment-tray'), css.indexOf('.attachment-tray::-webkit-scrollbar'))
+  assert.match(tray, /flex-wrap:\s*nowrap/)
+  assert.match(tray, /overflow-x:\s*auto/)
+  assert.match(tray, /max-height:\s*\d+px/)
+  const chip = css.slice(css.indexOf('.tray-chip {'), css.indexOf('.tray-chip .tray-name'))
+  assert.match(chip, /flex:\s*0 0 auto/)
+})
