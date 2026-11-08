@@ -27,12 +27,10 @@ window.__ModuleLoader__.load({
     try {
       var React = require('react')
 
-      /**
-       * 注册到「设置」侧边栏的 Open Whale 区块（`settings.section` 槽），
-       * 而不是插件卡片里的说明位：用户要的是「设置 → Open Whale → 二维码」，
-       * 二维码不该挤在插件详情（README/描述）里。
-       */
-      var SLOT = 'settings.section'
+      /** 主入口槽位：设置侧栏的 Open Whale 区块。 */
+      var SETTINGS_SLOT = 'settings.section'
+      /** 兜底槽位：插件详情页的配置区（上一版实测能渲染）。 */
+      var PLUGIN_SLOT = 'plugins.bundle.config'
       /** 宿主侧配对页路径，与 gateway.mjs 的路由表一致。 */
       var PAIRING_PATH = '/openwhale'
 
@@ -49,6 +47,17 @@ window.__ModuleLoader__.load({
         },
         actions: { display: 'flex', justifyContent: 'flex-end', margin: 0 },
         link: { fontSize: '13px', textDecoration: 'underline' },
+        title: { margin: '0 0 2px', fontSize: '15px', fontWeight: 600 },
+        card: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+          padding: '14px',
+          borderRadius: '12px',
+          border: '1px solid var(--dsw-alias-border-secondary, rgba(128, 128, 128, 0.24))',
+          width: '100%',
+          maxWidth: '480px',
+        },
       }
 
       /**
@@ -60,23 +69,28 @@ window.__ModuleLoader__.load({
           'div',
           { style: styles.root, 'data-plugin': 'dsh-openwhale' },
           React.createElement(
-            'p',
-            { style: styles.hint },
-            '用手机上的 Open Whale 应用扫描下面的二维码完成绑定；已绑定的设备可以在这里改名或移除。',
-          ),
-          React.createElement('iframe', {
-            src: PAIRING_PATH,
-            style: styles.frame,
-            title: 'Open Whale 配对页',
-            loading: 'lazy',
-          }),
-          React.createElement(
-            'p',
-            { style: styles.actions },
+            'div',
+            { style: styles.card },
+            React.createElement('h3', { style: styles.title }, '扫码绑定手机'),
             React.createElement(
-              'a',
-              { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
-              '在浏览器中打开',
+              'p',
+              { style: styles.hint },
+              '用手机上的 Open Whale 扫描下面的二维码；已绑定的设备可以在配对页里改名或移除。',
+            ),
+            React.createElement('iframe', {
+              src: PAIRING_PATH,
+              style: styles.frame,
+              title: 'Open Whale 配对页',
+              loading: 'lazy',
+            }),
+            React.createElement(
+              'p',
+              { style: styles.actions },
+              React.createElement(
+                'a',
+                { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
+                '在浏览器中打开配对页',
+              ),
             ),
           ),
         )
@@ -95,17 +109,29 @@ window.__ModuleLoader__.load({
             if (typeof console !== 'undefined') console.warn('[openwhale] 客户端没有 slots 服务，插件页不可用')
             return
           }
-          slots.inject(SLOT, function () {
+          /**
+           * 两个槽位都注册，互为兜底：
+           *  * settings.section → 「设置 → Open Whale」（用户要的位置）；
+           *  * plugins.bundle.config → 插件详情页底部的配置区（上一版实测能渲染，
+           *    所以即使当前 DSH 还没把 settings.section 挂出来，二维码也有地方看）。
+           * 每个槽位单独 try/catch：任何一边接口变化都只影响它自己。
+           */
+          var registerInto = function (slot, spec) {
             try {
-              return slots.register(
-                { name: SLOT, id: 'openwhale', order: 40, label: 'Open Whale' },
-                OpenWhalePluginPage,
-              )
+              slots.inject(slot, function () {
+                try {
+                  return slots.register(Object.assign({ name: slot }, spec), OpenWhalePluginPage)
+                } catch (error) {
+                  if (typeof console !== 'undefined') console.warn('[openwhale] 区块注册失败（' + slot + '）：', error)
+                  return undefined
+                }
+              })
             } catch (error) {
-              if (typeof console !== 'undefined') console.warn('[openwhale] 设置区块注册失败，已跳过：', error)
-              return undefined
+              if (typeof console !== 'undefined') console.warn('[openwhale] 槽位不可用（' + slot + '）：', error)
             }
-          })
+          }
+          registerInto(SETTINGS_SLOT, { id: 'openwhale', order: 40, label: 'Open Whale' })
+          registerInto(PLUGIN_SLOT, { key: 'dsh-openwhale' })
         } catch (error) {
           // 设置页不可用可以接受；把 DSH 带崩不可以。
           if (typeof console !== 'undefined') console.warn('[openwhale] 插件页挂载失败，已跳过：', error)

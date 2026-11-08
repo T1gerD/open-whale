@@ -49,28 +49,31 @@ test('the client bundle exports apply and an empty inject list', () => {
   assert.deepEqual(mod.inject, [])
 })
 
-test('apply registers the settings section through ctx.get("slots")', () => {
+test('apply registers both the settings section and the plugin-detail fallback', () => {
   const mod = loadBundle()
-  let registered = 0
-  let options
+  const registered = []
+  const injected = []
   const slots = {
     inject: (name, cb) => {
-      assert.equal(name, 'settings.section')
+      injected.push(name)
       cb()
     },
-    register: spec => {
-      registered += 1
-      options = spec
+    register: (spec) => {
+      registered.push(spec)
       return () => {}
     },
   }
   mod.apply({ get: name => (name === 'slots' ? slots : undefined) })
-  assert.equal(registered, 1)
-  // 注册的是「设置 → Open Whale」区块，而不是插件卡片里的说明位。
-  assert.equal(options.name, 'settings.section')
-  assert.equal(options.id, 'openwhale')
-  assert.equal(options.label, 'Open Whale')
-  assert.ok(Number.isFinite(options.order))
+  assert.deepEqual(injected, ['settings.section', 'plugins.bundle.config'])
+  assert.equal(registered.length, 2)
+  // 主入口：设置 → Open Whale 区块
+  assert.equal(registered[0].name, 'settings.section')
+  assert.equal(registered[0].id, 'openwhale')
+  assert.equal(registered[0].label, 'Open Whale')
+  assert.ok(Number.isFinite(registered[0].order))
+  // 兜底：插件详情页配置区（上一版实测会渲染，settings 未挂出时仍有地方看二维码）
+  assert.equal(registered[1].name, 'plugins.bundle.config')
+  assert.equal(registered[1].key, 'dsh-openwhale')
 })
 
 test('apply survives a missing slots service, old ctx.slots, and throwing slot APIs', () => {
@@ -82,7 +85,7 @@ test('apply survives a missing slots service, old ctx.slots, and throwing slot A
   assert.doesNotThrow(() => mod.apply({
     slots: { inject: (_name, cb) => cb(), register: () => { registered += 1 } },
   }))
-  assert.equal(registered, 1)
+  assert.equal(registered, 2)
   // register 抛错
   assert.doesNotThrow(() => mod.apply({
     get: () => ({ inject: (_n, cb) => cb(), register: () => { throw new Error('slot api changed') } }),
