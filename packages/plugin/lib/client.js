@@ -69,19 +69,18 @@ window.__ModuleLoader__.load({
         url: { fontSize: '11px', opacity: 0.6, wordBreak: 'break-all', margin: 0 },
       }
 
-      /** 配对页入口：优先局域网地址，其次其它非 loopback 地址，最后回退相对路径。 */
-      function pickPairingUrl(info) {
+      /**
+       * 取某个 kind 的宿主地址（loopback / lan / tailscale），拼成配对页路径。
+       * 没有对应端点时回退相对路径（桌面壳会代理到宿主）。
+       */
+      function endpointUrl(info, kind) {
         var endpoints = info && Array.isArray(info.endpoints) ? info.endpoints : []
-        var lan = null
-        var other = null
         for (var index = 0; index < endpoints.length; index += 1) {
           var endpoint = endpoints[index]
-          if (!endpoint || typeof endpoint.url !== 'string' || endpoint.url === '') continue
-          if (endpoint.kind === 'lan' && !lan) lan = endpoint
-          else if (endpoint.kind !== 'loopback' && !other) other = endpoint
+          if (!endpoint || endpoint.kind !== kind || typeof endpoint.url !== 'string' || endpoint.url === '') continue
+          return String(endpoint.url).replace(/\/$/, '') + PAIRING_PATH
         }
-        var base = (lan && lan.url) || (other && other.url)
-        return base ? String(base).replace(/\/$/, '') + PAIRING_PATH : PAIRING_PATH
+        return ''
       }
 
       /**
@@ -118,14 +117,18 @@ window.__ModuleLoader__.load({
         var info = state.info
         var pairing = info && info.pairing
         var available = !pairing || pairing.available !== false
-        var url = pickPairingUrl(info)
+        // 配对页必须在本机回环地址打开才显示二维码（宿主的安全策略）；
+        // 局域网地址只给手机直接开网页版用。
+        var url = endpointUrl(info, 'loopback') || PAIRING_PATH
+        var lanBase = endpointUrl(info, 'lan') || ''
+        var phoneUrl = lanBase ? lanBase.replace(PAIRING_PATH, '') + '/openwhale/app' : ''
         var children = [
           React.createElement('h3', { key: 'title', style: styles.title }, '扫码绑定手机'),
           React.createElement(
             'p',
             { key: 'hint', style: styles.hint },
             available
-              ? '用手机上的 Open Whale 扫描下方二维码；已绑定的设备可以在配对页里改名或移除。'
+              ? '二维码只在本机浏览器显示。用手机相机扫码，或让手机浏览器直接打开下面的网页版地址。'
               : '当前不能生成新的配对二维码；已绑定设备仍可在配对页里管理。',
           ),
         ]
@@ -178,7 +181,20 @@ window.__ModuleLoader__.load({
             ? React.createElement('span', { key: 'name', style: styles.hint }, String(info.computerName))
             : null,
         ))
-        children.push(React.createElement('p', { key: 'url', style: styles.url }, url))
+        children.push(React.createElement('p', { key: 'url', style: styles.url }, '本机配对页：' + url))
+        if (phoneUrl) {
+          children.push(React.createElement(
+            'p',
+            { key: 'phone', style: styles.url },
+            '手机网页版：',
+            React.createElement('a', {
+              href: phoneUrl,
+              target: '_blank',
+              rel: 'noopener noreferrer',
+              style: styles.link,
+            }, phoneUrl),
+          ))
+        }
 
         return React.createElement(
           'div',
