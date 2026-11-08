@@ -49,7 +49,7 @@ test('the client bundle exports apply and an empty inject list', () => {
   assert.deepEqual(mod.inject, [])
 })
 
-test('apply registers the settings section and a plugin-detail entry point', () => {
+test('apply registers only the settings section, with the official contract', () => {
   const mod = loadBundle()
   const registered = []
   const injected = []
@@ -64,18 +64,17 @@ test('apply registers the settings section and a plugin-detail entry point', () 
     },
   }
   mod.apply({ get: name => (name === 'slots' ? slots : undefined) })
-  assert.deepEqual(injected, ['settings.section', 'plugins.bundle.config'])
-  assert.equal(registered.length, 2)
-  // 设置区块：官方契约要求 label 是函数、inject 返回 props（agent-preset 同款）。
-  assert.equal(registered[0].name, 'settings.section')
-  assert.equal(registered[0].id, 'openwhale')
-  assert.equal(typeof registered[0].label, 'function')
-  assert.equal(registered[0].label(), 'Open Whale')
-  assert.equal(typeof registered[0].inject, 'function')
-  assert.ok(Number.isFinite(registered[0].order))
-  // 插件详情页兜底：只保留一行入口，二维码不在那里。
-  assert.equal(registered[1].name, 'plugins.bundle.config')
-  assert.equal(registered[1].key, 'dsh-openwhale')
+  // 只注册设置区块；插件详情页（plugins.bundle.config）不再注册任何内容。
+  assert.deepEqual(injected, ['settings.section'])
+  assert.equal(registered.length, 1)
+  const spec = registered[0]
+  // 官方契约（dsh-client-ui-agent-preset）：label 函数 + inject 返回 props。
+  assert.equal(spec.name, 'settings.section')
+  assert.equal(spec.id, 'openwhale')
+  assert.equal(typeof spec.label, 'function')
+  assert.equal(spec.label(), 'Open Whale')
+  assert.equal(typeof spec.inject, 'function')
+  assert.ok(Number.isFinite(spec.order))
 })
 
 test('apply survives a missing slots service, old ctx.slots, and throwing slot APIs', () => {
@@ -87,7 +86,7 @@ test('apply survives a missing slots service, old ctx.slots, and throwing slot A
   assert.doesNotThrow(() => mod.apply({
     slots: { inject: (_name, cb) => cb(), register: () => { registered += 1 } },
   }))
-  assert.equal(registered, 2)
+  assert.equal(registered, 1)
   // register 抛错
   assert.doesNotThrow(() => mod.apply({
     get: () => ({ inject: (_n, cb) => cb(), register: () => { throw new Error('slot api changed') } }),

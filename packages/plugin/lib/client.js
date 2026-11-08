@@ -1,19 +1,16 @@
-// Open Whale — DSH Web 客户端插件（插件页）。
+// Open Whale — DSH Web 客户端插件（`settings.section` 区块）。
 //
-// 这是聊天输入框「+」里那个 `/openwhale` 命令的替代品：v2.3.0 删掉了命令，
-// 绑定二维码改在「DSH 设置 → 插件 → Open Whale」的插件页里显示。页面内容复用
-// 宿主侧的 `/openwhale`（同一份配对页：二维码、已绑定设备、解绑、连接方式、
-// 发送文件），所以这里只负责把它嵌进来，不重复实现任何逻辑。
+// 在 DSH 设置侧栏提供「Open Whale」区块：配对二维码、配对状态、入口链接。
+// 宿主侧的 `/openwhale` 页面仍是唯一真相来源（二维码、已绑定设备、解绑、
+// 连接方式、发文件），这里只做展示，不重复实现业务逻辑。
 //
-// 加载格式由 DSH 的客户端模块加载器（`window.__ModuleLoader__`）规定，与官方
-// 客户端插件一致：工厂返回 `{apply, inject}`，宿主用客户端根 ctx 调用 `apply`。
-// 组件注册进 `plugins.bundle.config` 槽——该槽由插件管理页声明为 keyed/root，
-// key 用包名（与渲染时的 `entryKey: pkg.name` 对齐）。
+// 加载格式由 DSH 的客户端模块加载器（`window.__ModuleLoader__`）规定：工厂返回
+// `{apply, inject}`；设置区块按 `dsh-client-ui-agent-preset` 的契约注册——
+// `label` 必须是函数、`inject` 必须返回 props，否则设置页会静默跳过该 section。
 //
-// 3.0.0 起这里**整段做防御**：客户端 boot 会把任何 apply 抛错当成「entry failed」
-// 并直接中止整个 Web 启动（"web boot: 1 entry did not activate"）。设置页只是
-// 锦上添花，绝不能因为它把 DSH 挡在门外，所以工厂和 apply 都包了 try/catch，
-// slots 服务缺失、槽位接口变化、注册失败都只记一条 warning 后放弃。
+// 3.0.0 起整段做防御：客户端 boot 会把任何 apply 抛错当成「entry failed」并中止
+// 整个 Web 启动（"web boot: 1 entry did not activate"）。设置页只是锦上添花，
+// 绝不能因为它把 DSH 挡在门外——工厂、apply、query、onClick 全部 try/catch。
 window.__ModuleLoader__.load({
   id: 'dsh-openwhale',
   factory: require => {
@@ -21,106 +18,178 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    /** 客户端加载器要求模块导出 apply；inject 置空数组避免被当成 pending。 */
+    /** 客户端加载器要求导出 apply；inject 置空数组避免被当成 pending。 */
     exports.inject = []
 
     try {
       var React = require('react')
+      var useState = React.useState
+      var useEffect = React.useEffect
 
-      /** 主入口槽位：设置侧栏的 Open Whale 区块。 */
+      /** 设置区块槽位名（设置侧栏的「Open Whale」）。 */
       var SETTINGS_SLOT = 'settings.section'
-      /** 兜底槽位：插件详情页的配置区（上一版实测能渲染）。 */
-      var PLUGIN_SLOT = 'plugins.bundle.config'
-      /** 宿主侧配对页路径，与 gateway.mjs 的路由表一致。 */
+      /** 宿主侧路由，与 gateway.mjs 的路由表一致（同源相对路径，桌面壳会代理）。 */
       var PAIRING_PATH = '/openwhale'
+      var INFO_PATH = '/openwhale/info'
+      var QR_PATH = '/openwhale/qr.png'
 
       var styles = {
-        root: { display: 'flex', flexDirection: 'column', gap: '8px', width: '100%', maxWidth: '560px' },
-        hint: { margin: 0, fontSize: '12px', lineHeight: '18px', opacity: 0.7 },
-        frame: {
-          width: '100%',
-          height: '560px',
-          minHeight: '420px',
-          border: '1px solid var(--dsw-alias-border-secondary, rgba(128, 128, 128, 0.24))',
-          borderRadius: '12px',
-          background: '#0b1220',
-        },
-        actions: { display: 'flex', justifyContent: 'flex-end', margin: 0 },
-        link: { fontSize: '13px', textDecoration: 'underline' },
-        title: { margin: '0 0 2px', fontSize: '15px', fontWeight: 600 },
+        root: { display: 'flex', flexDirection: 'column', gap: '10px', width: '100%', maxWidth: '560px' },
         card: {
           display: 'flex',
           flexDirection: 'column',
-          gap: '8px',
-          padding: '14px',
+          gap: '10px',
+          padding: '16px',
           borderRadius: '12px',
           border: '1px solid var(--dsw-alias-border-secondary, rgba(128, 128, 128, 0.24))',
           width: '100%',
-          maxWidth: '480px',
         },
+        title: { margin: 0, fontSize: '15px', fontWeight: 600 },
+        hint: { margin: 0, fontSize: '12px', lineHeight: '18px', opacity: 0.75 },
+        qrWrap: { display: 'flex', justifyContent: 'center', padding: '4px 0' },
+        // 二维码由宿主生成 PNG；按容器缩放，避免再出现 iframe 的双层滚动条。
+        qr: {
+          width: '100%',
+          maxWidth: '300px',
+          aspectRatio: '1 / 1',
+          background: '#fff',
+          borderRadius: '8px',
+          display: 'block',
+        },
+        error: { margin: 0, fontSize: '12px', lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary, #d9534f)' },
+        actions: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          flexWrap: 'wrap',
+          margin: 0,
+        },
+        link: { fontSize: '13px', textDecoration: 'underline' },
+        url: { fontSize: '11px', opacity: 0.6, wordBreak: 'break-all', margin: 0 },
+      }
+
+      /** 配对页入口：优先局域网地址，其次其它非 loopback 地址，最后回退相对路径。 */
+      function pickPairingUrl(info) {
+        var endpoints = info && Array.isArray(info.endpoints) ? info.endpoints : []
+        var lan = null
+        var other = null
+        for (var index = 0; index < endpoints.length; index += 1) {
+          var endpoint = endpoints[index]
+          if (!endpoint || typeof endpoint.url !== 'string' || endpoint.url === '') continue
+          if (endpoint.kind === 'lan' && !lan) lan = endpoint
+          else if (endpoint.kind !== 'loopback' && !other) other = endpoint
+        }
+        var base = (lan && lan.url) || (other && other.url)
+        return base ? String(base).replace(/\/$/, '') + PAIRING_PATH : PAIRING_PATH
       }
 
       /**
-       * 插件页内容：内嵌宿主配对页 + 「在浏览器中打开」。
-       * 不读取任何 slot props，因此槽位渲染参数变化也不会影响它。
-       */
-      /**
-       * 完整配置卡：设置 → Open Whale 里显示（标题 + 二维码 + 打开链接）。
-       * 不读取 slot props，settings.section 的注入参数变化不会影响它。
+       * 设置区块内容：二维码 + 配对状态 + 「在浏览器中打开配对页」。
+       * 用宿主生成的 PNG（不再嵌套 iframe），设置页的滚动容器不会把它裁掉。
        */
       function OpenWhaleSection() {
+        var stateHook = useState({ status: 'loading', info: null, error: '', fetchedAt: 0 })
+        var state = stateHook[0]
+        var setState = stateHook[1]
+
+        useEffect(function () {
+          var alive = true
+          try {
+            fetch(INFO_PATH, { headers: { accept: 'application/json' } })
+              .then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status)
+                return response.json()
+              })
+              .then(function (info) {
+                if (alive) setState({ status: 'ready', info: info, error: '', fetchedAt: Date.now() })
+              })
+              .catch(function (error) {
+                if (!alive) return
+                var message = String((error && error.message) || error)
+                setState({ status: 'error', info: null, error: message, fetchedAt: 0 })
+              })
+          } catch (error) {
+            setState({ status: 'error', info: null, error: String((error && error.message) || error), fetchedAt: 0 })
+          }
+          return function () { alive = false }
+        }, [])
+
+        var info = state.info
+        var pairing = info && info.pairing
+        var available = !pairing || pairing.available !== false
+        var url = pickPairingUrl(info)
+        var children = [
+          React.createElement('h3', { key: 'title', style: styles.title }, '扫码绑定手机'),
+          React.createElement(
+            'p',
+            { key: 'hint', style: styles.hint },
+            available
+              ? '用手机上的 Open Whale 扫描下方二维码；已绑定的设备可以在配对页里改名或移除。'
+              : '当前不能生成新的配对二维码；已绑定设备仍可在配对页里管理。',
+          ),
+        ]
+
+        if (state.status === 'error') {
+          children.push(React.createElement(
+            'p',
+            { key: 'error', style: styles.error },
+            '读取配对信息失败：' + state.error + '。可以直接打开下面的配对页。',
+          ))
+        }
+        if (available) {
+          children.push(React.createElement(
+            'div',
+            { key: 'qr', style: styles.qrWrap },
+            React.createElement('img', {
+              src: state.fetchedAt ? QR_PATH + '?t=' + String(state.fetchedAt) : QR_PATH,
+              style: styles.qr,
+              alt: 'Open Whale 配对二维码',
+            }),
+          ))
+        } else if (pairing && pairing.message) {
+          children.push(React.createElement('p', { key: 'pairing-error', style: styles.error }, String(pairing.message)))
+        }
+        children.push(React.createElement(
+          'p',
+          { key: 'actions', style: styles.actions },
+          React.createElement(
+            'a',
+            {
+              href: url,
+              target: '_blank',
+              rel: 'noopener noreferrer',
+              style: styles.link,
+              onClick: function (event) {
+                // 相对链接在桌面壳里可能被拦；绝对 http 地址交给系统浏览器打开。
+                try {
+                  if (url !== PAIRING_PATH || typeof window === 'undefined' || !window.open) return
+                  event.preventDefault()
+                  var opened = window.open(url, '_blank', 'noopener')
+                  if (!opened) window.location.href = url
+                } catch (error) {
+                  if (typeof console !== 'undefined') console.warn('[openwhale] 打开配对页失败：', error)
+                }
+              },
+            },
+            '在浏览器中打开配对页',
+          ),
+          info && info.computerName
+            ? React.createElement('span', { key: 'name', style: styles.hint }, String(info.computerName))
+            : null,
+        ))
+        children.push(React.createElement('p', { key: 'url', style: styles.url }, url))
+
         return React.createElement(
           'div',
           { style: styles.root, 'data-plugin': 'dsh-openwhale' },
-          React.createElement(
-            'div',
-            { style: styles.card },
-            React.createElement('h3', { style: styles.title }, '扫码绑定手机'),
-            React.createElement(
-              'p',
-              { style: styles.hint },
-              '用手机上的 Open Whale 扫描下面的二维码；已绑定的设备可以在配对页里改名或移除。',
-            ),
-            React.createElement('iframe', {
-              src: PAIRING_PATH,
-              style: styles.frame,
-              title: 'Open Whale 配对页',
-              loading: 'lazy',
-            }),
-            React.createElement(
-              'p',
-              { style: styles.actions },
-              React.createElement(
-                'a',
-                { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
-                '在浏览器中打开配对页',
-              ),
-            ),
-          ),
+          React.createElement('div', { style: styles.card }, children),
         )
       }
 
       /**
-       * 插件详情页只放一行入口，不再把二维码塞进「插件说明」。
-       * settings.section 万一没渲染，这里至少还能点进配对页。
-       */
-      function OpenWhalePluginHint() {
-        return React.createElement(
-          'p',
-          { style: styles.hint, 'data-plugin': 'dsh-openwhale' },
-          '手机配对：',
-          React.createElement(
-            'a',
-            { href: PAIRING_PATH, target: '_blank', rel: 'noopener noreferrer', style: styles.link },
-            '打开配对页',
-          ),
-          '（二维码在 设置 → Open Whale）',
-        )
-      }
-
-      /**
-       * 注册插件页。slots 服务可能通过 `ctx.get('slots')` 暴露（官方插件都这么取），
-       * 也可能挂成属性；两种都试，拿不到就只警告、绝不抛错。
+       * 只注册设置区块。插件详情页（plugins.bundle.config）不再注册任何内容：
+       * 二维码属于「设置 → Open Whale」，不该出现在插件说明里。
        * @param {any} ctx 客户端根上下文
        */
       function apply(ctx) {
@@ -128,47 +197,30 @@ window.__ModuleLoader__.load({
           var slots = ctx && (typeof ctx.get === 'function' ? ctx.get('slots') : undefined)
           if (!slots) slots = ctx && ctx.slots
           if (!slots || typeof slots.inject !== 'function' || typeof slots.register !== 'function') {
-            if (typeof console !== 'undefined') console.warn('[openwhale] 客户端没有 slots 服务，插件页不可用')
+            if (typeof console !== 'undefined') console.warn('[openwhale] 客户端没有 slots 服务，设置区块不可用')
             return
           }
-          /**
-           * 两个槽位都注册，互为兜底：
-           *  * settings.section → 「设置 → Open Whale」（用户要的位置）；
-           *  * plugins.bundle.config → 插件详情页底部的配置区（上一版实测能渲染，
-           *    所以即使当前 DSH 还没把 settings.section 挂出来，二维码也有地方看）。
-           * 每个槽位单独 try/catch：任何一边接口变化都只影响它自己。
-           */
-          var registerInto = function (slot, spec, component) {
+          slots.inject(SETTINGS_SLOT, function () {
             try {
-              slots.inject(slot, function () {
-                try {
-                  return slots.register(Object.assign({ name: slot }, spec), component)
-                } catch (error) {
-                  if (typeof console !== 'undefined') console.warn('[openwhale] 区块注册失败（' + slot + '）：', error)
-                  return undefined
-                }
-              })
+              // 契约来自 dsh-client-ui-agent-preset：label 是函数，inject 返回 props。
+              return slots.register(
+                {
+                  name: SETTINGS_SLOT,
+                  id: 'openwhale',
+                  order: 40,
+                  label: function () { return 'Open Whale' },
+                  inject: function () { return {} },
+                },
+                OpenWhaleSection,
+              )
             } catch (error) {
-              if (typeof console !== 'undefined') console.warn('[openwhale] 槽位不可用（' + slot + '）：', error)
+              if (typeof console !== 'undefined') console.warn('[openwhale] 设置区块注册失败，已跳过：', error)
+              return undefined
             }
-          }
-          // 设置区块按官方契约（dsh-client-ui-agent-preset）：label 是函数、inject 返回 props。
-          // 之前只给 label 字符串且没有 inject，设置页不会渲染。
-          registerInto(
-            SETTINGS_SLOT,
-            {
-              id: 'openwhale',
-              order: 40,
-              label: function () { return 'Open Whale' },
-              inject: function () { return {} },
-            },
-            OpenWhaleSection,
-          )
-          // 插件详情页兜底：只留一行入口，二维码仍然只在设置区块里。
-          registerInto(PLUGIN_SLOT, { key: 'dsh-openwhale' }, OpenWhalePluginHint)
+          })
         } catch (error) {
           // 设置页不可用可以接受；把 DSH 带崩不可以。
-          if (typeof console !== 'undefined') console.warn('[openwhale] 插件页挂载失败，已跳过：', error)
+          if (typeof console !== 'undefined') console.warn('[openwhale] 设置区块挂载失败，已跳过：', error)
         }
       }
 
