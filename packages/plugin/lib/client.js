@@ -27,18 +27,22 @@ window.__ModuleLoader__.load({
     try {
       var React = require('react')
 
-      /** 插件页槽位名（插件管理页按包名 key 渲染）。 */
-      var SLOT = 'plugins.bundle.config'
+      /**
+       * 注册到「设置」侧边栏的 Open Whale 区块（`settings.section` 槽），
+       * 而不是插件卡片里的说明位：用户要的是「设置 → Open Whale → 二维码」，
+       * 二维码不该挤在插件详情（README/描述）里。
+       */
+      var SLOT = 'settings.section'
       /** 宿主侧配对页路径，与 gateway.mjs 的路由表一致。 */
       var PAIRING_PATH = '/openwhale'
 
       var styles = {
-        root: { display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' },
+        root: { display: 'flex', flexDirection: 'column', gap: '8px', width: '100%', maxWidth: '560px' },
         hint: { margin: 0, fontSize: '12px', lineHeight: '18px', opacity: 0.7 },
         frame: {
           width: '100%',
-          height: 'calc(100vh - 260px)',
-          minHeight: '480px',
+          height: '560px',
+          minHeight: '420px',
           border: '1px solid var(--dsw-alias-border-secondary, rgba(128, 128, 128, 0.24))',
           borderRadius: '12px',
           background: '#0b1220',
@@ -93,9 +97,12 @@ window.__ModuleLoader__.load({
           }
           slots.inject(SLOT, function () {
             try {
-              return slots.register({ name: SLOT, key: 'dsh-openwhale' }, OpenWhalePluginPage)
+              return slots.register(
+                { name: SLOT, id: 'openwhale', order: 40, label: 'Open Whale' },
+                OpenWhalePluginPage,
+              )
             } catch (error) {
-              if (typeof console !== 'undefined') console.warn('[openwhale] 插件页注册失败，已跳过：', error)
+              if (typeof console !== 'undefined') console.warn('[openwhale] 设置区块注册失败，已跳过：', error)
               return undefined
             }
           })

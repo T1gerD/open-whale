@@ -49,21 +49,28 @@ test('the client bundle exports apply and an empty inject list', () => {
   assert.deepEqual(mod.inject, [])
 })
 
-test('apply registers the settings page through ctx.get("slots")', () => {
+test('apply registers the settings section through ctx.get("slots")', () => {
   const mod = loadBundle()
   let registered = 0
+  let options
   const slots = {
     inject: (name, cb) => {
-      assert.equal(name, 'plugins.bundle.config')
+      assert.equal(name, 'settings.section')
       cb()
     },
-    register: () => {
+    register: spec => {
       registered += 1
+      options = spec
       return () => {}
     },
   }
   mod.apply({ get: name => (name === 'slots' ? slots : undefined) })
   assert.equal(registered, 1)
+  // 注册的是「设置 → Open Whale」区块，而不是插件卡片里的说明位。
+  assert.equal(options.name, 'settings.section')
+  assert.equal(options.id, 'openwhale')
+  assert.equal(options.label, 'Open Whale')
+  assert.ok(Number.isFinite(options.order))
 })
 
 test('apply survives a missing slots service, old ctx.slots, and throwing slot APIs', () => {
