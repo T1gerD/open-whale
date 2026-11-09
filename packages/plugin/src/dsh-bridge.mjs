@@ -1204,6 +1204,8 @@ export class DshBridge {
     if (!this.agents.has(sessionId)) return
 
     switch (event?.type) {
+      case 'user/message':
+        return this.#onUserMessage(sessionId, event)
       case 'turn/start':
         return this.#onTurnStart(sessionId, event)
       case 'assistant/message':
@@ -1221,13 +1223,79 @@ export class DshBridge {
     }
   }
 
+  /**
+   * 桌面端（DSH GUI）发起的用户消息：实时同步给手机。
+   *
+   * 只转发 `source.kind === 'user'` 且带 `rpcId` 的——那是桌面 UI 输入框发起的；
+   * 本插件自己 `followup()` 注入的手机消息没有 `rpcId`（手机本地已经有气泡），
+   * runtime-context 之类的内部注入也由 `isInjectedUserMessage` 挡掉。
+   * @param {string} sessionId
+   * @param {any} event
+   */
+  #onUserMessage(sessionId, event) {
+    const data = event?.data
+    if (isInjectedUserMessage(data)) return
+    const source = data?.source
+    if (!source || source.kind !== 'user') return
+    if (typeof source.rpcId !== 'string' || source.rpcId === '') return
+    const text = extractUserText(data)
+    if (text === '') return
+    const at = Number(event?.time)
+    const messageId = typeof data?.id === 'string' ? data.id : ''
+    this.emit({
+      kind: 'user-message',
+      sessionId,
+      ...(messageId !== '' ? { messageId } : {}),
+      text,
+      at: Number.isFinite(at) ? at : this.now(),
+    })
+  }
+
   /** @param {string} sessionId @param {any} event */
   #onTurnStart(sessionId, event) {
     const queue = this.pendingCalls.get(sessionId)
     const call = queue?.shift()
-    if (!call) return
+    if (!call) {
+      // 桌面端发起的回合：手机也要能实时看到回复，给它建一个虚拟 call。
+      this.#ensureDesktopCall(sessionId, event?.data?.turn)
+      return
+    }
     call.turn = event?.data?.turn
     if (call.turn !== undefined) this.turnCalls.set(`${sessionId}:${call.turn}`, call)
+  }
+
+  /**
+   * 桌面回合的虚拟 call：没有手机消息来源，但 assistant/tool/done 事件要有一个
+   * callId 才能在手机上渲染成一条回复。
+   * @param {string} sessionId
+   * @param {number|undefined} turn
+   * @returns {any | undefined}
+   */
+  #ensureDesktopCall(sessionId, turn) {
+    if (turn === undefined || turn === null) return undefined
+    const key = `${sessionId}:${turn}`
+    const existing = this.turnCalls.get(key)
+    if (existing) return existing
+    const call = {
+      callKey: `desk:${key}`,
+      deviceId: '',
+      callId: `desk_${turn}`,
+      sessionId,
+      text: '',
+      messages: new Map(),
+      messageOrder: [],
+      seenSteps: new Set(),
+      toolCalls: new Set(),
+      startedAt: this.now(),
+      files: undefined,
+      turn,
+      desktop: true,
+    }
+    this.calls.set(call.callKey, call)
+    this.turnCalls.set(key, call)
+    bridgeDiagnostic(`bridge: 桌面回合 ${key} 建立虚拟 call，开始同步给手机`)
+    this.emit({ kind: 'typing', sessionId, deviceId: '', callId: call.callId, active: true })
+    return call
   }
 
   /** @param {string} sessionId @param {any} event */
@@ -1369,6 +1437,18 @@ export class DshBridge {
     if (data?.turn !== undefined) {
       const mapped = this.turnCalls.get(`${sessionId}:${data.turn}`)
       if (mapped) return mapped
+      // turn/start 漏了但队列里还有手机消息：先补给这条消息，别误建桌面 call。
+      const queue = this.pendingCalls.get(sessionId)
+      const queued = queue?.[0]
+      if (queued) {
+        queue.shift()
+        queued.turn = data.turn
+        this.turnCalls.set(`${sessionId}:${data.turn}`, queued)
+        return queued
+      }
+      // 桌面端的回合：补虚拟 call，否则回复永远同步不到手机。
+      const desktop = this.#ensureDesktopCall(sessionId, data.turn)
+      if (desktop) return desktop
     }
     let latest
     for (const call of this.calls.values()) {

@@ -1734,6 +1734,21 @@ export class Gateway {
         const frame = { t: SERVER_FRAME.TYPING, callId: event.callId, active: event.active !== false }
         return this.#broadcastToConversation(conversationId, frame) > 0
       }
+      case 'user-message': {
+        // 桌面端发起的用户消息：实时同步到手机上（手机自己的消息由本地乐观气泡 +
+        // chat/echo 负责，不会走这里）。
+        const messageId = String(event.messageId ?? '')
+        if (messageId === '') return false
+        const frame = {
+          t: SERVER_FRAME.CHAT_ECHO,
+          msgId: `dsh_${messageId}`,
+          text: String(event.text ?? ''),
+          files: [],
+          at: new Date(Number.isFinite(Number(event.at)) ? Number(event.at) : Date.now()).toISOString(),
+        }
+        const recorded = this.#appendEvent(conversationId, frame)
+        return this.#broadcastToConversation(conversationId, recorded) > 0
+      }
       case 'message': {
         const text = String(event.text ?? '')
         const index = Number.isFinite(event.index) ? Number(event.index) : 0

@@ -1049,6 +1049,55 @@ test('an approval nobody answers is handed back to the desktop after the window'
   assert.equal(resolved.source, 'timeout')
 })
 
+test('desktop user messages are forwarded live, phone-injected and runtime ones are not', async () => {
+  const { bridge, fake, events } = makeBridge()
+  const { sessionId } = await bridge.createSession('dev_a')
+  const session = { id: sessionId }
+  const userEvent = (text, source, id) => ({
+    type: 'user/message',
+    time: 1700000000000,
+    data: { id, role: 'user', source, content: [{ type: 'text', text }] },
+  })
+
+  // 桌面 GUI 发的：source 带 rpcId → 同步给手机。
+  fake.fire(session, userEvent('电脑上发的', { kind: 'user', rpcId: 'r1', clientTimeZone: 'Asia/Shanghai' }, 'm1'))
+  const forwarded = events.filter(event => event.kind === 'user-message')
+  assert.equal(forwarded.length, 1)
+  assert.equal(forwarded[0].text, '电脑上发的')
+  assert.equal(forwarded[0].messageId, 'm1')
+  assert.equal(forwarded[0].at, 1700000000000)
+  assert.equal(forwarded[0].sessionId, sessionId)
+
+  // 手机自己发的（本插件注入，没有 rpcId）：手机本地已有气泡，不能重复转发。
+  fake.fire(session, userEvent('手机发的', { kind: 'user' }, 'm2'))
+  // runtime context 之类的内部注入：不是用户消息。
+  fake.fire(session, userEvent('Current runtime context: x', { kind: 'runtime-context' }, 'm3'))
+  assert.equal(events.filter(event => event.kind === 'user-message').length, 1)
+})
+
+test('a desktop turn is mirrored to the phone as a normal assistant reply', async () => {
+  const { bridge, fake, events } = makeBridge()
+  const { sessionId } = await bridge.createSession('dev_a')
+  const session = { id: sessionId }
+
+  fake.fire(session, { type: 'turn/start', time: 1, data: { turn: 3 } })
+  fake.fire(session, {
+    type: 'assistant/message',
+    time: 2,
+    data: { turn: 3, step: 1, message: { id: 'am_1', content: [{ type: 'text', text: '桌面上的回复' }] } },
+  })
+  fake.fire(session, { type: 'turn/end', time: 3, data: { turn: 3, reason: { kind: 'completed' } } })
+
+  const message = events.find(event => event.kind === 'message')
+  assert.ok(message, 'desktop turns must emit a chat message to the phone')
+  assert.equal(message.text, '桌面上的回复')
+  assert.equal(message.sessionId, sessionId)
+  assert.match(message.callId, /^desk_/, 'desktop turns use a synthetic call id')
+  const done = events.find(event => event.kind === 'done')
+  assert.ok(done)
+  assert.equal(done.text, '桌面上的回复')
+})
+
 test('harness-injected user messages never become blue bubbles', () => {
   // runtime context / skill catalog 都是 DSH 内部注入的 user/message，必须过滤掉。
   const injected = historyMessageOf({

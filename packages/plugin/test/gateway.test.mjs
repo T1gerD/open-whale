@@ -2171,6 +2171,28 @@ test('closing a tab is client-side; unbinding still releases everything it used'
 // v3.0.0: structured questions — ask_user_question / plan review on the phone
 // ---------------------------------------------------------------------------
 
+test('a desktop user message is echoed to the phone that is watching the conversation', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client, ack } = await pairDevice(port, device, { capabilities: [CAPABILITIES.SESSION_SYNC] })
+
+  gateway.pushEvent({
+    kind: 'user-message',
+    sessionId: ack.sessionId,
+    messageId: 'dsh-msg-1',
+    text: '电脑上发的消息',
+    at: Date.now(),
+  })
+
+  const echo = await client.waitFor(f => f.t === 'chat/echo')
+  assert.ok(echo, 'the phone must receive the desktop message live')
+  assert.equal(echo.msgId, 'dsh_dsh-msg-1')
+  assert.equal(echo.text, '电脑上发的消息')
+  assert.equal(echo.sessionId, ack.sessionId)
+  client.close()
+})
+
 test('a question is pushed to a capable device with its routing session', async t => {
   const { gateway, port } = await makeGateway()
   t.after(() => gateway.close())
