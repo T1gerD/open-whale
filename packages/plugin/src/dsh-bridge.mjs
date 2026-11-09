@@ -405,9 +405,11 @@ export class DshBridge {
     // 协议里只有三种答复：允许这一次、拒绝、以及「转到电脑端」（delegate）。
     // 以前把 delegate 一并折成 rejected，导致手机上点「转到电脑」实际是拒绝
     // 这次工具调用——桌面根本不会弹窗。
-    this.#settleApproval(approvalId, APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (input?.outcome))
-      ? input.outcome
-      : 'rejected')
+    const outcome = APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (input?.outcome))
+      ? /** @type {string} */ (input.outcome)
+      : 'rejected'
+    this.#settleApproval(approvalId, outcome)
+    this.log(`approval: ${approvalId} 手机答复 → ${outcome}`)
     return true
   }
 
@@ -565,10 +567,12 @@ export class DshBridge {
       }
     })
     this.emit(payload)
+    this.log(`approval: 请求 ${approvalId} session=${sessionId} 设备=${devices.join(',')} 工具=${payload.toolName}`)
 
     const decision = await decisionPromise
     if (decision === 'delegate') {
       // 用户主动把这次审批转给电脑端：不代替桌面作答，直接 next() 交给桌面 UI。
+      this.log(`approval: ${approvalId} 转交电脑 → next()`)
       this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: 'delegated', source: 'phone' })
       return next()
     }
@@ -577,6 +581,7 @@ export class DshBridge {
       return decision
     }
     // 超时 / 中止：给已经发出去的卡片补一条 resolved，手机据此关掉它。
+    this.log(`approval: ${approvalId} 未答复（${decision}）→ 交回桌面`)
     this.emit({
       kind: 'approval-resolved',
       sessionId,

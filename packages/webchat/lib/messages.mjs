@@ -952,11 +952,13 @@ export class ChatModel {
     if (!approval) return { handled: true, changed: false, frame }
     const existing = this.approvalsById.get(approval.approvalId)
     if (existing) {
-      Object.assign(existing, approval, {
-        replied: existing.replied === true,
-        repliedOutcome: existing.repliedOutcome,
-        repliedAt: existing.repliedAt,
-      })
+      // 电脑端重新推送同一个 approvalId，说明它**仍然在等答复**：上一次答复
+      // 没被接收（手机掉线 / 页面被系统挂起）。清掉本地「已答复」，让用户能
+      // 重新点，而不是停在一张点不动、电脑却在等的卡上。
+      existing.replied = false
+      delete existing.repliedOutcome
+      delete existing.repliedAt
+      Object.assign(existing, approval)
       this.#touch(now)
       return { handled: true, changed: true, frame, approval: existing }
     }

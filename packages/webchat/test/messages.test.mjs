@@ -315,6 +315,18 @@ test('审批：resolved 只移除对应那条，且不影响已回复标记', ()
   assert.deepEqual(model.approvals.map(item => item.approvalId), ['ap_2'])
 })
 
+test('审批：电脑端重发同一个 approvalId 会清掉本地「已答复」（上次答复可能没送达）', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash', reason: '写文件' })
+  assert.equal(model.markApprovalReplied('ap_1', 'delegate'), true)
+
+  const again = model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash', reason: '写文件' })
+  assert.equal(model.approvals.length, 1, '重发仍是一张卡，不插新卡')
+  assert.equal(again.approval.replied, false, '电脑端还在等答复，必须让用户能重新点')
+  assert.equal(again.approval.repliedOutcome, undefined)
+  assert.equal(model.markApprovalReplied('ap_1', 'allowed-once'), true, '重新点一次要能发出去')
+})
+
 test('审批：切会话不再清空待答审批（切回来还要能答）', () => {
   const model = makeModel()
   model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })

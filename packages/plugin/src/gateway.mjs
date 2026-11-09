@@ -1488,6 +1488,7 @@ export class Gateway {
       deviceId: /** @type {string} */ (session.deviceId),
       outcome,
     }) === true
+    this.log(`approval: 收到手机作答 ${approvalId}（device=${session.deviceId} outcome=${outcome} accepted=${accepted}）`)
     if (!accepted) this.log(`approval: 忽略已失效的作答 ${approvalId}`)
     return undefined
   }
@@ -1815,9 +1816,11 @@ export class Gateway {
           ...(event.callId !== undefined ? { callId: event.callId } : {}),
           expiresAt: event.expiresAt,
         }
-        return this.#broadcastToConversation(conversationId, frame, {
+        const delivered = this.#broadcastToConversation(conversationId, frame, {
           requireCapability: CAPABILITIES.APPROVAL,
-        }) > 0
+        })
+        this.log(`approval: 推送 ${event.approvalId} → 会话 ${conversationId}，送达设备 ${delivered} 台`)
+        return delivered > 0
       }
       case 'approval-resolved':
         return this.#broadcastToConversation(conversationId, {

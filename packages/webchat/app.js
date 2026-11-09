@@ -175,6 +175,10 @@ const state = {
   pendingSnapshots: new Map(),
   /** 审批倒计时定时器（有带 expiresAt 的待办审批时才跑）。 */
   approvalTicker: null,
+  /** 已发出但还没等到 approval/resolved 的答复：approvalId → {outcome, attempts}。 */
+  approvalReplies: new Map(),
+  /** 答复重发定时器。 */
+  approvalReplyTimer: null,
   lastRenderSignature: '',
   lastTabsSignature: '',
   lastActiveTabId: '',
@@ -863,6 +867,9 @@ function handleOnline(ack, context) {
   sendTabWatch()
   requestTabSnapshots()
   flushOutbox()
+  // 掉线/锁屏期间没送达的审批答复，连上就补发。
+  flushApprovalReplies()
+  syncApprovalReplyRetry()
   scheduleSessionSync()
   renderTabs()
   renderHeader()
@@ -1375,6 +1382,58 @@ function updateApprovalCountdowns() {
   if (!live) stopApprovalTicker()
 }
 
+/** 审批答复没等到 approval/resolved 时的重发节奏。
+ *
+ * 手机锁屏/切后台时 WebSocket 会被系统挂起，点「转到电脑」那一帧可能根本没
+ * 发出去（旧版会一直显示「已转交」而电脑还在等）。这里把答复当成待确认状态：
+ * 直到收到 resolved 之前定时重发，重连时立刻补发；电脑端对重复作答是幂等的。
+ */
+const APPROVAL_REPLY_RETRY_MS = 2500
+const APPROVAL_REPLY_MAX_ATTEMPTS = 20
+
+/** 把一条审批答复发给电脑；只有该请求仍在待办且仍标记为已答时才发。
+ * @param {string} approvalId
+ * @param {string} outcome
+ * @returns {boolean}
+ */
+function sendApprovalReply(approvalId, outcome) {
+  if (!state.connection?.online) return false
+  const approval = state.model?.findApproval?.(approvalId)
+  if (!approval || approval.replied !== true) return false
+  state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
+  return true
+}
+
+/** 重连后立刻补发所有还没被确认的答复。 */
+function flushApprovalReplies() {
+  for (const [approvalId, entry] of state.approvalReplies) {
+    sendApprovalReply(approvalId, entry.outcome)
+  }
+}
+
+/** 起停答复重发定时器（没有待确认答复时不留 timer）。 */
+function syncApprovalReplyRetry() {
+  if (state.approvalReplyTimer !== null) {
+    clearInterval(state.approvalReplyTimer)
+    state.approvalReplyTimer = null
+  }
+  if (state.approvalReplies.size === 0) return
+  state.approvalReplyTimer = setInterval(() => {
+    for (const [approvalId, entry] of [...state.approvalReplies]) {
+      entry.attempts += 1
+      if (entry.attempts > APPROVAL_REPLY_MAX_ATTEMPTS) {
+        state.approvalReplies.delete(approvalId)
+        continue
+      }
+      if (!sendApprovalReply(approvalId, entry.outcome)) state.approvalReplies.delete(approvalId)
+    }
+    if (state.approvalReplies.size === 0 && state.approvalReplyTimer !== null) {
+      clearInterval(state.approvalReplyTimer)
+      state.approvalReplyTimer = null
+    }
+  }, APPROVAL_REPLY_RETRY_MS)
+}
+
 /** @param {string} approvalId @param {'allowed-once'|'rejected'} outcome */
 function replyApproval(approvalId, outcome) {
   const model = state.model
@@ -1384,7 +1443,9 @@ function replyApproval(approvalId, outcome) {
     return
   }
   if (!model.markApprovalReplied(approvalId, outcome)) return
-  state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
+  state.approvalReplies.set(approvalId, { outcome, attempts: 0 })
+  sendApprovalReply(approvalId, outcome)
+  syncApprovalReplyRetry()
   scheduleRender()
   syncApprovalTicker()
   showToast(
@@ -1733,6 +1794,9 @@ function targetApprovalsCount(frame) {
 function handleApprovalResolved(resolved) {
   syncApprovalTicker()
   if (!resolved) return
+  // 电脑端确认了这条答复（或它在别处被处理）：停止重发。
+  state.approvalReplies.delete(resolved.approvalId)
+  syncApprovalReplyRetry()
   // 后台标签的请求被电脑处理掉时也给一句，但只在当前标签才需要「你答的」语气。
   const title = resolved.sessionId ? state.model?.titleFor(resolved.sessionId) : ''
   const label = resolved.sessionId && resolved.sessionId !== state.model?.activeSessionId ? `「${title}」的` : '这条'
