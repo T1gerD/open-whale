@@ -2037,7 +2037,8 @@ async function sendComposer() {
 
   // 生成中（或上一条排队项正在发出）：先排到输入框上方的本地队列，
   // 用户可以编辑 / 删除 / 插队发送；本轮结束后自动按序发出。
-  if (state.model.activeCallId || state.flushing) {
+  const busy = Boolean(state.model.activeCallId) || state.model.isTyping === true
+  if (busy || state.flushing) {
     state.queue.push({ id: uid('q'), text, attachments })
     dom.composerInput.value = ''
     autosizeInput()
@@ -2123,15 +2124,29 @@ async function deliverMessage(text, attachments) {
 }
 
 /** 输入框上方的排队区：文本预览 + 插队发送 / 编辑 / 删除。 */
+function ensureQueueHost() {
+  if (dom.messageQueue) return dom.messageQueue
+  const wrap = document.getElementById('composer-wrap')
+  if (!wrap) return null
+  const host = document.createElement('div')
+  host.className = 'message-queue'
+  host.id = 'message-queue'
+  host.hidden = true
+  wrap.insertBefore(host, wrap.firstChild)
+  dom.messageQueue = host
+  return host
+}
+
 function renderQueue() {
-  if (!dom.messageQueue) return
+  const host = ensureQueueHost()
+  if (!host) return
   const list = state.queue
-  dom.messageQueue.hidden = list.length === 0
+  host.hidden = list.length === 0
   if (list.length === 0) {
-    dom.messageQueue.innerHTML = ''
+    host.innerHTML = ''
     return
   }
-  dom.messageQueue.innerHTML = list
+  host.innerHTML = list
     .map(entry => {
       const preview = entry.text !== '' ? entry.text : '（仅附件）'
       const meta = entry.attachments.length > 0 ? `${entry.attachments.length} 个附件` : ''
