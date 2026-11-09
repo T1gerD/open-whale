@@ -1397,8 +1397,9 @@ const APPROVAL_REPLY_MAX_ATTEMPTS = 20
  * @returns {boolean}
  */
 function sendApprovalReply(approvalId, outcome) {
-  const approval = state.model?.findApproval?.(approvalId)
-  if (!approval || approval.replied !== true) return 'gone'
+  // 不在这里查模型：审批对象可能已经换了引用/被移到别的标签，查询失败会把
+  // 一次真实点击静默丢掉（真机上复现为「点了没反应」）。重发是否该停由
+  // approval/resolved 或重试次数决定。
   if (!state.connection?.online) return 'offline'
   const sent = state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
   return sent === false ? 'offline' : 'sent'
@@ -1407,7 +1408,7 @@ function sendApprovalReply(approvalId, outcome) {
 /** 重连后立刻补发所有还没被确认的答复。 */
 function flushApprovalReplies() {
   for (const [approvalId, entry] of state.approvalReplies) {
-    if (sendApprovalReply(approvalId, entry.outcome) === 'gone') state.approvalReplies.delete(approvalId)
+    sendApprovalReply(approvalId, entry.outcome)
   }
 }
 
@@ -1425,7 +1426,7 @@ function syncApprovalReplyRetry() {
         state.approvalReplies.delete(approvalId)
         continue
       }
-      if (sendApprovalReply(approvalId, entry.outcome) === 'gone') state.approvalReplies.delete(approvalId)
+      sendApprovalReply(approvalId, entry.outcome)
     }
     if (state.approvalReplies.size === 0 && state.approvalReplyTimer !== null) {
       clearInterval(state.approvalReplyTimer)
@@ -1434,25 +1435,31 @@ function syncApprovalReplyRetry() {
   }, APPROVAL_REPLY_RETRY_MS)
 }
 
-/** @param {string} approvalId @param {'allowed-once'|'rejected'} outcome */
+/** 处理一次审批按钮点击：标记已答、发 approval/reply，并在没发出去时提示+自动重试。 */
 function replyApproval(approvalId, outcome) {
   const model = state.model
-  if (!model) return
-  if (!state.connection?.online) {
-    showToast('还没连上电脑，无法回答这条请求', 'error')
+  if (!model) {
+    showToast('界面还没就绪，请刷新页面重试', 'error', 6000)
     return
   }
-  if (!model.markApprovalReplied(approvalId, outcome)) return
+  if (!state.connection?.online) {
+    showToast('当前显示离线，答复没发出去，正在重试', 'error', 6000)
+    return
+  }
+  if (!model.markApprovalReplied(approvalId, outcome)) {
+    showToast('这条审批已经处理过（或已失效），请下拉刷新页面', 'error', 6000)
+    return
+  }
   state.approvalReplies.set(approvalId, { outcome, attempts: 0 })
-  sendApprovalReply(approvalId, outcome)
+  const sent = sendApprovalReply(approvalId, outcome)
   syncApprovalReplyRetry()
   scheduleRender()
   syncApprovalTicker()
-  showToast(
-    outcome === 'allowed-once' ? '已允许这一次调用' : outcome === 'delegate' ? '已转到电脑端处理' : '已拒绝这次调用',
-    'ok',
-    2200,
-  )
+  if (sent === 'sent') {
+    showToast(outcome === 'allowed-once' ? '已允许这一次调用（等待电脑确认）' : '已拒绝这次调用（等待电脑确认）', 'ok', 3200)
+  } else {
+    showToast('答复没发出去（连接异常），正在自动重试', 'error', 6000)
+  }
 }
 
 /**
