@@ -380,12 +380,13 @@ test('localStorage 快照往返：消息 / cursor / 会话标题 / 待发状态'
   assert.equal(restored.restoreFromStorage({ messages: 'nope' }), false)
 })
 
-test('渲染顺序保持追加 / 快照给定顺序（不做时间重排）', () => {
+test('消息按时间排序（与电脑端一致，不回放顺序错乱）', () => {
   const model = makeModel()
   model.addLocalUserMessage({ msgId: 'm1', text: '甲', at: '2026-10-26T12:00:00.000Z' })
   model.applyFrame({ t: 'chat/message', callId: 'c1', messageId: 'a1', index: 0, text: '乙', seq: 1 })
+  // 回放来的一条更早的消息（11:00）应排在「甲」前面，而不是被追加到最后。
   model.applyFrame({ t: 'chat/echo', msgId: 'm2', deviceId: 'dev_b', text: '丙', at: '2026-10-26T11:00:00.000Z', seq: 2 })
-  assert.deepEqual(model.messages.filter(item => item.kind !== 'assistant').map(item => item.text), ['甲', '丙'])
+  assert.deepEqual(model.messages.filter(item => item.kind !== 'assistant').map(item => item.text), ['丙', '甲'])
 })
 
 test('消息上限会裁掉最旧的消息（手机内存有限）', () => {
@@ -512,4 +513,23 @@ test('injected runtime-context bubbles are dropped from cached history', () => {
   assert.equal(isInjectedHistoryText('<system-reminder>x</system-reminder>'), true)
   assert.equal(isInjectedHistoryText('Current runtime context: none.'), true)
   assert.equal(isInjectedHistoryText('你好'), false)
+})
+
+
+test('snapshot messages are sorted by time so the phone matches the desktop', () => {
+  const model = makeModel()
+  const t0 = Date.parse('2026-11-09T11:40:00.000Z')
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 's1',
+    sessionEpoch: 1,
+    snapshot: {
+      messages: [
+        { id: 'a1', kind: 'assistant', text: '回复', at: new Date(t0 + 2000).toISOString() },
+        { id: 'u1', kind: 'user', text: '提问', at: new Date(t0).toISOString() },
+        { id: 'a2', kind: 'assistant', text: '再回复', at: new Date(t0 + 5000).toISOString() },
+      ],
+    },
+  }, t0 + 6000)
+  assert.deepEqual(model.messages.map(message => message.text), ['提问', '回复', '再回复'])
 })

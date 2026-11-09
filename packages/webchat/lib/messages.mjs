@@ -388,12 +388,22 @@ export class ChatModel {
    * @param {any} message
    * @returns {boolean}
    */
+  /** 按时间稳定排序：快照/回放/乐观消息混在一起时，保证气泡顺序与电脑端一致。 */
+  #sortByTime() {
+    this.messages.sort((left, right) => {
+      const a = Date.parse(left?.at ?? '') || 0
+      const b = Date.parse(right?.at ?? '') || 0
+      return a - b
+    })
+  }
+
   #insert(message) {
     if (!message?.id || this.byId.has(message.id)) return false
     // 内部注入（runtime context / system-reminder）永远不当聊天气泡展示。
     if (message.kind === 'user' && isInjectedHistoryText(message.text)) return false
     this.byId.set(message.id, message)
     this.messages.push(message)
+    this.#sortByTime()
     this.#trim()
     return true
   }
@@ -854,6 +864,9 @@ export class ChatModel {
       if (activeCall.typing !== false) this.typing.add(activeCall.callId)
     }
     this.messages = nextMessages.slice(-this.limit)
+    // 快照里的消息可能不是严格按时间排的（回放/乐观消息混入），统一按时间排，
+    // 否则手机会出现「我的提问排在回复后面」（真机反馈：和电脑端顺序不一致）。
+    this.#sortByTime()
     this.byId = new Map(this.messages.map(message => [message.id, message]))
     this.parts.clear()
     this.deltaSeq.clear()
