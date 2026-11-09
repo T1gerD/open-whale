@@ -2,12 +2,12 @@
 //
 // 关键约束（都来自冻结契约，别在这里“优化”）：
 //  * `allowed-once` 只授权这一次工具调用，**不会**提升沙箱模式；
-//  * 电脑端等 60 秒（APPROVAL_TIMEOUT_MS）没答就把审批交给桌面 UI，但手机卡片
-//    保留并标记 `onDesktop`：手机仍可作答把审批转回手机（先答先算）；
+//  * 电脑端等 `APPROVAL_TIMEOUT_MS`，超时就把提示交回桌面，所以手机端的倒计时
+//    是“电脑会代答”的时刻，不是“请求失效”的时刻；
 //  * 同时可能有多条 ask 在等（不同工具/不同回合），队列必须按 approvalId 去重，
 //    后到的不能覆盖先到的，否则用户会看不到正在等的那一条。
 
-import { APPROVAL_REPLY_OUTCOMES, CAPABILITIES, CLIENT_FRAME } from './frames.mts'
+import { APPROVAL_REPLY_OUTCOMES, APPROVAL_TIMEOUT_MS, CAPABILITIES, CLIENT_FRAME } from './frames.mts'
 
 /** `displayReason` 是「语言 → 文案」的映射，protocol 保证至少有 `en`。 */
 export type ApprovalDisplayReason = { en: string; [locale: string]: string }
@@ -25,8 +25,6 @@ export interface ApprovalPrompt {
   callId?: string
   /** Unix 毫秒：电脑端到这个时刻会把提示交回桌面 UI。 */
   expiresAt?: number
-  /** 电脑端已弹出这条审批；手机仍可作答，先答先算。 */
-  onDesktop?: boolean
   /** 收到这条请求的本地时间（排序/提示用）。 */
   receivedAt: number
 }
@@ -44,7 +42,6 @@ export interface ApprovalAskFrameLike {
   displayReason?: unknown
   callId?: unknown
   expiresAt?: unknown
-  onDesktop?: unknown
 }
 
 export interface ApprovalReplyFrame {
@@ -69,7 +66,6 @@ export function normalizeApprovalAsk(frame: ApprovalAskFrameLike, now: number = 
   if (typeof frame.callId === 'string' && frame.callId !== '') prompt.callId = frame.callId
   const expiresAt = toMillis(frame.expiresAt)
   if (expiresAt !== undefined) prompt.expiresAt = expiresAt
-  if (frame.onDesktop === true) prompt.onDesktop = true
   return prompt
 }
 

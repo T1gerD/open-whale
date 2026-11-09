@@ -319,9 +319,7 @@ export interface ApprovalAskFrame {
   displayReason?: { en: string; [locale: string]: string }
   callId?: string
   /** Unix 毫秒：到点电脑端把提示交回桌面。 */
-  expiresAt?: number
-  /** 电脑端已弹出这条审批；手机仍可作答（先答先算）。 */
-  onDesktop?: boolean
+  expiresAt: number
 }
 
 /** 那条请求已经被处理（手机/电脑/超时）。 */

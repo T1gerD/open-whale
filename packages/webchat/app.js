@@ -179,8 +179,6 @@ const state = {
   approvalReplies: new Map(),
   /** 答复重发定时器。 */
   approvalReplyTimer: null,
-  /** 已从桌面「转到手机处理」的审批 id（只影响前端展开，不额外发包）。 */
-  pulledApprovals: new Set(),
   lastRenderSignature: '',
   lastTabsSignature: '',
   lastActiveTabId: '',
@@ -1399,17 +1397,17 @@ const APPROVAL_REPLY_MAX_ATTEMPTS = 20
  * @returns {boolean}
  */
 function sendApprovalReply(approvalId, outcome) {
-  if (!state.connection?.online) return false
   const approval = state.model?.findApproval?.(approvalId)
-  if (!approval || approval.replied !== true) return false
-  state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
-  return true
+  if (!approval || approval.replied !== true) return 'gone'
+  if (!state.connection?.online) return 'offline'
+  const sent = state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
+  return sent === false ? 'offline' : 'sent'
 }
 
 /** 重连后立刻补发所有还没被确认的答复。 */
 function flushApprovalReplies() {
   for (const [approvalId, entry] of state.approvalReplies) {
-    sendApprovalReply(approvalId, entry.outcome)
+    if (sendApprovalReply(approvalId, entry.outcome) === 'gone') state.approvalReplies.delete(approvalId)
   }
 }
 
@@ -1427,7 +1425,7 @@ function syncApprovalReplyRetry() {
         state.approvalReplies.delete(approvalId)
         continue
       }
-      if (!sendApprovalReply(approvalId, entry.outcome)) state.approvalReplies.delete(approvalId)
+      if (sendApprovalReply(approvalId, entry.outcome) === 'gone') state.approvalReplies.delete(approvalId)
     }
     if (state.approvalReplies.size === 0 && state.approvalReplyTimer !== null) {
       clearInterval(state.approvalReplyTimer)
@@ -1465,27 +1463,17 @@ function replyApproval(approvalId, outcome) {
 function approvalCardHtml(approval) {
   const expired = approvalExpired(approval)
   const replied = approval.replied === true
-  const onDesktop = approval.onDesktop === true
   const disabled = expired || replied
   const classes = ['approval-card']
   if (expired) classes.push('is-expired')
   if (replied) classes.push('is-replied')
-  if (onDesktop && !replied) classes.push('is-on-desktop')
   const reason = escapeHtml(approvalReasonText(approval))
   const tool = escapeHtml(approval.toolName ?? '工具')
-  // 60 秒没答 / 手机当时不在线 → 电脑端已经弹出同一条审批。手机这边按钮照常可点：
-  // 直接允许/拒绝就等于把审批「转到手机」作答（谁先答谁算），不需要先点一次转移。
   let foot = ''
   if (replied) {
     foot = `<p class="approval-state">${
-      approval.repliedOutcome === 'allowed-once'
-        ? '已允许（等待电脑确认）'
-        : approval.repliedOutcome === 'delegate'
-          ? '已转交电脑处理'
-          : '已拒绝（等待电脑确认）'
+      approval.repliedOutcome === 'allowed-once' ? '已允许（等待电脑确认）' : '已拒绝（等待电脑确认）'
     }</p>`
-  } else if (onDesktop) {
-    foot = '<p class="approval-state">电脑端也弹出了这条审批——直接点「允许一次 / 拒绝」即可在手机上作答</p>'
   }
   return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
     <div class="approval-head">
@@ -1501,9 +1489,6 @@ function approvalCardHtml(approval) {
       <button class="btn btn-danger approval-deny" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
         approval.approvalId,
       )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
-      <button class="btn approval-delegate" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
-        approval.approvalId,
-      )}" data-outcome="delegate" ${disabled || onDesktop ? 'disabled' : ''}>转到电脑</button>
     </div>
   </div>`
 }
@@ -1803,7 +1788,6 @@ function handleApprovalResolved(resolved) {
   if (!resolved) return
   // 电脑端确认了这条答复（或它在别处被处理）：停止重发。
   state.approvalReplies.delete(resolved.approvalId)
-  state.pulledApprovals.delete(resolved.approvalId)
   syncApprovalReplyRetry()
   // 后台标签的请求被电脑处理掉时也给一句，但只在当前标签才需要「你答的」语气。
   const title = resolved.sessionId ? state.model?.titleFor(resolved.sessionId) : ''
@@ -2390,9 +2374,6 @@ function messageSignature() {
   hash = (hash * 31 + state.model.approvals.length) % 1_000_000_007
   for (const approval of state.model.approvals) {
     hash = (hash * 31 + approval.approvalId.length + (approval.replied ? 7 : 3)) % 1_000_000_007
-    // 「已在电脑端 / 已转到手机」都改变卡片形态，必须进签名，否则点按钮不重绘。
-    hash = (hash * 31 + (approval.onDesktop ? 11 : 5)) % 1_000_000_007
-    hash = (hash * 31 + (state.pulledApprovals.has(approval.approvalId) ? 13 : 17)) % 1_000_000_007
   }
   // 提问卡片同理：批次、题目数量、是否已提交都影响渲染。
   hash = (hash * 31 + state.model.questions.length) % 1_000_000_007

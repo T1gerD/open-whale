@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: bdebfa6e6b84a2231c903a92f6c44cea944e365c2631b9e7a69cb56762830ae5
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: f008410a2e1651d9d6663b085745c112393b30883bf4e772ba0147030527cb60
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -548,22 +548,14 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {string} [reason]     Machine reason the computer logged.
  * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
  * @property {string} [callId]     The chat turn this prompt belongs to, when known.
- * @property {number} [expiresAt]  Unix ms after which the computer hides the card.
- *                                 Kept for old clients; the computer now moves the
- *                                 prompt to the desktop UI after `APPROVAL_TIMEOUT_MS`
- *                                 and marks the card `onDesktop` instead.
- * @property {boolean} [onDesktop] The prompt is now also showing on the desktop UI
- *                                 (60s unanswered, or no phone online when it was
- *                                 raised). The phone may still answer it and take the
- *                                 prompt back — whoever answers first wins.
+ * @property {number} [expiresAt]  Unix ms after which the computer falls back to the desktop.
  */
 
 /**
  * @typedef {object} ApprovalReplyFrame
  * @property {'approval/reply'} t
  * @property {string} approvalId
- * @property {'allowed-once'|'rejected'|'delegate'} outcome  `allowed-once` grants exactly
- *           this one call; `delegate` hands it to the desktop UI.
+ * @property {'allowed-once'|'rejected'|'delegate'} outcome  `allowed-once` grants exactly this one call.
  */
 
 /**

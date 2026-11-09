@@ -321,7 +321,6 @@ export async function apply(ctx, config) {
       // 刷新/重连后把还没答的审批再推一次。
       pendingApprovals: sessionId => bridge.pendingApprovals(sessionId),
       // 重连时补发最近结束的审批，清掉已经失效的卡片。
-      recentResolutions: sessionId => bridge.recentResolutions(sessionId),
       // 结构化提问（ask_user_question / 计划审阅）的作答，与审批是两条 seam。
       answerQuestion: input => bridge.answerQuestion(input),
       releaseSession: sessionId => bridge.releaseSession(sessionId),

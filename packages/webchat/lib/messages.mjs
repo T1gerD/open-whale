@@ -206,7 +206,6 @@ export function normalizeApproval(raw, now = Date.now()) {
     ...(displayReason !== '' ? { displayReason } : {}),
     ...(typeof raw.callId === 'string' && raw.callId !== '' ? { callId: raw.callId } : {}),
     ...(Number.isFinite(expiresAt) && expiresAt > 0 ? { expiresAt } : {}),
-    ...(raw.onDesktop === true ? { onDesktop: true } : {}),
     at: new Date(now).toISOString(),
     /** 本地是否已经点过按钮（避免连点；电脑端 pending 期间不重发）。 */
     replied: false,

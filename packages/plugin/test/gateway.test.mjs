@@ -52,8 +52,6 @@ function makeBridge() {
     answerResult: true,
     /** @type {(sessionId: string) => any[]} */
     pendingApprovals: () => [],
-    /** @type {(sessionId: string) => any[]} */
-    recentResolutions: () => [],
     /** Set by the test to inspect the last bridge.send input. */
     lastSend: undefined,
     /** @type {any} */
@@ -99,8 +97,6 @@ function makeBridge() {
     },
     /** 待答审批：重连/刷新后网关应重发。 */
     pendingApprovals: sessionId => harness.pendingApprovals(sessionId),
-    /** 最近结束的审批：重连时补 resolved，清掉失效卡片。 */
-    recentResolutions: sessionId => harness.recentResolutions(sessionId),
     releaseSession: async sessionId => { releasedSessions.push(sessionId) },
     onEvent: listener => {
       listener
@@ -1652,7 +1648,7 @@ test('an approval request is forwarded to the bound device and its answer reache
   assert.equal(ask.reason, '需要执行命令')
   assert.deepEqual(ask.displayReason, { en: 'Run a command?', zh: '要执行命令吗？' })
   assert.equal(ask.callId, 'c1')
-  assert.equal('onDesktop' in ask, false, 'a card fresh on the phone is not marked desktop')
+  assert.equal('expiresAt' in ask, false, 'the card relies on the 60s handoff, not an expiry')
 
   client.send({ t: 'approval/reply', approvalId: 'ap_1', outcome: 'allowed-once' })
   await delay(30)
@@ -2208,9 +2204,7 @@ test('a reconnecting device receives the approvals still waiting', async t => {
   const { gateway, port, harness } = await makeGateway()
   t.after(() => gateway.close())
   const device = freshDevice()
-  harness.pendingApprovals = sessionId => [{
-    approvalId: 'ap_replay', toolName: 'ops_bash', reason: '写文件', sessionId, onDesktop: true,
-  }]
+  harness.pendingApprovals = sessionId => [{ approvalId: 'ap_replay', toolName: 'ops_bash', reason: '写文件', sessionId }]
 
   const { client } = await pairDevice(port, device, {
     capabilities: [CAPABILITIES.APPROVAL, CAPABILITIES.SESSION_SYNC],
@@ -2220,27 +2214,8 @@ test('a reconnecting device receives the approvals still waiting', async t => {
   assert.equal(ask.approvalId, 'ap_replay')
   assert.equal(ask.toolName, 'ops_bash')
   assert.equal(ask.reason, '写文件')
-  assert.equal(ask.onDesktop, true, 'a card already waiting on the desktop must say so when replayed')
   assert.equal(ask.sessionId, gateway.deviceSession.get(device.deviceId))
   assert.equal('expiresAt' in ask, false, 'approvals rely on the 60s desktop handoff, not an expiry')
-  client.close()
-})
-
-test('a reconnecting device is told about approvals that ended while it was away', async t => {
-  // 审批在手机离线期间被交回桌面：重连时补一条 resolved，手机上那张点不动的卡才会消失。
-  const { gateway, port, harness } = await makeGateway()
-  t.after(() => gateway.close())
-  const device = freshDevice()
-  harness.recentResolutions = () => [{ approvalId: 'ap_done', outcome: 'cancelled', source: 'timeout' }]
-
-  const { client } = await pairDevice(port, device, {
-    capabilities: [CAPABILITIES.APPROVAL, CAPABILITIES.SESSION_SYNC],
-  })
-  const resolved = await client.waitFor(f => f.t === 'approval/resolved')
-  assert.ok(resolved, 'the stale card must be dismissed after reconnecting')
-  assert.equal(resolved.approvalId, 'ap_done')
-  assert.equal(resolved.outcome, 'cancelled')
-  assert.equal(resolved.source, 'timeout')
   client.close()
 })
 

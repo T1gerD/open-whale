@@ -124,9 +124,6 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
  *           Settle a forwarded approval with the phone's answer.
  * @property {(sessionId: string) => Array<object>} [pendingApprovals]
  *           Approvals still waiting in one conversation, replayed after a reconnect.
- * @property {(sessionId: string) => Array<{approvalId: string, outcome: string, source: string}>} [recentResolutions]
- *           Approvals that ended recently, replayed as `approval/resolved` so a phone
- *           that was offline does not keep a dead card on screen.
  * @property {(input: {questionId: string, deviceId?: string, answers: unknown}) => boolean} [answerQuestion]
  *           Settle a forwarded structured question with the phone's answers.
  * @property {(sessionId: string) => Promise<void>} [releaseSession]
@@ -1812,7 +1809,6 @@ export class Gateway {
           ...(event.reason !== undefined ? { reason: event.reason } : {}),
           ...(event.displayReason !== undefined ? { displayReason: event.displayReason } : {}),
           ...(event.callId !== undefined ? { callId: event.callId } : {}),
-          ...(event.onDesktop === true ? { onDesktop: true } : {}),
         }
         const delivered = this.#broadcastToConversation(conversationId, frame, {
           requireCapability: CAPABILITIES.APPROVAL,
@@ -1969,33 +1965,6 @@ export class Gateway {
       },
     })
     this.#replayPendingApprovals(session, conversationId)
-    this.#replayRecentResolutions(session, conversationId)
-  }
-
-  /**
-   * 重连时补发最近结束的审批结果，清掉手机/网页上那些已经点不动的卡片
-   * （比如设备离线超过宽限、电脑已把审批交回桌面）。
-   * @param {Session} session
-   * @param {string} conversationId
-   */
-  #replayRecentResolutions(session, conversationId) {
-    if (!session.hasCap(CAPABILITIES.APPROVAL)) return
-    let recent = []
-    try {
-      recent = this.bridge.recentResolutions?.(conversationId) ?? []
-    } catch (error) {
-      this.log(`approval: 读取最近审批结果失败：${/** @type {Error} */ (error).message}`)
-      return
-    }
-    for (const item of recent) {
-      session.send({
-        t: SERVER_FRAME.APPROVAL_RESOLVED,
-        sessionId: conversationId,
-        approvalId: item.approvalId,
-        outcome: item.outcome,
-        ...(item.source !== undefined ? { source: item.source } : {}),
-      })
-    }
   }
 
   /**
@@ -2025,7 +1994,6 @@ export class Gateway {
         ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
         ...(approval.displayReason !== undefined ? { displayReason: approval.displayReason } : {}),
         ...(approval.callId !== undefined ? { callId: approval.callId } : {}),
-        ...(approval.onDesktop === true ? { onDesktop: true } : {}),
       })
     }
   }
