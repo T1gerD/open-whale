@@ -1529,7 +1529,16 @@ export function isInjectedUserMessage(data) {
   if (kind !== '' && INJECTED_USER_SOURCES.has(kind)) return true
   if (typeof data?.role === 'string' && data.role !== 'user') return true
   const text = extractUserText(data)
-  return /^<system-reminder>/i.test(text) || /^Current runtime context[.:]/i.test(text)
+  // 兜底（不依赖 source 元数据）：DSH 的运行时上下文 / 系统提醒还有几种固定开头，
+  // 包括 "Time sampled while preparing turn N…" 这类按回合注入的时间信息。
+  return (
+    /^<system-reminder>/i.test(text)
+    || /^Current runtime context[.:]/i.test(text)
+    || /^Time sampled while preparing turn /i.test(text)
+    || /^Browser time zone for this request:/i.test(text)
+    || /^Elapsed since the preceding model-visible message:/i.test(text)
+    || /^The available skill catalog changed/i.test(text)
+  )
 }
 
 /** 这些 source.kind 是 harness 内部注入，不能当成用户消息展示。 */

@@ -14,6 +14,7 @@ import {
   ChatTabsModel,
   MESSAGE_STATUS,
   composerAction,
+  isInjectedHistoryText,
   assistantMessageId,
   fileMessageId,
   normalizeAttachment,
@@ -494,4 +495,21 @@ test('pendingApprovals aggregates approvals across tabs', () => {
   assert.equal(pending.length, 1)
   assert.equal(pending[0].sessionId, 'a')
   assert.equal(pending[0].approval.approvalId, 'ap_a')
+})
+
+
+test('injected runtime-context bubbles are dropped from cached history', () => {
+  const model = makeModel()
+  model.restoreFromStorage({
+    messages: [
+      { id: 'u1', kind: 'user', text: 'Time sampled while preparing turn 51, step 1: 2026-11-09T19:35:37+08:00', at: new Date(NOW).toISOString() },
+      { id: 'u2', kind: 'user', text: '<system-reminder>catalog changed</system-reminder>', at: new Date(NOW).toISOString() },
+      { id: 'u3', kind: 'user', text: '排队消息未成功', at: new Date(NOW).toISOString() },
+    ],
+  })
+  // 旧缓存里的内部注入不再恢复；真实用户消息保留。
+  assert.deepEqual(model.messages.map(message => message.text), ['排队消息未成功'])
+  assert.equal(isInjectedHistoryText('<system-reminder>x</system-reminder>'), true)
+  assert.equal(isInjectedHistoryText('Current runtime context: none.'), true)
+  assert.equal(isInjectedHistoryText('你好'), false)
 })

@@ -43,6 +43,28 @@ export const FILE_MESSAGE_PREFIX = 'file_'
 export const APPROVAL_QUEUE_LIMIT = 8
 
 /**
+ * 这条文本是不是 harness 内部注入（运行时上下文 / 系统提醒）？
+ *
+ * 服务端 bridge 已经过滤，但网页版会把聊天记录缓存在 localStorage：
+ * 之前渲染出来的旧气泡会在下次打开时恢复回来（真机反馈「仍有残余多余信息」）。
+ * 渲染/恢复/插入三处统一用这个判定兜底。
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isInjectedHistoryText(value) {
+  const text = String(value ?? '').trim()
+  if (text === '') return false
+  return (
+    /^<system-reminder>/i.test(text)
+    || /^Current runtime context[.:]/i.test(text)
+    || /^Time sampled while preparing turn /i.test(text)
+    || /^Browser time zone for this request:/i.test(text)
+    || /^Elapsed since the preceding model-visible message:/i.test(text)
+    || /^The available skill catalog changed/i.test(text)
+  )
+}
+
+/**
  * 输入区右侧按钮的决策（用户需求）：
  *  - 正在生成且输入框为空 → 「停止」；
  *  - 其余情况（含生成中但已输入文字）→ 「发送」，生成中的消息由电脑端排队。
@@ -368,6 +390,8 @@ export class ChatModel {
    */
   #insert(message) {
     if (!message?.id || this.byId.has(message.id)) return false
+    // 内部注入（runtime context / system-reminder）永远不当聊天气泡展示。
+    if (message.kind === 'user' && isInjectedHistoryText(message.text)) return false
     this.byId.set(message.id, message)
     this.messages.push(message)
     this.#trim()
@@ -1099,6 +1123,7 @@ export class ChatModel {
     for (const raw of saved.messages) {
       if (!raw || typeof raw.id !== 'string') continue
       const message = { ...raw, tools: Array.isArray(raw.tools) ? raw.tools : [] }
+      if (message.kind === 'user' && isInjectedHistoryText(message.text)) continue
       if (message.kind === 'file' && message.file?.fileId) this.files.set(message.file.fileId, message.file)
       if (this.byId.has(message.id)) continue
       this.byId.set(message.id, message)
