@@ -818,7 +818,7 @@ export const SESSION_LIST_LIMIT = 200
 export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
-export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
+export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected', 'delegate'])
 
 /**
  * How many additional sessions one device may keep live (beyond its active one).

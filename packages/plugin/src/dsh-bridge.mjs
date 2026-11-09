@@ -476,15 +476,14 @@ export class DshBridge {
     if (signal?.aborted) return next()
 
     const approvalId = randomUUID()
+    // 手机在线时审批卡常驻：不挂本地超时（用户要求「卡片不设倒计时、常驻手机端」）。
+    // 只有用户点「转到电脑」、设备全部断开或请求中止时才交回桌面。
     const expiresAt = this.now() + this.approvalTimeoutMs
     const decisionPromise = new Promise(resolve => {
       /** @type {any} */
       const entry = { resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null }
       this.approvals.set(approvalId, entry)
-      if (this.approvalTimeoutMs > 0) {
-        entry.timer = setTimeout(() => this.#settleApproval(approvalId, 'timeout'), this.approvalTimeoutMs)
-        entry.timer.unref?.()
-      }
+      // 不设本地超时：卡片常驻到用户作答 / 转电脑 / 请求中止。
       if (signal && typeof signal.addEventListener === 'function') {
         entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
         signal.addEventListener('abort', entry.onAbort, { once: true })
@@ -502,6 +501,11 @@ export class DshBridge {
     })
 
     const decision = await decisionPromise
+    if (decision === 'delegate') {
+      // 用户主动把这次审批转给电脑端：不代替桌面作答，直接 next() 交给桌面 UI。
+      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: 'delegated', source: 'phone' })
+      return next()
+    }
     if (decision === 'allowed-once' || decision === 'rejected') {
       this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: decision, source: 'phone' })
       return decision

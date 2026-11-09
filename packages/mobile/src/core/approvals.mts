@@ -30,7 +30,7 @@ export interface ApprovalPrompt {
 }
 
 /** 手机端唯一的两种答复。 */
-export type ApprovalOutcome = 'allowed-once' | 'rejected'
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'delegate'
 
 /** 同时展示/排队的最多请求数：再多说明电脑端在狂刷，全堆上来反而挡住输入栏。 */
 export const MAX_PENDING_APPROVALS = 4
@@ -98,7 +98,7 @@ export function approvalReasonText(prompt: ApprovalPrompt): string {
 export function buildApprovalReplyFrame(approvalId: unknown, outcome: unknown): ApprovalReplyFrame | undefined {
   const id = typeof approvalId === 'string' ? approvalId.trim() : ''
   if (!id) return undefined
-  const decided: ApprovalOutcome = outcome === 'allowed-once' ? 'allowed-once' : 'rejected'
+  const decided: ApprovalOutcome = outcome === 'allowed-once' ? 'allowed-once' : outcome === 'delegate' ? 'delegate' : 'rejected'
   if (!APPROVAL_REPLY_OUTCOMES.includes(decided)) return undefined
   return { t: CLIENT_FRAME.APPROVAL_REPLY, approvalId: id, outcome: decided }
 }

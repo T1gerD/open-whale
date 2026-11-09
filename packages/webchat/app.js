@@ -1387,7 +1387,11 @@ function replyApproval(approvalId, outcome) {
   state.connection.send({ t: CLIENT_FRAME.APPROVAL_REPLY, approvalId, outcome })
   scheduleRender()
   syncApprovalTicker()
-  showToast(outcome === 'allowed-once' ? '已允许这一次调用' : '已拒绝这次调用', 'ok', 2200)
+  showToast(
+    outcome === 'allowed-once' ? '已允许这一次调用' : outcome === 'delegate' ? '已转到电脑端处理' : '已拒绝这次调用',
+    'ok',
+    2200,
+  )
 }
 
 /**
@@ -1404,15 +1408,16 @@ function approvalCardHtml(approval) {
   if (replied) classes.push('is-replied')
   const reason = escapeHtml(approvalReasonText(approval))
   const tool = escapeHtml(approval.toolName ?? '工具')
+  // 卡片不设倒计时（用户要求：常驻手机端，直到作答或主动转电脑）。
   let foot = ''
   if (replied) {
     foot = `<p class="approval-state">${
-      approval.repliedOutcome === 'allowed-once' ? '已允许（等待电脑确认）' : '已拒绝（等待电脑确认）'
+      approval.repliedOutcome === 'allowed-once'
+        ? '已允许（等待电脑确认）'
+        : approval.repliedOutcome === 'delegate'
+          ? '已转交电脑处理'
+          : '已拒绝（等待电脑确认）'
     }</p>`
-  } else if (approval.expiresAt) {
-    foot = `<p class="approval-countdown" data-countdown-for="${escapeHtml(approval.approvalId)}">${escapeHtml(
-      approvalCountdownText(approval),
-    )}</p>`
   }
   return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
     <div class="approval-head">
@@ -1428,6 +1433,9 @@ function approvalCardHtml(approval) {
       <button class="btn btn-danger approval-deny" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
         approval.approvalId,
       )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
+      <button class="btn approval-delegate" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}" data-outcome="delegate" ${disabled ? 'disabled' : ''}>转到电脑</button>
     </div>
   </div>`
 }
@@ -1672,7 +1680,8 @@ function handleFrame(frame) {
     if (isActiveTarget) {
       syncApprovalTicker()
       if (targetApprovalsCount(frame) > approvalsBefore) {
-        showToast('电脑在请求权限，请在上面这张卡片里作答', '', 3200)
+        const tool = state.model?.approvals?.[0]?.toolName ?? ''
+        showToast(`电脑在请求权限${tool ? `（${tool}）` : ''}，请处理`, '', 3600)
       }
     } else if (targetApprovalsCount(frame) > approvalsBefore) {
       showToast(`「${state.model.titleFor(target)}」有一个权限请求，切到该标签处理`, '', 3600)
@@ -3054,7 +3063,8 @@ function setupChatEvents() {
       return
     }
     if (target.dataset.action === 'approval-reply') {
-      const outcome = target.dataset.outcome === 'allowed-once' ? 'allowed-once' : 'rejected'
+      const raw = target.dataset.outcome
+      const outcome = raw === 'allowed-once' ? 'allowed-once' : raw === 'delegate' ? 'delegate' : 'rejected'
       replyApproval(target.dataset.approvalId ?? '', outcome)
       return
     }

@@ -189,7 +189,7 @@ export const QUESTION_MAX_OPTIONS = 20
 export const QUESTION_MAX_TEXT = 2_000
 
 /** 手机端唯一允许的审批答复，镜像 `APPROVAL_REPLY_OUTCOMES`。 */
-export const APPROVAL_REPLY_OUTCOMES: readonly string[] = Object.freeze(['allowed-once', 'rejected'])
+export const APPROVAL_REPLY_OUTCOMES: readonly string[] = Object.freeze(['allowed-once', 'rejected', 'delegate'])
 
 /** 电源拒绝原因，镜像 `POWER_REFUSAL`。 */
 export const POWER_REFUSAL = {

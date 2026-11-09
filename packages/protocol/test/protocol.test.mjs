@@ -413,8 +413,9 @@ test('a tab bed is bounded so one client cannot watch every session', () => {
   assert.ok(SESSION_WATCH_LIMIT > 0 && SESSION_WATCH_LIMIT <= 16)
 })
 
-test('only the two approval outcomes a phone may send are accepted', () => {
-  assert.deepEqual([...APPROVAL_REPLY_OUTCOMES], ['allowed-once', 'rejected'])
+test('the approval outcomes a phone may send are bounded to allow / reject / delegate', () => {
+  // delegate：手机把这次审批主动转给电脑端处理（用户要求）。
+  assert.deepEqual([...APPROVAL_REPLY_OUTCOMES], ['allowed-once', 'rejected', 'delegate'])
 })
 
 test('the approval timeout is short enough to hand back to the desktop', () => {

@@ -239,7 +239,7 @@ export const QUESTION_MAX_OPTIONS = 20
 export const QUESTION_MAX_TEXT = 2_000
 
 /** `approval/reply` 唯一允许的两种结果；其它值电脑端按 `rejected` 处理。 */
-export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
+export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected', 'delegate'])
 
 /**
  * 一台设备除当前会话外还能保持多少个后台会话（`session/watch` 上限）。

@@ -1735,11 +1735,12 @@ pre {
   overflow-y: hidden;
   max-height: 52px;
   -webkit-overflow-scrolling: touch;
-  scrollbar-width: thin;
+  /* 不要可视滚动条：给手机一条干净的单行列表，横滑即可（用户要求删掉黑长条）。 */
+  scrollbar-width: none;
 }
 
 .attachment-tray::-webkit-scrollbar {
-  height: 4px;
+  display: none;
 }
 
 .tray-chip {
@@ -1774,11 +1775,16 @@ pre {
   border: 0;
   background: transparent;
   color: var(--text-faint);
-  width: 20px;
-  height: 20px;
+  /* 触摸目标至少 28px（用户反馈删除键不灵敏）；视觉上仍是小叉。 */
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   line-height: 1;
-  font-size: 15px;
+  font-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
 }
 
 .tray-remove:hover {

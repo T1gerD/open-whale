@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: d68ed2e454111b996865f34dafb9b95c0f23e4ab5f6085c0194034f7781183f3
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: 4240bbd0890e8d07c6804d139384a5edb74dd464f2287bd53bca5b03648301b3
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -826,7 +826,7 @@ export const SESSION_LIST_LIMIT = 200
 export const APPROVAL_TIMEOUT_MS = 60_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
-export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected'])
+export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected', 'delegate'])
 
 /**
  * How many additional sessions one device may keep live (beyond its active one).
