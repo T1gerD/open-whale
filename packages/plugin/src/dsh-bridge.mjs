@@ -41,6 +41,12 @@ import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from '
 /** Tools whose results are files rather than text. */
 const FILE_TOOL_HINTS = ['write', 'image', 'docx', 'xlsx', 'pptx', 'pdf', 'export', 'render', 'download']
 
+/** 交回桌面的审批保留多久，用于重连时给手机补一条 resolved（清掉点不动的卡片）。 */
+const RECENT_RESOLUTION_TTL_MS = 3 * 60_000
+
+/** 每个会话最多保留多少条最近的审批结果。 */
+const RECENT_RESOLUTION_LIMIT = 20
+
 /**
  * @typedef {object} BridgeEvent
  * One event for the gateway to fan out. `sessionId` is the conversation the
@@ -72,8 +78,8 @@ export class DshBridge {
    *        decide whether an approval may be forwarded at all — registering the
    *        answerer is not the same as claiming: with no phone online the
    *        request must fall through to the desktop UI.
-   * @param {number} [options.approvalTimeoutMs] 兼容旧配置保留；审批卡现在常驻，
-   *        不再用这个窗口做本地超时（交回桌面改由 `handleDevicesGone` 触发）。
+   * @param {number} [options.approvalTimeoutMs] 手机没作答多久后把审批交给桌面 UI
+   *        （默认 60 秒，可配置；交回桌面后手机卡片保留，仍可「转到手机」作答）。
    * @param {() => number} [options.now]
    * @param {(input: {content: Array<{type: string, text: string}>, source: {kind: string}}) => any} [options.createUserMessage]
    *        Injected so the bridge can be exercised without the harness present.
@@ -150,6 +156,8 @@ export class DshBridge {
     this.turnCalls = new Map()
     /** approvalId → 等待手机作答的请求 */
     this.approvals = new Map()
+    /** sessionId → 最近结束的审批 [{approvalId, outcome, source, at}]，重连时补 resolved。 */
+    this.recentResolutionLog = new Map()
     /** questionId → 等待手机作答的结构化提问（前台等待期间） */
     this.questions = new Map()
     /** questionId → 前台等待超时后仍可补答的提问（DSH 的 askTimed/continued） */
@@ -391,7 +399,7 @@ export class DshBridge {
   // ---------------------------------------------------------------------------
 
   /**
-   * 手机对一条待答审批作答。
+   * 手机对一条待答审批作答（也用于把桌面上的审批「转到手机」作答）。
    * @param {{approvalId: string, deviceId?: string, outcome: string}} input
    * @returns {boolean} 是否真的结算了一条等待中的请求
    */
@@ -400,15 +408,24 @@ export class DshBridge {
     const entry = this.approvals.get(approvalId)
     if (!entry) return false
     const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
-    // 只有被问过的那台手机能答，避免同会话的另一台设备抢答。
-    if (deviceId !== '' && !entry.deviceIds.has(deviceId)) return false
-    // 协议里只有三种答复：允许这一次、拒绝、以及「转到电脑端」（delegate）。
-    // 以前把 delegate 一并折成 rejected，导致手机上点「转到电脑」实际是拒绝
-    // 这次工具调用——桌面根本不会弹窗。
+    // 只有被问过的那台手机能答，避免同会话的另一台设备抢答。手机当时不在线时
+    // 这条请求是先交给桌面的；此时允许「当前订阅了该会话」的设备把审批转回手机。
+    if (deviceId !== '' && !entry.deviceIds.has(deviceId)) {
+      const online = this.#approvalDevices(entry.sessionId)
+      if (!online.includes(deviceId)) return false
+    }
     const outcome = APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (input?.outcome))
       ? /** @type {string} */ (input.outcome)
       : 'rejected'
-    this.#settleApproval(approvalId, outcome)
+    if (outcome === 'delegate') {
+      // 「转到电脑」：把请求交给桌面 UI，但手机卡片保留（还能再转回手机作答）。
+      if (!entry.desktop) {
+        this.log(`approval: ${approvalId} 手机选择转到电脑`)
+        this.#handToDesktop(approvalId)
+      }
+      return true
+    }
+    this.#settleApproval(approvalId, outcome, 'phone')
     this.log(`approval: ${approvalId} 手机答复 → ${outcome}`)
     return true
   }
@@ -528,25 +545,23 @@ export class DshBridge {
   }
 
   /**
-   * 把一条审批请求转发给在线手机；没有手机、超时或请求被中止时交回桌面。
+   * 把一条审批请求转发给手机，并在手机上等待答复。
+   *
+   * 60 秒（`approvalTimeoutMs`，可配置）没人作答就把这条请求交给桌面 UI；但请求
+   * **仍然挂在手机上**：卡片变成「已在电脑端」，点「转到手机处理」后还能作答，
+   * 手机先答就由手机决定（谁先答谁算）。手机不在线时同样先交给桌面，但保留这条
+   * 待答记录，手机连上后可以把审批快速转回手机。
    * @param {string} sessionId
    * @param {any} req
    * @param {() => Promise<any>} next
    */
   async #onApprovalRequest(sessionId, req, next) {
     if (this.disposed) return next()
-    const devices = this.#approvalDevices(sessionId)
-    if (devices.length === 0) {
-      // 没有手机在线：绝不冒领，把问题交回桌面 UI。
-      return next()
-    }
     const signal = req?.signal
     if (signal?.aborted) return next()
+    const devices = this.#approvalDevices(sessionId)
 
     const approvalId = randomUUID()
-    // 审批卡常驻：不挂本地超时，也**不下发 expiresAt**。手机/网页版拿不到到期时间，
-    // 就不会到点把按钮禁掉；卡片只在作答 / 转电脑 / 请求中止时消失。
-    // 窗口只留给「所有被问到的设备都掉线」：那时由 handleDevicesGone() 交回桌面。
     const payload = {
       kind: 'approval-ask',
       sessionId,
@@ -558,38 +573,94 @@ export class DshBridge {
     }
     const decisionPromise = new Promise(resolve => {
       /** @type {any} */
-      const entry = { resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null, payload }
+      const entry = {
+        approvalId,
+        resolve,
+        sessionId,
+        deviceIds: new Set(devices),
+        timer: null,
+        signal,
+        onAbort: null,
+        payload,
+        next,
+        desktop: false,
+        desktopPromise: null,
+      }
       this.approvals.set(approvalId, entry)
-      // 不设本地超时：卡片常驻到用户作答 / 转电脑 / 请求中止。
       if (signal && typeof signal.addEventListener === 'function') {
-        entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
+        entry.onAbort = () => this.#settleApproval(approvalId, 'cancelled', 'cancelled')
         signal.addEventListener('abort', entry.onAbort, { once: true })
       }
     })
     this.emit(payload)
-    this.log(`approval: 请求 ${approvalId} session=${sessionId} 设备=${devices.join(',')} 工具=${payload.toolName}`)
+    this.log(`approval: 请求 ${approvalId} session=${sessionId} 设备=${devices.join(',') || '（无）'} 工具=${payload.toolName}`)
+
+    if (devices.length === 0) {
+      // 手机不在线：先交给桌面（否则工具调用会卡住），但保留待答记录，
+      // 手机连上后 pendingApprovals 会把它以「已在电脑端」的形式重发，可转回手机。
+      this.#handToDesktop(approvalId)
+    } else if (this.approvalTimeoutMs > 0) {
+      const entry = this.approvals.get(approvalId)
+      if (entry) {
+        entry.timer = setTimeout(() => {
+          const live = this.approvals.get(approvalId)
+          if (live) live.timer = null
+          this.#handToDesktop(approvalId)
+        }, this.approvalTimeoutMs)
+        entry.timer.unref?.()
+      }
+    }
 
     const decision = await decisionPromise
-    if (decision === 'delegate') {
-      // 用户主动把这次审批转给电脑端：不代替桌面作答，直接 next() 交给桌面 UI。
-      this.log(`approval: ${approvalId} 转交电脑 → next()`)
-      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: 'delegated', source: 'phone' })
-      return next()
+    const outcome = decision?.outcome ?? 'cancelled'
+    const by = decision?.by ?? 'cancelled'
+    if (outcome === 'allowed-once' || outcome === 'rejected') {
+      this.#emitResolution(sessionId, approvalId, outcome, by === 'desktop' ? 'desktop' : 'phone')
+      return outcome
     }
-    if (decision === 'allowed-once' || decision === 'rejected') {
-      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: decision, source: 'phone' })
-      return decision
+    // 中止 / 被桌面取消：给已经发出去的卡片补一条 resolved，手机据此关掉它。
+    this.log(`approval: ${approvalId} 结束（${outcome}，来源 ${by}）`)
+    this.#emitResolution(sessionId, approvalId, 'cancelled', by)
+    return outcome === 'unavailable' ? 'unavailable' : 'cancelled'
+  }
+
+  /**
+   * 把一条待答审批交给桌面 UI（幂等）。
+   *
+   * 不 settle：请求由 `next()` 在桌面侧继续，谁先答谁算。桌面答完就把结果当成
+   * 最终答复；手机在这之前答（「转到手机」）就先 settle，桌面那张卡会被
+   * `approval/decided` 事件带走的。
+   * @param {string} approvalId
+   */
+  #handToDesktop(approvalId) {
+    const entry = this.approvals.get(approvalId)
+    if (!entry || entry.desktop) return
+    entry.desktop = true
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
     }
-    // 超时 / 中止：给已经发出去的卡片补一条 resolved，手机据此关掉它。
-    this.log(`approval: ${approvalId} 未答复（${decision}）→ 交回桌面`)
-    this.emit({
-      kind: 'approval-resolved',
-      sessionId,
-      approvalId,
-      outcome: 'cancelled',
-      source: decision === 'timeout' ? 'timeout' : 'cancelled',
+    entry.payload.onDesktop = true
+    this.log(`approval: ${approvalId} 已在桌面等待（手机仍可转回作答）`)
+    this.emit({ ...entry.payload })
+
+    let answer
+    try {
+      answer = Promise.resolve(entry.next())
+    } catch (error) {
+      answer = Promise.reject(error)
+    }
+    entry.desktopPromise = answer
+    answer.then(raw => {
+      if (!this.approvals.has(approvalId)) return
+      const outcome = raw === 'allowed-once' || raw === 'rejected'
+        ? raw
+        : raw === 'unavailable' ? 'unavailable' : 'cancelled'
+      this.#settleApproval(approvalId, outcome, 'desktop')
+    }).catch(() => {
+      if (!this.approvals.has(approvalId)) return
+      this.#settleApproval(approvalId, 'unavailable', 'desktop')
     })
-    return next()
   }
 
   /**
@@ -607,8 +678,12 @@ export class DshBridge {
     }
   }
 
-  /** @param {string} approvalId @param {'allowed-once'|'rejected'|'delegate'|'timeout'|'aborted'|'cancelled'} outcome */
-  #settleApproval(approvalId, outcome) {
+  /**
+   * @param {string} approvalId
+   * @param {string} outcome
+   * @param {string} [by] 谁结束的：`phone` / `desktop` / `cancelled`
+   */
+  #settleApproval(approvalId, outcome, by = 'phone') {
     const entry = this.approvals.get(approvalId)
     if (!entry) return
     this.approvals.delete(approvalId)
@@ -616,7 +691,45 @@ export class DshBridge {
     if (entry.onAbort && typeof entry.signal?.removeEventListener === 'function') {
       entry.signal.removeEventListener('abort', entry.onAbort)
     }
-    entry.resolve(outcome)
+    entry.resolve({ outcome, by })
+  }
+
+  /**
+   * 记下一条审批结果，并广播 `approval/resolved`。
+   * @param {string} sessionId
+   * @param {string} approvalId
+   * @param {string} outcome
+   * @param {string} source
+   */
+  #emitResolution(sessionId, approvalId, outcome, source) {
+    this.#recordResolution(sessionId, approvalId, outcome, source)
+    this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome, source })
+  }
+
+  /** @param {string} sessionId @param {string} approvalId @param {string} outcome @param {string} source */
+  #recordResolution(sessionId, approvalId, outcome, source) {
+    const now = this.now()
+    const list = (this.recentResolutionLog.get(sessionId) ?? [])
+      .filter(item => now - item.at <= RECENT_RESOLUTION_TTL_MS)
+    list.push({ approvalId, outcome, source, at: now })
+    while (list.length > RECENT_RESOLUTION_LIMIT) list.shift()
+    this.recentResolutionLog.set(sessionId, list)
+  }
+
+  /**
+   * 最近结束的审批（TTL 内）。重连时网关会给手机补 `approval/resolved`，
+   * 清掉那些已经答过、手机却没收到结果的卡片。
+   * @param {string} sessionId
+   * @returns {Array<{approvalId: string, outcome: string, source: string}>}
+   */
+  recentResolutions(sessionId) {
+    const id = typeof sessionId === 'string' ? sessionId : ''
+    if (id === '') return []
+    const now = this.now()
+    const list = this.recentResolutionLog.get(id) ?? []
+    const fresh = list.filter(item => now - item.at <= RECENT_RESOLUTION_TTL_MS)
+    if (fresh.length !== list.length) this.recentResolutionLog.set(id, fresh)
+    return fresh.map(({ approvalId, outcome, source }) => ({ approvalId, outcome, source }))
   }
 
   /**
@@ -632,34 +745,6 @@ export class DshBridge {
       if (entry.sessionId === id && entry.payload) pending.push(entry.payload)
     }
     return pending
-  }
-
-  /**
-   * 网关发现某会话的在线设备集合变了（典型：手机掉线 / 关掉标签页）。
-   *
-   * 审批卡常驻、没有本地超时：如果被问到过的设备全部离线，卡片已经没人能点，
-   * 这个工具调用会永远挂住。此时把这些请求交回桌面（resolve 'timeout' →
-   * `next()`），桌面 UI 会重新弹审批。
-   * @param {string} sessionId
-   * @param {string[]} remainingDeviceIds 仍在线、且绑定/订阅该会话的设备
-   */
-  handleDevicesGone(sessionId, remainingDeviceIds) {
-    const id = typeof sessionId === 'string' ? sessionId : ''
-    if (id === '') return
-    const remaining = new Set(Array.isArray(remainingDeviceIds) ? remainingDeviceIds : [])
-    for (const [approvalId, entry] of [...this.approvals]) {
-      if (entry.sessionId !== id) continue
-      let reachable = false
-      for (const deviceId of entry.deviceIds) {
-        if (remaining.has(deviceId)) {
-          reachable = true
-          break
-        }
-      }
-      if (reachable) continue
-      this.log(`approval: ${approvalId} 的设备已全部离线，交回桌面`)
-      this.#settleApproval(approvalId, 'timeout')
-    }
   }
 
   // ---------------------------------------------------------------------------

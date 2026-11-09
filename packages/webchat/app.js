@@ -179,6 +179,8 @@ const state = {
   approvalReplies: new Map(),
   /** 答复重发定时器。 */
   approvalReplyTimer: null,
+  /** 已从桌面「转到手机处理」的审批 id（只影响前端展开，不额外发包）。 */
+  pulledApprovals: new Set(),
   lastRenderSignature: '',
   lastTabsSignature: '',
   lastActiveTabId: '',
@@ -1463,13 +1465,16 @@ function replyApproval(approvalId, outcome) {
 function approvalCardHtml(approval) {
   const expired = approvalExpired(approval)
   const replied = approval.replied === true
+  const onDesktop = approval.onDesktop === true
+  const pulled = state.pulledApprovals.has(approval.approvalId) === true
   const disabled = expired || replied
   const classes = ['approval-card']
   if (expired) classes.push('is-expired')
   if (replied) classes.push('is-replied')
+  if (onDesktop && !pulled) classes.push('is-on-desktop')
   const reason = escapeHtml(approvalReasonText(approval))
   const tool = escapeHtml(approval.toolName ?? '工具')
-  // 卡片不设倒计时（用户要求：常驻手机端，直到作答或主动转电脑）。
+  // 60 秒没答 / 手机当时不在线 → 已经交给电脑端；卡片保留，可一键转到手机作答。
   let foot = ''
   if (replied) {
     foot = `<p class="approval-state">${
@@ -1479,15 +1484,18 @@ function approvalCardHtml(approval) {
           ? '已转交电脑处理'
           : '已拒绝（等待电脑确认）'
     }</p>`
+  } else if (onDesktop && !pulled) {
+    foot = '<p class="approval-state">电脑端已弹出这条审批，可一键转到手机处理</p>'
+  } else if (onDesktop) {
+    foot = '<p class="approval-state">已在手机上处理，电脑端弹窗会自动关闭</p>'
   }
-  return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
-    <div class="approval-head">
-      <span class="approval-tool">${tool}</span>
-      <span class="approval-request">请求执行</span>
-    </div>
-    <p class="approval-reason">${reason}</p>
-    ${foot}
-    <div class="approval-actions">
+  const actions = onDesktop && !pulled && !replied
+    ? `<div class="approval-actions">
+      <button class="btn btn-primary approval-pull" type="button" data-action="approval-pull" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}">转到手机处理</button>
+    </div>`
+    : `<div class="approval-actions">
       <button class="btn btn-primary approval-allow" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
         approval.approvalId,
       )}" data-outcome="allowed-once" ${disabled ? 'disabled' : ''}>允许一次</button>
@@ -1496,8 +1504,16 @@ function approvalCardHtml(approval) {
       )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
       <button class="btn approval-delegate" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
         approval.approvalId,
-      )}" data-outcome="delegate" ${disabled ? 'disabled' : ''}>转到电脑</button>
+      )}" data-outcome="delegate" ${disabled || onDesktop ? 'disabled' : ''}>转到电脑</button>
+    </div>`
+  return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
+    <div class="approval-head">
+      <span class="approval-tool">${tool}</span>
+      <span class="approval-request">请求执行</span>
     </div>
+    <p class="approval-reason">${reason}</p>
+    ${foot}
+    ${actions}
   </div>`
 }
 
@@ -1796,6 +1812,7 @@ function handleApprovalResolved(resolved) {
   if (!resolved) return
   // 电脑端确认了这条答复（或它在别处被处理）：停止重发。
   state.approvalReplies.delete(resolved.approvalId)
+  state.pulledApprovals.delete(resolved.approvalId)
   syncApprovalReplyRetry()
   // 后台标签的请求被电脑处理掉时也给一句，但只在当前标签才需要「你答的」语气。
   const title = resolved.sessionId ? state.model?.titleFor(resolved.sessionId) : ''
@@ -3139,6 +3156,12 @@ function setupChatEvents() {
     }
     if (target.dataset.action === 'download-file') {
       downloadFile(target.dataset.fileId ?? '')
+      return
+    }
+    if (target.dataset.action === 'approval-pull') {
+      state.pulledApprovals.add(String(target.dataset.approvalId ?? ''))
+      scheduleRender()
+      showToast('已转到手机，点「允许一次」或「拒绝」即可作答', 'ok', 2600)
       return
     }
     if (target.dataset.action === 'approval-reply') {

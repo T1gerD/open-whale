@@ -122,11 +122,11 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
  *           Log-backed history for `session/state` (degrades to `[]` on failure).
  * @property {(input: {approvalId: string, deviceId?: string, outcome: string}) => boolean} [answerApproval]
  *           Settle a forwarded approval with the phone's answer.
- * @property {(sessionId: string, remainingDeviceIds: string[]) => void} [devicesChanged]
- *           A socket closed: the bridge hands approvals nobody can answer any more
- *           back to the desktop instead of leaving the tool call waiting forever.
  * @property {(sessionId: string) => Array<object>} [pendingApprovals]
  *           Approvals still waiting in one conversation, replayed after a reconnect.
+ * @property {(sessionId: string) => Array<{approvalId: string, outcome: string, source: string}>} [recentResolutions]
+ *           Approvals that ended recently, replayed as `approval/resolved` so a phone
+ *           that was offline does not keep a dead card on screen.
  * @property {(input: {questionId: string, deviceId?: string, answers: unknown}) => boolean} [answerQuestion]
  *           Settle a forwarded structured question with the phone's answers.
  * @property {(sessionId: string) => Promise<void>} [releaseSession]
@@ -163,7 +163,7 @@ class Session {
     this.helloDeadline.unref?.()
 
     connection.on('message', text => this.#onMessage(text))
-    connection.on('close', () => this.#onClose())
+    connection.on('close', payload => this.#onClose(payload))
     connection.on('error', () => this.#onClose())
   }
 
@@ -191,8 +191,13 @@ class Session {
     this.connection.close(code, reason)
   }
 
-  #onClose() {
+  /** @param {Buffer|undefined} [payload] WebSocket CLOSE 帧载荷（code + reason）。 */
+  #onClose(payload) {
     clearTimeout(this.helloDeadline)
+    if (Buffer.isBuffer(payload) && payload.length >= 2) {
+      this.closeCode = payload.readUInt16BE(0)
+      this.closeReason = payload.subarray(2).toString('utf8').slice(0, 120)
+    }
     this.gateway.handleSessionClosed(this)
   }
 
@@ -1114,22 +1119,15 @@ export class Gateway {
    * @param {Session} session
    */
   handleSessionClosed(session) {
-    this.log(`ws: ${session.id} 断开（device=${session.deviceId ?? '-'}）`)
-    const conversationId = session.sessionId
+    const closeInfo = session.closeCode !== undefined
+      ? ` code=${session.closeCode} reason=${session.closeReason || '-'}`
+      : ' 未收到 CLOSE 帧（网络断开/进程被杀）'
+    this.log(`ws: ${session.id} 断开（device=${session.deviceId ?? '-'}）${closeInfo}`)
     this.sessions.delete(session)
     if (!session.deviceId) return
     this.#removeDeviceSession(session)
     if (!this.deviceOnline(session.deviceId)) {
       this.gatewayEvents.emit('device-offline', { deviceId: session.deviceId, sessionId: session.id })
-    }
-    // 审批卡常驻手机、没有本地超时：如果这条连接是最后一个能作答的通道，就把
-    // 待答审批交回桌面，否则那个工具调用会一直挂着。
-    if (conversationId) {
-      try {
-        this.bridge.devicesChanged?.(conversationId, this.approvalDevicesFor(conversationId))
-      } catch (error) {
-        this.log(`approval: 设备变化通知失败：${/** @type {Error} */ (error).message}`)
-      }
     }
   }
 
@@ -1814,7 +1812,7 @@ export class Gateway {
           ...(event.reason !== undefined ? { reason: event.reason } : {}),
           ...(event.displayReason !== undefined ? { displayReason: event.displayReason } : {}),
           ...(event.callId !== undefined ? { callId: event.callId } : {}),
-          expiresAt: event.expiresAt,
+          ...(event.onDesktop === true ? { onDesktop: true } : {}),
         }
         const delivered = this.#broadcastToConversation(conversationId, frame, {
           requireCapability: CAPABILITIES.APPROVAL,
@@ -1971,6 +1969,33 @@ export class Gateway {
       },
     })
     this.#replayPendingApprovals(session, conversationId)
+    this.#replayRecentResolutions(session, conversationId)
+  }
+
+  /**
+   * 重连时补发最近结束的审批结果，清掉手机/网页上那些已经点不动的卡片
+   * （比如设备离线超过宽限、电脑已把审批交回桌面）。
+   * @param {Session} session
+   * @param {string} conversationId
+   */
+  #replayRecentResolutions(session, conversationId) {
+    if (!session.hasCap(CAPABILITIES.APPROVAL)) return
+    let recent = []
+    try {
+      recent = this.bridge.recentResolutions?.(conversationId) ?? []
+    } catch (error) {
+      this.log(`approval: 读取最近审批结果失败：${/** @type {Error} */ (error).message}`)
+      return
+    }
+    for (const item of recent) {
+      session.send({
+        t: SERVER_FRAME.APPROVAL_RESOLVED,
+        sessionId: conversationId,
+        approvalId: item.approvalId,
+        outcome: item.outcome,
+        ...(item.source !== undefined ? { source: item.source } : {}),
+      })
+    }
   }
 
   /**
@@ -2000,6 +2025,7 @@ export class Gateway {
         ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
         ...(approval.displayReason !== undefined ? { displayReason: approval.displayReason } : {}),
         ...(approval.callId !== undefined ? { callId: approval.callId } : {}),
+        ...(approval.onDesktop === true ? { onDesktop: true } : {}),
       })
     }
   }

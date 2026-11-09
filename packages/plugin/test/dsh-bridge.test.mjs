@@ -1018,33 +1018,92 @@ test('agent/created never double-registers the plugin own conversations', async 
   assert.equal(fake.scopedEvents.filter(entry => entry.event === 'user-questions/request').length, 1)
 })
 
-test('delegating an approval hands it back to the desktop instead of rejecting', async () => {
-  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+test('delegating an approval moves it to the desktop but keeps the phone card pullable', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], approvalTimeoutMs: 60_000 })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
-  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop-took-over')
+  let desktopResolve
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, () => new Promise(resolve => {
+    desktopResolve = resolve
+  }))
   await delay(10)
   const approval = events.find(event => event.kind === 'approval-ask')
   assert.ok(approval)
+  assert.equal('expiresAt' in approval, false)
 
   assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'delegate' }), true)
-  assert.equal(await approvalPromise, 'desktop-took-over', 'delegate must call next(), never reject on the phone behalf')
+  // 手机卡片不消失，变成「已在电脑端」，还能再转回手机作答。
+  await delay(5)
+  const onDesktop = events.filter(event => event.kind === 'approval-ask' && event.approvalId === approval.approvalId).at(-1)
+  assert.equal(onDesktop.onDesktop, true)
+
+  // 电脑端作答 → 结果来自桌面。
+  desktopResolve('allowed-once')
+  assert.equal(await approvalPromise, 'allowed-once')
   const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
-  assert.equal(resolved.outcome, 'delegated')
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'desktop')
 })
 
-test('an approval card is persistent and is handed back when every phone goes offline', async () => {
-  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+test('after the 60s window the desktop answers, and the phone can still pull the approval back', async () => {
+  let desktopResolve
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], approvalTimeoutMs: 20 })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
-  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop')
-  await delay(10)
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, () => new Promise(resolve => {
+    desktopResolve = resolve
+  }))
+  await delay(40)
   const approval = events.find(event => event.kind === 'approval-ask')
   assert.ok(approval)
-  assert.equal('expiresAt' in approval, false, 'a persistent card must not carry an expiry the clients can act on')
+  const handedOff = events.filter(event => event.kind === 'approval-ask' && event.approvalId === approval.approvalId).at(-1)
+  assert.equal(handedOff.onDesktop, true, 'the card must tell the phone it is waiting on the desktop')
 
-  bridge.handleDevicesGone('ow-dev_a', [])
-  assert.equal(await approvalPromise, 'desktop', 'nobody can answer any more: hand the approval back to the desktop')
+  // 手机的「转到手机」= 直接作答；先答先算，桌面那张卡的结果被忽略。
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'rejected' }), true)
+  assert.equal(await approvalPromise, 'rejected')
+  desktopResolve('allowed-once')
+  await delay(5)
+  const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
+  assert.equal(resolved.outcome, 'rejected')
+  assert.equal(resolved.source, 'phone')
+})
+
+test('an approval raised with no phone online is pulled back to the phone later', async () => {
+  let online = []
+  let desktopResolve
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => online })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  let desktopAsked = false
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, () => {
+    desktopAsked = true
+    return new Promise(resolve => {
+      desktopResolve = resolve
+    })
+  })
+  await delay(20)
+  assert.equal(desktopAsked, true, 'with no phone online the desktop must be asked immediately')
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+
+  // 手机连上并订阅了这个会话：网关重放 pendingApprovals（onDesktop），手机作答即转回手机。
+  online = ['dev_a']
+  const pending = bridge.pendingApprovals('ow-dev_a')
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].onDesktop, true)
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+  desktopResolve('rejected')
+  await delay(5)
+  const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
+  assert.equal(resolved.outcome, 'allowed-once')
+  assert.equal(resolved.source, 'phone')
+
+  // 结束后的审批留在「最近结果」里，重连时网关据此补 resolved。
+  assert.deepEqual(bridge.recentResolutions('ow-dev_a'), [
+    { approvalId: approval.approvalId, outcome: 'allowed-once', source: 'phone' },
+  ])
 })
 
 test('harness-injected user messages never become blue bubbles', () => {
