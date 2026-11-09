@@ -28,6 +28,8 @@ const WORKDIR = process.platform === 'win32' ? 'C:\\work' : '/work'
  */
 function fakeContext() {
   const listeners = []
+  /** Agent 生命周期监听器：`agent/created` / `agent/disposed`。 */
+  const lifecycle = []
   const created = []
   const sections = []
   const guards = []
@@ -42,19 +44,34 @@ function fakeContext() {
     guards,
     scopedEvents,
     listeners,
+    lifecycle,
     live,
     answeredQuestions,
     /** Fire an event into every registered session/event listener. */
     fire(session, event) {
       for (const listener of listeners) listener(session, event)
     },
+    /** Fire one agent lifecycle event (`agent/created` / `agent/disposed`). */
+    emitAgent(event, payload) {
+      for (const entry of [...lifecycle]) {
+        if (entry.event === event) entry.listener(payload)
+      }
+    },
     ctx: {
       on(event, listener) {
-        assert.equal(event, 'session/event')
-        listeners.push(listener)
+        if (event === 'session/event') {
+          listeners.push(listener)
+          return () => {
+            const index = listeners.indexOf(listener)
+            if (index >= 0) listeners.splice(index, 1)
+          }
+        }
+        assert.ok(event === 'agent/created' || event === 'agent/disposed', `unexpected event ${event}`)
+        const entry = { event, listener }
+        lifecycle.push(entry)
         return () => {
-          const index = listeners.indexOf(listener)
-          if (index >= 0) listeners.splice(index, 1)
+          const index = lifecycle.indexOf(entry)
+          if (index >= 0) lifecycle.splice(index, 1)
         }
       },
       /** DSH 的 continued-question 入口（超时后补答时会用到）。 */
@@ -963,6 +980,71 @@ test('disposing the bridge unbinds every adopted agent and keeps the agents aliv
   assert.equal(first.scopedEvents.length, 0)
   assert.equal(second.scopedEvents.length, 0)
   assert.equal(fake.live.size, 2, 'adopted desktop agents survive a plugin unload')
+})
+
+test('an agent resumed by the desktop is adopted so approvals still reach the phone', async () => {
+  // 现场顺序：DSH 重启 → 手机先连上并订阅会话 → 桌面随后发消息，DSH 才 resume 出
+  // agent。这个 agent 没跑过本插件的 setup，只能靠全局 agent/created 补注册，
+  // 否则审批只在桌面弹（2026-11-09 19:49 的实测现象）。
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  const { agent, scopedEvents } = addLiveAgent(fake, 'desk-resumed')
+  assert.equal(scopedEvents.length, 0, 'the desktop agent starts without our forwarders')
+
+  fake.emitAgent('agent/created', { agent, source: 'resume' })
+
+  const approvalEntry = scopedEvents.find(entry => entry.event === 'approval/request')
+  const questionEntry = scopedEvents.find(entry => entry.event === 'user-questions/request')
+  assert.ok(approvalEntry, 'a desktop-resumed agent must get an approval forwarder')
+  assert.ok(questionEntry, 'a desktop-resumed agent must get a question forwarder')
+  assert.equal(approvalEntry.opts?.prepend, true)
+
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop')
+  await delay(10)
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval, 'the adopted forwarder must emit approval-ask')
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+})
+
+test('agent/created never double-registers the plugin own conversations', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.createSession('dev_x')
+  const agent = fake.live.get('ow-dev_x')
+  assert.ok(agent)
+  agent.id = 'ow-dev_x'
+  // DSH 对我们自己 create 出来的 agent 也会发 agent/created；重复注册会让手机收到两张卡。
+  fake.emitAgent('agent/created', { agent, source: 'fresh' })
+  assert.equal(fake.scopedEvents.filter(entry => entry.event === 'approval/request').length, 1)
+  assert.equal(fake.scopedEvents.filter(entry => entry.event === 'user-questions/request').length, 1)
+})
+
+test('delegating an approval hands it back to the desktop instead of rejecting', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop-took-over')
+  await delay(10)
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'delegate' }), true)
+  assert.equal(await approvalPromise, 'desktop-took-over', 'delegate must call next(), never reject on the phone behalf')
+  const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
+  assert.equal(resolved.outcome, 'delegated')
+})
+
+test('an approval card is persistent and is handed back when every phone goes offline', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop')
+  await delay(10)
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  assert.equal('expiresAt' in approval, false, 'a persistent card must not carry an expiry the clients can act on')
+
+  bridge.handleDevicesGone('ow-dev_a', [])
+  assert.equal(await approvalPromise, 'desktop', 'nobody can answer any more: hand the approval back to the desktop')
 })
 
 test('harness-injected user messages never become blue bubbles', () => {

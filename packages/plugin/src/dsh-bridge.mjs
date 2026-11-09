@@ -23,6 +23,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import {
+  APPROVAL_REPLY_OUTCOMES,
   APPROVAL_TIMEOUT_MS,
   IdempotencyCache,
   QUESTION_LATE_WINDOW_MS,
@@ -71,7 +72,8 @@ export class DshBridge {
    *        decide whether an approval may be forwarded at all — registering the
    *        answerer is not the same as claiming: with no phone online the
    *        request must fall through to the desktop UI.
-   * @param {number} [options.approvalTimeoutMs] Override the 60s forwarding timeout (tests).
+   * @param {number} [options.approvalTimeoutMs] 兼容旧配置保留；审批卡现在常驻，
+   *        不再用这个窗口做本地超时（交回桌面改由 `handleDevicesGone` 触发）。
    * @param {() => number} [options.now]
    * @param {(input: {content: Array<{type: string, text: string}>, source: {kind: string}}) => any} [options.createUserMessage]
    *        Injected so the bridge can be exercised without the harness present.
@@ -128,6 +130,14 @@ export class DshBridge {
      * @type {WeakMap<any, {offs: Function[], sessionId: string}>}
      */
     this.adoptedAgents = new WeakMap()
+    /**
+     * 本插件自己 create/resume 的 agent（`setup` 已在这上面注册过转发者）。
+     *
+     * 它们同样会触发全局 `agent/created`，必须跳过，否则同一个 agent 上会挂两套
+     * 转发者：一份审批请求会给手机推两张卡、答复也只能结算其中一张。
+     * @type {WeakSet<any>}
+     */
+    this.ownedAgents = new WeakSet()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
     /** `${deviceId}\u0000${callId}` → 进行中的回合 */
@@ -158,6 +168,55 @@ export class DshBridge {
       }
     })
     this.subscriptions.push(off)
+    // 桌面自己恢复/新建的 agent 不会经过本插件的 `setup`（DSH 重启后手机先连上、
+    // 桌面上那条会话随后才 resume，就属于这种次序）。只靠 selectSession/send 时
+    // 补注册会漏掉它：审批只在桌面弹、手机毫无反应。全局 `agent/created` 让任何
+    // 变成 live 的会话都补上转发者——真正要不要转发仍由 `devicesInSession` 决定。
+    this.subscriptions.push(this.ctx.on('agent/created', payload => {
+      this.#onAgentCreated(payload?.agent)
+    }))
+    this.subscriptions.push(this.ctx.on('agent/disposed', payload => {
+      this.#onAgentDisposed(payload?.agent)
+    }))
+  }
+
+  /**
+   * 一个 agent 变成 live（新建 / resume / clear / compaction 都算）。
+   *
+   * `agent/created` 是 serial 事件，监听器抛错会让整个会话创建失败，所以这里
+   * 任何异常都吞掉并记日志。
+   * @param {any} agent
+   */
+  #onAgentCreated(agent) {
+    try {
+      if (!agent) return
+      const sessionId = typeof agent.id === 'string' ? agent.id : ''
+      if (sessionId === '') return
+      // 本插件 setup 已经注册过；重复注册会给手机推两张卡。
+      if (this.ownedAgents.has(agent)) return
+      if (this.adoptedAgents.has(agent)) return
+      if (!agent.ctx || typeof agent.ctx.on !== 'function') return
+      this.#adoptLiveAgent(sessionId, agent)
+      this.log(`bridge: agent/created 接管 ${sessionId}，已补注册审批/提问转发者`)
+    } catch (error) {
+      this.log(`bridge: agent/created 接管失败：${/** @type {Error} */ (error).message}`)
+    }
+  }
+
+  /**
+   * agent 从注册表移除：解绑我们加的转发者，清掉不是本插件创建的 entry。
+   * @param {any} agent
+   */
+  #onAgentDisposed(agent) {
+    try {
+      if (!agent) return
+      this.#detachAdopted(agent)
+      for (const [sessionId, entry] of this.agents) {
+        if (entry?.agent === agent && !entry.handle) this.agents.delete(sessionId)
+      }
+    } catch (error) {
+      this.log(`bridge: agent/disposed 清理失败：${/** @type {Error} */ (error).message}`)
+    }
   }
 
   /** Release registrations and dispose every agent this bridge created. */
@@ -343,7 +402,12 @@ export class DshBridge {
     const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
     // 只有被问过的那台手机能答，避免同会话的另一台设备抢答。
     if (deviceId !== '' && !entry.deviceIds.has(deviceId)) return false
-    this.#settleApproval(approvalId, input?.outcome === 'allowed-once' ? 'allowed-once' : 'rejected')
+    // 协议里只有三种答复：允许这一次、拒绝、以及「转到电脑端」（delegate）。
+    // 以前把 delegate 一并折成 rejected，导致手机上点「转到电脑」实际是拒绝
+    // 这次工具调用——桌面根本不会弹窗。
+    this.#settleApproval(approvalId, APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (input?.outcome))
+      ? input.outcome
+      : 'rejected')
     return true
   }
 
@@ -407,6 +471,8 @@ export class DshBridge {
    * @param {string} sessionId
    */
   #setupAgent(agentCtx, _agent, sessionId) {
+    // 标记「本插件创建/恢复」的 agent：`agent/created` 监听器据此跳过补注册。
+    if (_agent) this.ownedAgents.add(_agent)
     // The voice is registered in the agent's own scope: it applies to this
     // conversation and disappears with it, so the desktop conversations the
     // user has open keep their normal, technical register.
@@ -476,20 +542,10 @@ export class DshBridge {
     if (signal?.aborted) return next()
 
     const approvalId = randomUUID()
-    // 手机在线时审批卡常驻：不挂本地超时（用户要求「卡片不设倒计时、常驻手机端」）。
-    // 只有用户点「转到电脑」、设备全部断开或请求中止时才交回桌面。
-    const expiresAt = this.now() + this.approvalTimeoutMs
-    const decisionPromise = new Promise(resolve => {
-      /** @type {any} */
-      const entry = { resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null }
-      this.approvals.set(approvalId, entry)
-      // 不设本地超时：卡片常驻到用户作答 / 转电脑 / 请求中止。
-      if (signal && typeof signal.addEventListener === 'function') {
-        entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
-        signal.addEventListener('abort', entry.onAbort, { once: true })
-      }
-    })
-    this.emit({
+    // 审批卡常驻：不挂本地超时，也**不下发 expiresAt**。手机/网页版拿不到到期时间，
+    // 就不会到点把按钮禁掉；卡片只在作答 / 转电脑 / 请求中止时消失。
+    // 窗口只留给「所有被问到的设备都掉线」：那时由 handleDevicesGone() 交回桌面。
+    const payload = {
       kind: 'approval-ask',
       sessionId,
       approvalId,
@@ -497,8 +553,18 @@ export class DshBridge {
       ...(typeof req?.reason === 'string' && req.reason !== '' ? { reason: req.reason.slice(0, 500) } : {}),
       ...(isLocalizedText(req?.displayReason) ? { displayReason: req.displayReason } : {}),
       ...(typeof req?.callId === 'string' && req.callId !== '' ? { callId: req.callId } : {}),
-      expiresAt,
+    }
+    const decisionPromise = new Promise(resolve => {
+      /** @type {any} */
+      const entry = { resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null, payload }
+      this.approvals.set(approvalId, entry)
+      // 不设本地超时：卡片常驻到用户作答 / 转电脑 / 请求中止。
+      if (signal && typeof signal.addEventListener === 'function') {
+        entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
+        signal.addEventListener('abort', entry.onAbort, { once: true })
+      }
     })
+    this.emit(payload)
 
     const decision = await decisionPromise
     if (decision === 'delegate') {
@@ -536,7 +602,7 @@ export class DshBridge {
     }
   }
 
-  /** @param {string} approvalId @param {'allowed-once'|'rejected'|'timeout'|'aborted'|'cancelled'} outcome */
+  /** @param {string} approvalId @param {'allowed-once'|'rejected'|'delegate'|'timeout'|'aborted'|'cancelled'} outcome */
   #settleApproval(approvalId, outcome) {
     const entry = this.approvals.get(approvalId)
     if (!entry) return
@@ -546,6 +612,49 @@ export class DshBridge {
       entry.signal.removeEventListener('abort', entry.onAbort)
     }
     entry.resolve(outcome)
+  }
+
+  /**
+   * 某个会话里还在等答复的审批（网关在连接/刷新/切回标签时重发，卡片不会凭空消失）。
+   * @param {string} sessionId
+   * @returns {Array<object>}
+   */
+  pendingApprovals(sessionId) {
+    const id = typeof sessionId === 'string' ? sessionId : ''
+    if (id === '') return []
+    const pending = []
+    for (const entry of this.approvals.values()) {
+      if (entry.sessionId === id && entry.payload) pending.push(entry.payload)
+    }
+    return pending
+  }
+
+  /**
+   * 网关发现某会话的在线设备集合变了（典型：手机掉线 / 关掉标签页）。
+   *
+   * 审批卡常驻、没有本地超时：如果被问到过的设备全部离线，卡片已经没人能点，
+   * 这个工具调用会永远挂住。此时把这些请求交回桌面（resolve 'timeout' →
+   * `next()`），桌面 UI 会重新弹审批。
+   * @param {string} sessionId
+   * @param {string[]} remainingDeviceIds 仍在线、且绑定/订阅该会话的设备
+   */
+  handleDevicesGone(sessionId, remainingDeviceIds) {
+    const id = typeof sessionId === 'string' ? sessionId : ''
+    if (id === '') return
+    const remaining = new Set(Array.isArray(remainingDeviceIds) ? remainingDeviceIds : [])
+    for (const [approvalId, entry] of [...this.approvals]) {
+      if (entry.sessionId !== id) continue
+      let reachable = false
+      for (const deviceId of entry.deviceIds) {
+        if (remaining.has(deviceId)) {
+          reachable = true
+          break
+        }
+      }
+      if (reachable) continue
+      this.log(`approval: ${approvalId} 的设备已全部离线，交回桌面`)
+      this.#settleApproval(approvalId, 'timeout')
+    }
   }
 
   // ---------------------------------------------------------------------------

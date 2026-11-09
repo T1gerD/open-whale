@@ -540,14 +540,18 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {string} [reason]     Machine reason the computer logged.
  * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
  * @property {string} [callId]     The chat turn this prompt belongs to, when known.
- * @property {number} expiresAt    Unix ms after which the computer falls back to the desktop.
+ * @property {number} [expiresAt]  Unix ms after which the computer hides the card.
+ *                                 **Omitted** for persistent approvals: those stay
+ *                                 until the phone answers, delegates to the desktop,
+ *                                 or every asked device goes offline.
  */
 
 /**
  * @typedef {object} ApprovalReplyFrame
  * @property {'approval/reply'} t
  * @property {string} approvalId
- * @property {'allowed-once'|'rejected'} outcome  `allowed-once` grants exactly this one call.
+ * @property {'allowed-once'|'rejected'|'delegate'} outcome  `allowed-once` grants exactly
+ *           this one call; `delegate` hands it back to the desktop UI.
  */
 
 /**
@@ -555,7 +559,7 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {'approval/resolved'} t
  * @property {string} sessionId    Which conversation the tool belongs to.
  * @property {string} approvalId
- * @property {'allowed-once'|'rejected'|'cancelled'|'unavailable'} outcome
+ * @property {'allowed-once'|'rejected'|'delegated'|'cancelled'|'unavailable'} outcome
  * @property {string} [source]     `phone` | `desktop` | `timeout` | `cancelled`.
  */
 

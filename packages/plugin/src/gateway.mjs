@@ -122,6 +122,11 @@ const MAX_JSON_BODY_BYTES = 64 * 1024
  *           Log-backed history for `session/state` (degrades to `[]` on failure).
  * @property {(input: {approvalId: string, deviceId?: string, outcome: string}) => boolean} [answerApproval]
  *           Settle a forwarded approval with the phone's answer.
+ * @property {(sessionId: string, remainingDeviceIds: string[]) => void} [devicesChanged]
+ *           A socket closed: the bridge hands approvals nobody can answer any more
+ *           back to the desktop instead of leaving the tool call waiting forever.
+ * @property {(sessionId: string) => Array<object>} [pendingApprovals]
+ *           Approvals still waiting in one conversation, replayed after a reconnect.
  * @property {(input: {questionId: string, deviceId?: string, answers: unknown}) => boolean} [answerQuestion]
  *           Settle a forwarded structured question with the phone's answers.
  * @property {(sessionId: string) => Promise<void>} [releaseSession]
@@ -1110,11 +1115,21 @@ export class Gateway {
    */
   handleSessionClosed(session) {
     this.log(`ws: ${session.id} 断开（device=${session.deviceId ?? '-'}）`)
+    const conversationId = session.sessionId
     this.sessions.delete(session)
     if (!session.deviceId) return
     this.#removeDeviceSession(session)
     if (!this.deviceOnline(session.deviceId)) {
       this.gatewayEvents.emit('device-offline', { deviceId: session.deviceId, sessionId: session.id })
+    }
+    // 审批卡常驻手机、没有本地超时：如果这条连接是最后一个能作答的通道，就把
+    // 待答审批交回桌面，否则那个工具调用会一直挂着。
+    if (conversationId) {
+      try {
+        this.bridge.devicesChanged?.(conversationId, this.approvalDevicesFor(conversationId))
+      } catch (error) {
+        this.log(`approval: 设备变化通知失败：${/** @type {Error} */ (error).message}`)
+      }
     }
   }
 
@@ -1952,6 +1967,38 @@ export class Gateway {
         ...(active ? { activeCall: { callId: active.callId, text: active.text, typing: active.typing !== false } } : {}),
       },
     })
+    this.#replayPendingApprovals(session, conversationId)
+  }
+
+  /**
+   * 重发一个会话里还在等答复的审批。
+   *
+   * 审批卡是常驻的（电脑端不再超时交回桌面），所以页面刷新 / 重连 / 切回标签后
+   * 必须能把还没答的卡片再推一次；否则手机看着空白、电脑那边工具调用一直挂着。
+   * 客户端按 approvalId 幂等合并，重发不会多出一张卡。
+   * @param {Session} session
+   * @param {string} conversationId
+   */
+  #replayPendingApprovals(session, conversationId) {
+    if (!session.hasCap(CAPABILITIES.APPROVAL)) return
+    let pending = []
+    try {
+      pending = this.bridge.pendingApprovals?.(conversationId) ?? []
+    } catch (error) {
+      this.log(`approval: 读取待答审批失败：${/** @type {Error} */ (error).message}`)
+      return
+    }
+    for (const approval of pending) {
+      session.send({
+        t: SERVER_FRAME.APPROVAL_ASK,
+        sessionId: conversationId,
+        approvalId: approval.approvalId,
+        toolName: approval.toolName,
+        ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
+        ...(approval.displayReason !== undefined ? { displayReason: approval.displayReason } : {}),
+        ...(approval.callId !== undefined ? { callId: approval.callId } : {}),
+      })
+    }
   }
 
   /**

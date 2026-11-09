@@ -318,6 +318,10 @@ export async function apply(ctx, config) {
       createSession: () => bridge.createSession(),
       historyMessages: sessionId => bridge.historyMessages(sessionId),
       answerApproval: input => bridge.answerApproval(input),
+      // 审批卡常驻、没有本地超时：最后一个能作答的连接断开时交回桌面，别让工具调用挂死。
+      devicesChanged: (sessionId, remainingDeviceIds) => bridge.handleDevicesGone(sessionId, remainingDeviceIds),
+      // 刷新/重连后把还没答的审批再推一次。
+      pendingApprovals: sessionId => bridge.pendingApprovals(sessionId),
       // 结构化提问（ask_user_question / 计划审阅）的作答，与审批是两条 seam。
       answerQuestion: input => bridge.answerQuestion(input),
       releaseSession: sessionId => bridge.releaseSession(sessionId),

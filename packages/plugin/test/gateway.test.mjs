@@ -50,6 +50,8 @@ function makeBridge() {
     /** @type {(sessionId: string) => any[]} */
     history: () => [],
     answerResult: true,
+    /** @type {(sessionId: string) => any[]} */
+    pendingApprovals: () => [],
     /** Set by the test to inspect the last bridge.send input. */
     lastSend: undefined,
     /** @type {any} */
@@ -93,6 +95,8 @@ function makeBridge() {
       answeredQuestions.push(input)
       return harness.answerResult
     },
+    /** 待答审批：重连/刷新后网关应重发。 */
+    pendingApprovals: sessionId => harness.pendingApprovals(sessionId),
     releaseSession: async sessionId => { releasedSessions.push(sessionId) },
     onEvent: listener => {
       listener
@@ -2194,6 +2198,27 @@ test('a question is pushed to a capable device with its routing session', async 
   assert.equal(ask.items[0].options.length, 2)
   assert.equal(ask.callId, 'call_1')
   assert.equal(ask.canAnswerLate, true)
+  client.close()
+})
+
+test('a reconnecting device receives the approvals still waiting', async t => {
+  // 审批常驻、没有本地超时：页面刷新或断线重连后必须把未答的卡片再推一次，
+  // 否则手机看着空白、电脑那边工具调用一直挂着。
+  const { gateway, port, harness } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  harness.pendingApprovals = sessionId => [{ approvalId: 'ap_replay', toolName: 'ops_bash', reason: '写文件', sessionId }]
+
+  const { client } = await pairDevice(port, device, {
+    capabilities: [CAPABILITIES.APPROVAL, CAPABILITIES.SESSION_SYNC],
+  })
+  const ask = await client.waitFor(f => f.t === 'approval/ask')
+  assert.ok(ask, 'the pending approval must be replayed after connecting')
+  assert.equal(ask.approvalId, 'ap_replay')
+  assert.equal(ask.toolName, 'ops_bash')
+  assert.equal(ask.reason, '写文件')
+  assert.equal(ask.sessionId, gateway.deviceSession.get(device.deviceId))
+  assert.equal('expiresAt' in ask, false, 'a persistent approval carries no expiry')
   client.close()
 })
 

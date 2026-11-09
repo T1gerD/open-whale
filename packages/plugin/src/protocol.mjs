@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: 4240bbd0890e8d07c6804d139384a5edb74dd464f2287bd53bca5b03648301b3
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: c62bf148e4925dcae2cc5dfb3e71d977fae8b5f2bf26cb364a66d6b328ecbb23
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -548,14 +548,18 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {string} [reason]     Machine reason the computer logged.
  * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
  * @property {string} [callId]     The chat turn this prompt belongs to, when known.
- * @property {number} expiresAt    Unix ms after which the computer falls back to the desktop.
+ * @property {number} [expiresAt]  Unix ms after which the computer hides the card.
+ *                                 **Omitted** for persistent approvals: those stay
+ *                                 until the phone answers, delegates to the desktop,
+ *                                 or every asked device goes offline.
  */
 
 /**
  * @typedef {object} ApprovalReplyFrame
  * @property {'approval/reply'} t
  * @property {string} approvalId
- * @property {'allowed-once'|'rejected'} outcome  `allowed-once` grants exactly this one call.
+ * @property {'allowed-once'|'rejected'|'delegate'} outcome  `allowed-once` grants exactly
+ *           this one call; `delegate` hands it back to the desktop UI.
  */
 
 /**
@@ -563,7 +567,7 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {'approval/resolved'} t
  * @property {string} sessionId    Which conversation the tool belongs to.
  * @property {string} approvalId
- * @property {'allowed-once'|'rejected'|'cancelled'|'unavailable'} outcome
+ * @property {'allowed-once'|'rejected'|'delegated'|'cancelled'|'unavailable'} outcome
  * @property {string} [source]     `phone` | `desktop` | `timeout` | `cancelled`.
  */
 

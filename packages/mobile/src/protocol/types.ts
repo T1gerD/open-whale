@@ -318,8 +318,8 @@ export interface ApprovalAskFrame {
   /** 本地化文案（至少有 `en`）。 */
   displayReason?: { en: string; [locale: string]: string }
   callId?: string
-  /** Unix 毫秒：到点电脑端把提示交回桌面。 */
-  expiresAt: number
+  /** Unix 毫秒：到点电脑端把提示交回桌面。常驻审批不下发该字段。 */
+  expiresAt?: number
 }
 
 /** 那条请求已经被处理（手机/电脑/超时）。 */
@@ -327,7 +327,7 @@ export interface ApprovalResolvedFrame {
   t: 'approval/resolved'
   sessionId?: string
   approvalId: string
-  outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+  outcome: 'allowed-once' | 'rejected' | 'delegated' | 'cancelled' | 'unavailable'
   source?: 'phone' | 'desktop' | 'timeout' | 'cancelled'
 }
 
