@@ -137,7 +137,7 @@ async function buildConfigSchema() {
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
       // 转发窗口（毫秒）：手机不在线时这些值不影响桌面（直接走原有审批 UI）。
-      approvalTimeoutMs: z.number().default(DEFAULT_CONFIG.approvalTimeoutMs).description('审批转发等待手机的毫秒数（5000..120000，超时交回桌面）'),
+      approvalTimeoutMs: z.number().default(DEFAULT_CONFIG.approvalTimeoutMs).description('（已废弃，保留兼容）审批卡现在常驻手机，直到作答或「转到电脑」；该值不再触发本地超时'),
       questionTimeoutMs: z.number().default(DEFAULT_CONFIG.questionTimeoutMs).description('阻塞式提问（ask_user_question）等待手机的毫秒数'),
       questionTimedTimeoutMs: z.number().default(DEFAULT_CONFIG.questionTimedTimeoutMs).description('带超时提问（askTimed / 计划审阅）等待手机的毫秒数，应短于调用方超时'),
       questionLateWindowMs: z.number().default(DEFAULT_CONFIG.questionLateWindowMs).description('带超时提问超时后仍可通过手机补答的窗口（毫秒）'),

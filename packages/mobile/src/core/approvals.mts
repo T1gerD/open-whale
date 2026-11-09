@@ -2,12 +2,12 @@
 //
 // 关键约束（都来自冻结契约，别在这里“优化”）：
 //  * `allowed-once` 只授权这一次工具调用，**不会**提升沙箱模式；
-//  * 电脑端等 `APPROVAL_TIMEOUT_MS`，超时就把提示交回桌面，所以手机端的倒计时
-//    是“电脑会代答”的时刻，不是“请求失效”的时刻；
+//  * 电脑端把审批卡常驻在手机上：不再有本地超时/expiresAt，只有作答、转电脑或
+//    所有被问到的设备都离线时才交回桌面；
 //  * 同时可能有多条 ask 在等（不同工具/不同回合），队列必须按 approvalId 去重，
 //    后到的不能覆盖先到的，否则用户会看不到正在等的那一条。
 
-import { APPROVAL_REPLY_OUTCOMES, APPROVAL_TIMEOUT_MS, CAPABILITIES, CLIENT_FRAME } from './frames.mts'
+import { APPROVAL_REPLY_OUTCOMES, CAPABILITIES, CLIENT_FRAME } from './frames.mts'
 
 /** `displayReason` 是「语言 → 文案」的映射，protocol 保证至少有 `en`。 */
 export type ApprovalDisplayReason = { en: string; [locale: string]: string }
@@ -166,7 +166,7 @@ export function approvalAvailability(
     return {
       ok: false,
       error: '当前离线，没法回答这条请求',
-      hint: `电脑端会等 ${Math.round(APPROVAL_TIMEOUT_MS / 1000)} 秒后把提示交回桌面；连上后可以在这里重试。`,
+      hint: '离线时电脑端会把这条请求交回桌面处理；这条卡片可能已经失效，重新连上后以电脑端的提示为准。',
     }
   }
   const list = Array.isArray(capabilities) ? capabilities : []
