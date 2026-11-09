@@ -785,9 +785,8 @@ export class ChatModel {
     const epoch = Number.isFinite(Number(frame.sessionEpoch)) ? Number(frame.sessionEpoch) : this.sessionEpoch
     const sessionChanged = sessionId !== this.sessionId || epoch !== this.sessionEpoch
     if (sessionChanged) {
-      // 换会话 = 换一整套上下文：旧会话的待办审批与输入态必须先清掉，再按新快照
-      // 重建；否则上一会话的“正在输入”会残留到新会话里。
-      this.clearApprovals()
+      // 只清输入态；**审批不能清**：手机切走会话再切回来时，待答审批必须还在
+      // （真机反馈「切会话权限审核消失」）。审批按会话路由，不会串到别的标签。
       this.typing.clear()
     }
     const snapshot = frame.snapshot && typeof frame.snapshot === 'object' ? frame.snapshot : {}
@@ -883,9 +882,7 @@ export class ChatModel {
     if (sessionChanged) {
       this.sessionId = sessionId
       this.sessionEpoch = epoch
-      // 事件回放里出现新会话：上一会话的审批作废（电脑端会补 resolved，但界面要立刻清），
-      // cursor 也要从新会话的 from 重新起算，不能被旧会话的 seq 挡住。
-      this.clearApprovals()
+      // 只清输入态与游标；审批保留，理由同上（切会话不应让待答审批消失）。
       this.typing.clear()
       this.cursor = Number.isFinite(Number(frame.from)) ? Math.max(0, Number(frame.from)) : 0
     }
@@ -1230,6 +1227,19 @@ export class ChatTabsModel {
 
   get hasPendingApprovals() {
     return (this.active?.approvals.length ?? 0) > 0
+  }
+
+  /**
+   * 所有标签里待答的审批（跨标签聚合）：切到别的标签后，提醒横幅要能继续提示。
+   * @returns {Array<{sessionId: string, approval: any}>}
+   */
+  pendingApprovals() {
+    const out = []
+    for (const [sessionId, chat] of this.chats) {
+      if (!chat) continue
+      for (const approval of chat.approvals) out.push({ sessionId, approval })
+    }
+    return out
   }
 
   get questions() {

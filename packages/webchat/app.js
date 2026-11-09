@@ -2527,15 +2527,24 @@ function setupScrollTracking() {
 /** 同步审批提醒横幅：有多少条待答请求，就显示多少条。 */
 function renderApprovalBanner() {
   if (!dom.approvalBanner) return
-  const count = state.model?.approvals?.length ?? 0
-  dom.approvalBanner.hidden = count === 0
-  if (count === 0) return
-  const first = state.model.approvals[0]
+  const pending = state.model?.pendingApprovals?.() ?? []
+  const total = pending.length
+  const previous = state.approvalBannerCount ?? 0
+  state.approvalBannerCount = total
+  dom.approvalBanner.hidden = total === 0
+  if (total === 0) return
+  const active = state.model?.approvals ?? []
+  const firstOther = pending.find(item => item.sessionId !== state.model?.activeSessionId)
+  const first = active[0] ?? firstOther?.approval
   const tool = first?.toolName ? `（${first.toolName}）` : ''
-  dom.approvalBannerText.textContent = count === 1 ? `电脑在请求权限${tool}，请处理` : `有 ${count} 条权限请求待处理`
-  // 横幅出现时震动一下：手机放桌上/在别的应用里回来更容易注意到。
+  if (active.length > 0) {
+    dom.approvalBannerText.textContent = total === 1 ? `电脑在请求权限${tool}，请处理` : `有 ${total} 条权限请求待处理`
+  } else if (firstOther) {
+    dom.approvalBannerText.textContent = `「${state.model.titleFor(firstOther.sessionId)}」有权限请求${tool}，点查看切过去`
+  }
+  // 只在「从无到有」时震动，避免每次重绘都震。
   try {
-    if (navigator.vibrate) navigator.vibrate([120, 60, 120])
+    if (navigator.vibrate && previous === 0) navigator.vibrate([120, 60, 120])
   } catch {}
 }
 
@@ -2843,9 +2852,17 @@ function setupComposerEvents() {
   })
   dom.stopBtn.addEventListener('click', stopGeneration)
   dom.approvalBannerJump?.addEventListener('click', () => {
-    const card = dom.messageList.querySelector('.approval-card')
-    if (card) card.scrollIntoView({ block: 'start', behavior: 'smooth' })
-    else dom.messageArea.scrollTo({ top: 0, behavior: 'smooth' })
+    // 当前标签没有待答审批时，先切到持有审批的标签，再滚到卡片。
+    const active = state.model?.approvals ?? []
+    if (active.length === 0) {
+      const pending = state.model?.pendingApprovals?.() ?? []
+      if (pending.length > 0) switchTab(pending[0].sessionId)
+    }
+    setTimeout(() => {
+      const card = dom.messageList.querySelector('.approval-card')
+      if (card) card.scrollIntoView({ block: 'start', behavior: 'smooth' })
+      else dom.messageArea.scrollTo({ top: 0, behavior: 'smooth' })
+    }, 60)
   })
   dom.messageQueue?.addEventListener('click', event => {
     const button = event.target.closest('[data-action]')

@@ -314,13 +314,14 @@ test('审批：resolved 只移除对应那条，且不影响已回复标记', ()
   assert.deepEqual(model.approvals.map(item => item.approvalId), ['ap_2'])
 })
 
-test('审批：会话切换会清空队列（不能按错会话作答）', () => {
+test('审批：切会话不再清空待答审批（切回来还要能答）', () => {
   const model = makeModel()
   model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })
-  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash' })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash', expiresAt: Date.now() + 60_000 })
   model.applyFrame({ t: 'session/state', sessionId: 'sess_b', sessionEpoch: 2, head: 0, snapshot: { messages: [] } })
-  assert.equal(model.approvals.length, 0)
-  assert.equal(model.approvalsById.size, 0)
+  // 审批按 approvalId 路由回对的会话，切走/切回都不能丢（真机反馈的「审核消失」）。
+  assert.equal(model.approvals.length, 1)
+  assert.equal(model.approvalsById.get('ap_1')?.approvalId, 'ap_1')
 })
 
 test('file/offered 生成文件卡片，重复推送只更新不新增', () => {
@@ -471,4 +472,26 @@ test('the composer is a stop button only while generating with an empty input', 
   assert.equal(composerAction({ hasSession: false }).sendDisabled, true)
   assert.equal(composerAction({ sending: true, hasText: true }).sendDisabled, true)
   assert.equal(composerAction({ streaming: false }).sendDisabled, true)
+})
+
+
+test('a pending approval survives switching session/epoch', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_keep', toolName: 'bash', expiresAt: Date.now() + 60_000 }, NOW)
+  assert.equal(model.approvals.length, 1)
+  // 切会话/新 epoch 的快照不能把待答审批清掉（真机反馈「切会话审批消失」）。
+  model.applyFrame({ t: 'session/state', sessionId: 's2', sessionEpoch: 2, snapshot: { messages: [] } }, NOW + 1000)
+  assert.equal(model.approvals.length, 1)
+  assert.equal(model.approvalsById.get('ap_keep')?.approvalId, 'ap_keep')
+})
+
+test('pendingApprovals aggregates approvals across tabs', () => {
+  const tabs = new ChatTabsModel()
+  tabs.openTab('a')
+  tabs.openTab('b')
+  tabs.chats.get('a').applyFrame({ t: 'approval/ask', approvalId: 'ap_a', toolName: 'bash', expiresAt: NOW + 60_000 }, NOW)
+  const pending = tabs.pendingApprovals()
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].sessionId, 'a')
+  assert.equal(pending[0].approval.approvalId, 'ap_a')
 })
