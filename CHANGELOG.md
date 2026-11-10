@@ -33,7 +33,7 @@
   自检（合成 `AbortController` 走一遍转发链），并按 DSH 版本白名单（已实测 `0.2.2-rc.1`，
   同 `x.y.z` 家族匹配）记录状态；新增配置 **`experimentalDualApproval`**（默认开，显式
   `false` 关闭）：关闭/自检失败时**完全不写 `req.signal`**，退回「手机作答 + 桌面弹窗自己
-  点掉」，手机卡片与先答先算不受影响。`bridge.approvalProxyStatus()` 提供给 health。
+  点掉」，手机卡片与先答先算不受影响。`bridge.approvalProxyStatus()` 提供给 health（部署后真机发现 `index.mjs` 的 bridge 适配层漏转发这个 seam，health 曾一直显示 `approvalProxy:null`；已修并加端到端 + 结构回归断言）。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
@@ -43,7 +43,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 895 项全绿**（v3.0.0 基线 855 项，新增 40 项）。
+- 测试：**54 个测试文件 / 896 项全绿**（v3.0.0 基线 855 项，新增 41 项）。
 
 ## [3.0.0] - 2026-10-30
 

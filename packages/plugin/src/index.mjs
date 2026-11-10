@@ -334,6 +334,10 @@ export async function apply(ctx, config) {
       // 重连时补发最近结束的审批，清掉已经失效的卡片。
       // 结构化提问（ask_user_question / 计划审阅）的作答，与审批是两条 seam。
       answerQuestion: input => bridge.answerQuestion(input),
+      // 3.0.1：审批 signal 代理的启动自检 / DSH 版本白名单结论，随 /openwhale/health
+      // 暴露。这个 seam 漏转发时 health 会一直显示 approvalProxy:null（真机部署后
+      // 发现的接线缺口），所以适配层必须显式转出去。
+      approvalProxyStatus: () => bridge.approvalProxyStatus(),
       releaseSession: sessionId => bridge.releaseSession(sessionId),
       renameAssistant: async ({ label }) => {
         store.setComputerName(label)

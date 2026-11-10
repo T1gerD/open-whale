@@ -7,7 +7,7 @@
 // the profile-file reader that stands in when the default-model service is absent.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -356,4 +356,17 @@ test('配置 schema 暴露双端审批开关（有 schemastery 时是布尔且�
   const field = Config.dict.experimentalDualApproval
   assert.ok(field, 'schema 必须包含 experimentalDualApproval')
   assert.equal(field.meta?.default, true)
+})
+
+test('网关的 bridge 适配层转发 approvalProxyStatus', () => {
+  // 真机部署后发现的回归：桥本身有 approvalProxyStatus()，但 index.mjs 给 Gateway
+  // 的是一层手写适配对象，漏转发这个 seam → /openwhale/health 里的 approvalProxy
+  // 永远是 null，自检/版本白名单结果根本看不到。这里对适配层做结构断言，
+  // 防止以后重构适配对象时又把它丢掉。
+  const source = readFileSync(new URL('../src/index.mjs', import.meta.url), 'utf8')
+  assert.match(
+    source,
+    /approvalProxyStatus:\s*\(\)\s*=>\s*bridge\.approvalProxyStatus\(\)/,
+    'index.mjs 的 bridge 适配层必须把 approvalProxyStatus 转发给网关',
+  )
 })

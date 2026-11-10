@@ -229,6 +229,15 @@ async function startComputer(options = {}) {
       truncated: false,
     }),
     answerApproval: () => true,
+    // 3.0.1：网关的 health 会把这个 seam 原样透出；e2e 用固定值验证「桥给了什么，
+    // health 就能看到什么」（真正的接线在 index.mjs 的适配层，由 entry.test 钉住）。
+    approvalProxyStatus: () => ({
+      enabled: true,
+      selfCheck: 'passed',
+      hostVersion: '0.2.2-rc.1',
+      tested: true,
+      reason: 'e2e stub',
+    }),
     historyMessages: async () => [],
     fileFor: async fileId => options.fileFor?.(fileId),
     power: async input => ({
@@ -581,6 +590,11 @@ test('the health endpoint is enough to debug a failed connection', async t => {
   assert.equal(health.connections, 1)
   assert.equal(health.computerId, computer.store.computerId)
   assert.equal(health.devices.length, 1)
+  // 3.0.1：审批代理加固结论必须真的穿过 index.mjs 的 bridge 适配层到达 health
+  // （部署后真机发现漏转发 → approvalProxy 永远是 null，这条端到端断言钉住它）。
+  assert.ok(health.approvalProxy, 'health 必须带 approvalProxy')
+  assert.equal(health.approvalProxy.enabled, true)
+  assert.equal(health.approvalProxy.selfCheck, 'passed')
   client.close()
 })
 
