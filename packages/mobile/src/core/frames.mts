@@ -171,7 +171,7 @@ export const SESSION_LIST_LIMIT = 200
  */
 export const SESSION_WATCH_LIMIT = 8
 
-/** 电脑端等手机回答权限请求的时长，镜像 `APPROVAL_TIMEOUT_MS`（UI 用它提示“电脑会先代答”）。 */
+/** LEGACY：3.0.0 双端审批后不再使用，只为镜像一致性保留（见协议里的 @deprecated 说明）。 */
 export const APPROVAL_TIMEOUT_MS = 120_000
 
 /** 电脑端等手机回答阻塞式提问（ask()）的时长，镜像 `QUESTION_TIMEOUT_MS`。 */

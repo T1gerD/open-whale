@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: c3c36360326302363c9977764536949d45868cb021954cbe59b188ac212fa949
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: 01cc8804f4ca9ae89fae01fdf3b844e420d834fcbbe4e2e2f65a0bbc7854719e
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -99,6 +99,12 @@ export const ALL_CAPABILITIES = Object.freeze(Object.values(CAPABILITIES))
 export const CLIENT_FRAME = /** @type {const} */ ({
   HELLO: 'hello',
   PAIR_REQ: 'pair/req',
+  /**
+   * Heartbeat. The computer answers `pong` and treats a recent one as proof the
+   * socket is alive. A client that can tell foreground from background SHOULD add
+   * `visible: boolean` (明示前后台；缺省按前台处理) so the computer can report
+   * 「在线（前台）/ 在线（后台）」 instead of calling a backgrounded phone online.
+   */
   PING: 'ping',
   CHAT: 'chat/send',
   CHAT_CANCEL: 'chat/cancel',
@@ -821,9 +827,14 @@ export const SESSION_SNAPSHOT_LIMIT = 60
 export const SESSION_LIST_LIMIT = 200
 
 /**
- * How long a forwarded approval waits for the phone before the computer hands the
- * prompt back to its own UI. Short enough that a phone that is asleep cannot
- * freeze a desktop turn; long enough to unlock a phone and tap.
+ * LEGACY (v3.0.0 双端审批之后不再有「等待手机 N 秒再转桌面」这个阶段).
+ *
+ * 仅作为协议镜像 / 兼容常量保留：3.0.0 起审批请求到达时会同时唤起桌面原生弹窗
+ * 并把卡片推给手机，先答先算，不再有固定的转交超时。新代码不得依赖此值，新的
+ * 审批策略请通过 wire 帧本身协商。
+ *
+ * @deprecated since 3.0.0 — 保留导出只为让旧镜像/旧客户端继续能 import；下个
+ * 协议大版本考虑移除。历史语义：审批转发等待手机作答的时长（120 秒）。
  */
 export const APPROVAL_TIMEOUT_MS = 120_000
 

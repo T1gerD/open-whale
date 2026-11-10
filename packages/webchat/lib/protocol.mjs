@@ -218,9 +218,8 @@ export const SESSION_SNAPSHOT_LIMIT = 60
 export const SESSION_LIST_LIMIT = 200
 
 /**
- * 电脑端等手机回答审批的最长时间。超时后电脑把请求交回桌面 UI，
- * 并给手机补一条 `approval/resolved {outcome:'cancelled', source:'timeout'}`。
- * 客户端只用来做倒计时文案，真正的裁决在电脑端。
+ * LEGACY（3.0.0 双端审批后已无「等手机 N 秒再转桌面」阶段）：只为协议镜像测试与
+ * 旧缓存代码保留；新代码不得依赖。历史语义：电脑端等手机回答审批的最长时间。
  */
 export const APPROVAL_TIMEOUT_MS = 120_000
 
