@@ -18,7 +18,7 @@
 ## 1. 发布前门禁（必须全绿才打 tag）
 
 ```bash
-node scripts/run-tests.mjs                 # 54 文件 / 903 项（3.0.0 基线）
+node scripts/run-tests.mjs                 # 54 文件 / 906 项（3.0.0 基线）
 node scripts/run-tests.mjs --self-test     # 运行器自检：摘要 + exit 1 必须判红（改过 run-tests.mjs 必跑）
 node scripts/check-docs.mjs                # 版本 / 产物名 / README 与本文的测试计数一致
 node packages/mobile/scripts/check-syntax.mjs

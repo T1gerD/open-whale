@@ -835,3 +835,46 @@ test('老服务端快照没有 msgId 时，同文本本地气泡也不会重复�
   assert.equal(model.messages[0].id, userMessageId('m3'))
   assert.equal(model.messages[0].text, '看这个', '注入的附件提示必须剥掉')
 })
+
+test('重复气泡：手机消息回显里的附件提示段被剥掉，并合并回本地气泡', () => {
+  const model = makeModel()
+  model.addLocalUserMessage({ msgId: 'm1', text: '看这个', at: new Date().toISOString() })
+  model.applyFrame({
+    t: 'chat/echo',
+    msgId: 'dsh_9',
+    deviceId: 'dev_x',
+    at: new Date().toISOString(),
+    text: '看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上（路径相对本次对话的工作目录）：\n- 图片：a.jpg；请按需读取这些文件；图片请用图像读取工具查看。',
+  })
+  assert.equal(model.messages.length, 1, '同一条消息不能因回显多一条')
+  assert.equal(model.messages[0].text, '看这个', '注入的附件提示必须剥掉')
+})
+
+test('重复气泡：旧缓存恢复时剥掉附件提示，纯提示残留直接丢弃', () => {
+  const model = makeModel()
+  model.restoreFromStorage({
+    messages: [
+      { id: 'usr_m1', kind: 'user', text: '看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上：…', at: new Date().toISOString() },
+      { id: 'usr_m2', kind: 'user', text: '用户通过手机发来了 1 个附件，已保存到电脑上：…', at: new Date().toISOString() },
+    ],
+    cursor: 0,
+  })
+  assert.equal(model.messages.length, 1, '纯提示残留（无用户文字）必须丢弃')
+  assert.equal(model.messages[0].text, '看这个')
+})
+
+test('已回答的提问摘要可以被 UI 收起（不再永久钉在下方）', () => {
+  const model = makeModel()
+  model.applyFrame({
+    t: 'question/ask',
+    sessionId: 'sess_1',
+    questionId: 'q1',
+    items: [{ id: 'i1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] }],
+    expiresAt: Date.now() + 60_000,
+  })
+  assert.equal(model.recordQuestionAnswer('q1', [{ id: 'i1', selected: ['A'] }]), true)
+  assert.equal(model.questionLog.length, 1)
+  assert.equal(model.dismissQuestionSummary('q1'), true)
+  assert.equal(model.questionLog.length, 0)
+  assert.equal(model.dismissQuestionSummary('q1'), false, '重复收起是幂等的')
+})

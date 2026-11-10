@@ -1525,6 +1525,22 @@ function approvalCardsHtml() {
  */
 const questionDrafts = new Map()
 
+/** 已回答摘要卡展示多久后自动收起（毫秒）。 */
+const QUESTION_SUMMARY_TTL_MS = 12_000
+/** questionId → 自动收起定时器（避免每次重绘都重复排定时器）。 */
+const questionSummaryTimers = new Map()
+
+/** 给一张已回答摘要排一个自动收起定时器（幂等）。 */
+function scheduleQuestionSummaryDismiss(questionId) {
+  if (typeof questionId !== 'string' || questionId === '' || questionSummaryTimers.has(questionId)) return
+  const timer = setTimeout(() => {
+    questionSummaryTimers.delete(questionId)
+    state.model?.dismissQuestionSummary?.(questionId)
+    scheduleRender()
+  }, QUESTION_SUMMARY_TTL_MS)
+  questionSummaryTimers.set(questionId, timer)
+}
+
 /** @param {string} questionId */
 function draftFor(questionId) {
   let draft = questionDrafts.get(questionId)
@@ -1672,7 +1688,11 @@ function questionCardsHtml() {
   const model = state.model
   if (!model) return ''
   const live = (model.questions ?? []).map(questionCardHtml)
-  const done = (model.questionLog ?? []).map(questionSummaryCardHtml).filter(html => html !== '')
+  const done = (model.questionLog ?? []).map(entry => {
+    // 摘要卡只做“答完了”的即时反馈：展示一段时间后自动收起，不再永久钉在聊天流下方。
+    scheduleQuestionSummaryDismiss(entry.questionId)
+    return questionSummaryCardHtml(entry)
+  }).filter(html => html !== '')
   if (live.length === 0 && done.length === 0) return ''
   // 只有还在等回答的卡片才需要 aria-live；历史摘要不该被反复朗读。
   const ariaLive = live.length > 0 ? 'polite' : 'off'

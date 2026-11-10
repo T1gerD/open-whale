@@ -655,6 +655,9 @@ export class ChatModel {
 
   #insert(message) {
     if (!message?.id || this.byId.has(message.id)) return false
+    // 电脑端给手机附件消息注入的提示段（“用户通过手机发来了…”）只该给模型看。
+    // 任何路径进入手机聊天流都先剥掉，否则会出现一张带路径原文的异常气泡。
+    if (message.kind === 'user') message.text = stripInjectedAttachmentNotice(message.text)
     // 内部注入（runtime context / system-reminder）永远不当聊天气泡展示。
     if (message.kind === 'user' && isInjectedHistoryText(message.text)) return false
     this.byId.set(message.id, message)
@@ -794,6 +797,23 @@ export class ChatModel {
   }
 
   /**
+   * 收起一张已收尾的提问摘要。
+   * 真机反馈“回答完的卡片一直待在聊天流下方不消失”：摘要卡只是即时反馈，
+   * 展示一小段时间后由 UI 自动收起（题目/答案仍在会话历史里）。
+   * @param {string} questionId
+   * @returns {boolean}
+   */
+  dismissQuestionSummary(questionId) {
+    const id = String(questionId ?? '')
+    if (id === '') return false
+    const index = this.questionLog.findIndex(entry => entry.questionId === id)
+    if (index < 0) return false
+    this.questionLog.splice(index, 1)
+    this.#touch()
+    return true
+  }
+
+  /**
    * 本地已经提交了一批回答：标记为已回复，避免连点。
    * @param {string} questionId
    * @returns {boolean} false 表示这条提问已经不在队列里
@@ -826,6 +846,21 @@ export class ChatModel {
     approval.repliedAt = new Date().toISOString()
     this.#touch()
     return true
+  }
+
+  /**
+   * 本地撤掉一条审批卡：用户已经作答（允许/拒绝/转电脑）时立即生效，
+   * 不等电脑端的 resolved 帧——否则电脑端漏发/延迟时卡片会一直挂在下方。
+   * @param {string} approvalId
+   */
+  dismissApproval(approvalId) {
+    const id = String(approvalId ?? '')
+    if (id === '') return false
+    const index = this.approvals.findIndex(item => item.approvalId === id)
+    this.approvalsById.delete(id)
+    if (index >= 0) this.approvals.splice(index, 1)
+    if (index >= 0) this.#touch()
+    return index >= 0
   }
 
   /** 是否还有未回答的审批（决定是否跑倒计时定时器）。 */
@@ -975,7 +1010,9 @@ export class ChatModel {
       // 本地乐观消息 or 回放重复：用电脑端权威内容覆盖，但保住本地状态里更有用的信息。
       const files = normalizeAttachments(frame.files)
       Object.assign(existing, {
-        text: typeof frame.text === 'string' && frame.text !== '' ? frame.text : existing.text,
+        text: typeof frame.text === 'string' && frame.text !== ''
+          ? stripInjectedAttachmentNotice(frame.text)
+          : existing.text,
         // 只补空缺，绝不覆盖：echo 的 at 是「网关收到补发消息的时刻」，比原始发送
         // 时刻晚得多。用它替换本地 at 会让这条气泡在墙钟兜底排序里被推到后面，
         // 这正是真机「我先发的消息被排到所有回复之后」的直接原因。
@@ -991,10 +1028,31 @@ export class ChatModel {
       this.#touch(now)
       return { handled: true, changed: true, frame }
     }
+    const text = stripInjectedAttachmentNotice(String(frame.text ?? ''))
+    // 电脑端把同一条手机消息回显回来（或旧缓存里带着附件提示原文）时，按“同文本+
+    // 时间接近”合并到已有本地气泡，绝不再插一条重复气泡（真机：一张带路径原文的卡）。
+    if (text.trim() !== '') {
+      const duplicate = this.messages.find(message => message.kind === 'user'
+        && message.id !== id
+        && message.text === text
+        && (message.optimistic === true || Math.abs(now - (Date.parse(message.at ?? '') || 0)) < 120_000))
+      if (duplicate) {
+        if (Array.isArray(frame.files) && frame.files.length > 0
+          && (!duplicate.files || duplicate.files.length === 0)) {
+          duplicate.files = normalizeAttachments(frame.files)
+        }
+        duplicate.status = MESSAGE_STATUS.SENT
+        if (this.#noteSeq(duplicate, frame.seq)) duplicate.optimistic = false
+        this.#advanceCursor(frame.seq)
+        this.#sortMessages()
+        this.#touch(now)
+        return { handled: true, changed: true, frame }
+      }
+    }
     const inserted = this.#insert({
       id,
       kind: 'user',
-      text: String(frame.text ?? ''),
+      text,
       at: String(frame.at ?? new Date().toISOString()),
       files: normalizeAttachments(frame.files),
       status: MESSAGE_STATUS.SENT,
@@ -1579,6 +1637,10 @@ export class ChatModel {
     for (const raw of saved.messages) {
       if (!raw || typeof raw.id !== 'string') continue
       const message = { ...raw, tools: Array.isArray(raw.tools) ? raw.tools : [] }
+      if (message.kind === 'user') message.text = stripInjectedAttachmentNotice(message.text)
+      // 只有附件提示、没有用户文字的历史消息是旧版本重复气泡的残留：本地气泡已经
+      // 带着附件卡，这里直接丢掉，别让它在刷新后又出现一句占位文本。
+      if (message.kind === 'user' && message.text === '（来自手机的附件）') continue
       if (message.kind === 'user' && isInjectedHistoryText(message.text)) continue
       if (message.kind === 'file' && message.file?.fileId) this.files.set(message.file.fileId, message.file)
       if (this.byId.has(message.id)) continue
@@ -1743,9 +1805,14 @@ export class ChatTabsModel {
     return this.active?.questionsById ?? EMPTY_MAP
   }
 
-  /** 当前标签里已收尾的提问摘要（只读卡片，答完留在聊天流里）。 */
+  /** 当前标签里已收尾的提问摘要（只读卡片，短暂展示后自动收起）。 */
   get questionLog() {
     return this.active?.questionLog ?? EMPTY_ARRAY
+  }
+
+  /** 收起一张已收尾的提问摘要。 */
+  dismissQuestionSummary(questionId) {
+    return this.active?.dismissQuestionSummary(questionId) === true
   }
 
   get hasPendingQuestions() {
