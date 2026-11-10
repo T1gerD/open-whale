@@ -764,8 +764,21 @@ test('device presence separates foreground from background and expires stale hea
 
   client.close()
   await delay(80)
-  assert.equal(gateway.devicePresence(device.deviceId), 'offline')
   assert.equal(gateway.deviceOnline(device.deviceId), false)
+  // 2026-11-10：移动浏览器切后台会直接杀掉 WebSocket。后台断开后保留一段
+  // 「在线（后台）」宽限期，否则用户会看到“切后台 → 离线”而以为手机断开了。
+  assert.equal(gateway.devicePresence(device.deviceId), 'background', '后台断开后在宽限期内仍算在线（后台）')
+  const healthClosed = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.equal(healthClosed.onlineDevices, 1, '宽限期内的后台设备仍计入在线设备')
+  assert.equal(healthClosed.foregroundDevices, 0)
+  assert.equal(healthClosed.backgroundDevices, 1)
+  assert.equal(healthClosed.connections, 0, 'connections 仍只统计真实 socket')
+  // 超过宽限期才真正离线。
+  now += 10 * 60_000 + 1
+  assert.equal(gateway.devicePresence(device.deviceId), 'offline')
+  const healthExpired = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.equal(healthExpired.onlineDevices, 0)
+  assert.equal(healthExpired.backgroundDevices, 0)
 })
 
 test('an unauthenticated socket is registered before it ever authenticates', async t => {

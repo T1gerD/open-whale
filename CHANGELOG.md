@@ -35,6 +35,8 @@
   `false` 关闭）：关闭/自检失败时**完全不写 `req.signal`**，退回「手机作答 + 桌面弹窗自己
   点掉」，手机卡片与先答先算不受影响。`bridge.approvalProxyStatus()` 提供给 health（部署后真机发现 `index.mjs` 的 bridge 适配层漏转发这个 seam，health 曾一直显示 `approvalProxy:null`；已修并加端到端 + 结构回归断言）。
 - **手机重复气泡修复（真机反馈「同一句『看这个』出现两遍」）**：手机消息进入 DSH 日志时会带上插件注入的附件提示；历史快照重建时同一条消息拿到的是 `hist_<seq>` id，与本地气泡的 `usr_<msgId>` 不同 → 重连/切标签后多出一条蓝色气泡（第二遍还带路径原文）。现在电脑端记录「DSH 消息 id → 手机 msgId」，历史快照带 `msgId`+`seq` 并剥掉附件提示；网页版优先用 `usr_<msgId>` 合并本地气泡（保留附件卡 / mine / 干净文本），并对没有 `msgId` 的旧服务端快照按「同文本+时间接近」兜底去重。
+- **手机会话工具集修复（真机：DSH 重启后手机助理“读图工具掉线”/读不了文件）**：插件创建手机会话时没写 `agentPreset`，DSH 重启后由插件 resume 时用 profile 默认预设恢复，请求前下发 34 条 `tool-removal`（`read_image`/`read`/`write`/`edit`/`ops_*`/`web_*` 全被移除，只剩 23 个插件/团队工具）；同一会话在桌面打开过（adopt 桌面 agent）时有 57 个工具。现在 `createSession` 显式写 `meta.agentPreset: 'standard'`，新手机会话恢复后即拥有全量工具。旧会话的 preset 被 DSH 视为“会话启动事实”锁定，需在桌面打开一次或新建会话。
+- **切后台后不再立刻显示离线**：移动浏览器切后台会冻结并杀掉 WebSocket，网关原先“没有 socket 就离线”会显示成“离线”。现在记录设备最后状态，**后台断开后 10 分钟宽限期内仍显示「在线（后台）」**（health 计入 online/background 但 `connections` 仍只统计真实 socket），回前台重连立刻恢复「在线（前台）」，超时才真离线。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
@@ -44,7 +46,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 902 项全绿**（v3.0.0 基线 855 项，新增 47 项）。
+- 测试：**54 个测试文件 / 903 项全绿**（v3.0.0 基线 855 项，新增 48 项）。
 
 ## [3.0.0] - 2026-10-30
 

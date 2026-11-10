@@ -184,6 +184,15 @@ test('a phone message creates one DSH conversation for that device', async () =>
   assert.equal(fake.created[0].meta.cwd, WORKDIR)
 })
 
+test('a new phone conversation requests the standard agent preset (full tool set)', async () => {
+  // 真机回归：不写 agentPreset 时 DSH 用 profile 默认预设（只有插件/团队工具），
+  // 手机助理读不了图/文件、用不了命令和联网；standard 才有 read_image / ops_* 等。
+  const { bridge, fake } = makeBridge()
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: '你好', attachments: [] })
+  assert.equal(fake.created.length, 1)
+  assert.equal(fake.created[0].meta.agentPreset, 'standard')
+  assert.equal(fake.created[0].meta.cwd, WORKDIR)
+})
 test('two phones never share a conversation', async () => {
   const { bridge, fake } = makeBridge()
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'a', attachments: [] })

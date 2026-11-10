@@ -272,6 +272,18 @@ export class DshBridge {
       ? Math.max(0, Number(options.questionLateWindowMs))
       : QUESTION_LATE_WINDOW_MS
     this.now = options.now ?? (() => Date.now())
+    /**
+     * 新建手机会话时写入 SessionHeader 的 agent preset。
+     *
+     * 不写的话 DSH 会用 profile 的默认预设：那个预设只有插件/团队类工具，
+     * 没有 read_image / read / write / edit / grep / ops_* / web_*。真机上表现为
+     * DSH 重启后手机助理「读图工具掉线」、读不了文件、用不了命令和联网。桌面 GUI
+     * 创建会话时用的就是 standard（主会话实测 57 个工具）。
+     * @type {string}
+     */
+    this.agentPreset = typeof options.agentPreset === 'string' && options.agentPreset !== ''
+      ? options.agentPreset
+      : 'standard'
     /** sessionId → {agent, handle}：一个会话一个 agent，绝不重复创建 */
     this.agents = new Map()
     /**
@@ -532,7 +544,8 @@ export class DshBridge {
     if (sessionId === '') throw new Error('无法生成会话 id')
     const handle = await this.ctx.agents.create({
       sessionId,
-      meta: { cwd: this.#cwd() },
+      // agentPreset 决定会话的工具集/提示词组合：standard 才有读图/文件/命令/联网工具。
+      meta: { cwd: this.#cwd(), agentPreset: this.agentPreset },
       agentOptions: this.#agentOptions(),
       setup: this.#setupFor(sessionId),
     })

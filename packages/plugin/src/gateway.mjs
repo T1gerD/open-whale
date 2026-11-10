@@ -108,6 +108,15 @@ const MAX_TEXT_LENGTH = 100_000
  */
 const PRESENCE_FRESHNESS_MS = 70_000
 
+/**
+ * 后台宽限（毫秒）：设备切后台/锁屏后，移动浏览器常在几秒内冻结页面并杀掉
+ * WebSocket。如果“没有 socket 就显示离线”，用户会误以为手机断开了（真机反馈：
+ * 切后台后插件页只显示「离线」）。所以记住设备断开前的最后状态：后台断开后
+ * 在宽限期内仍显示「在线（后台）」，回到前台重连立刻恢复「在线（前台）」；
+ * 超过宽限期才真正显示 offline。前台断开不享受宽限（与旧行为一致）。
+ */
+const BACKGROUND_PRESENCE_GRACE_MS = 10 * 60_000
+
 /** Bodies we accept on the small JSON management routes (send-file etc.). */
 const MAX_JSON_BODY_BYTES = 64 * 1024
 
@@ -302,6 +311,12 @@ export class Gateway {
     this.sessions = new Set()
     /** @type {Map<string, Set<Session>>} deviceId → live sessions (see MAX_SESSIONS_PER_DEVICE) */
     this.byDevice = new Map()
+    /**
+     * deviceId → { state, at }：设备最后一条 socket 断开前的状态。
+     * 后台断开后在 BACKGROUND_PRESENCE_GRACE_MS 内仍显示「在线（后台）」。
+     * @type {Map<string, {state: 'foreground'|'background', at: number}>}
+     */
+    this.lastPresence = new Map()
     /** Rejects a replayed `hello` from an already-bound device. */
     this.nonces = new NonceReplayGuard()
     this.gatewayEvents = new EventEmitter()
@@ -388,12 +403,38 @@ export class Gateway {
    * @returns {'foreground'|'background'|'offline'}
    */
   devicePresence(deviceId) {
-    const sessions = this.sessionsForDevice(deviceId)
-    if (sessions.length === 0) return 'offline'
     const now = this.now()
+    const sessions = this.sessionsForDevice(deviceId)
+    if (sessions.length === 0) {
+      // 移动浏览器切后台会把 socket 一起带走：断开前是后台的，保留一段
+      // 「在线（后台）」宽限期，避免用户看到「离线」以为手机断开了。
+      const last = this.lastPresence.get(deviceId)
+      if (last && last.state === 'background' && now - last.at <= BACKGROUND_PRESENCE_GRACE_MS) {
+        return 'background'
+      }
+      return 'offline'
+    }
     const foreground = sessions.some(session =>
       session.visible !== false && now - session.lastVisibleAt <= PRESENCE_FRESHNESS_MS)
     return foreground ? 'foreground' : 'background'
+  }
+
+  /**
+   * 设备最后一条 socket 断开时记录其最后状态（供后台宽限期使用）。
+   * @param {Session} session
+   */
+  #rememberPresence(session) {
+    const deviceId = session.deviceId
+    if (!deviceId || this.deviceOnline(deviceId)) return
+    const now = this.now()
+    this.lastPresence.set(deviceId, {
+      state: session.visible === false ? 'background' : 'foreground',
+      at: now,
+    })
+    // 清掉过期条目，避免长期运行时 Map 无限增长。
+    for (const [id, last] of this.lastPresence) {
+      if (now - last.at > BACKGROUND_PRESENCE_GRACE_MS) this.lastPresence.delete(id)
+    }
   }
 
   /**
@@ -405,7 +446,19 @@ export class Gateway {
     for (const deviceId of this.byDevice.keys()) {
       if (this.devicePresence(deviceId) === 'foreground') foregroundDevices += 1
     }
-    const onlineDevices = this.byDevice.size
+    // 后台断开、仍在宽限期内的设备也算「在线（后台）」。
+    const now = this.now()
+    let recentBackground = 0
+    for (const [deviceId, last] of this.lastPresence) {
+      if (this.byDevice.has(deviceId)) continue
+      if (last.state !== 'background') continue
+      if (now - last.at > BACKGROUND_PRESENCE_GRACE_MS) {
+        this.lastPresence.delete(deviceId)
+        continue
+      }
+      recentBackground += 1
+    }
+    const onlineDevices = this.byDevice.size + recentBackground
     return { onlineDevices, foregroundDevices, backgroundDevices: onlineDevices - foregroundDevices }
   }
 
@@ -1191,6 +1244,7 @@ export class Gateway {
     this.sessions.delete(session)
     if (!session.deviceId) return
     this.#removeDeviceSession(session)
+    this.#rememberPresence(session)
     if (!this.deviceOnline(session.deviceId)) {
       this.gatewayEvents.emit('device-offline', { deviceId: session.deviceId, sessionId: session.id })
     }
