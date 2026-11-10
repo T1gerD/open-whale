@@ -2193,6 +2193,26 @@ test('a desktop user message is echoed to the phone that is watching the convers
   client.close()
 })
 
+test('a dual-display approval is marked onDesktop for the phone', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client, ack } = await pairDevice(port, device, { capabilities: [CAPABILITIES.APPROVAL] })
+
+  gateway.pushEvent({
+    kind: 'approval-ask',
+    sessionId: ack.sessionId,
+    approvalId: 'ap_desk',
+    toolName: 'bash',
+    reason: '电脑端同时展示',
+    onDesktop: true,
+  })
+  const ask = await client.waitFor(f => f.t === 'approval/ask')
+  assert.ok(ask)
+  assert.equal(ask.onDesktop, true)
+  client.close()
+})
+
 test('a question is pushed to a capable device with its routing session', async t => {
   const { gateway, port } = await makeGateway()
   t.after(() => gateway.close())

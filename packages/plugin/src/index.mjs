@@ -77,21 +77,18 @@ export const DEFAULT_CONFIG = Object.freeze({
   cloudflaredPath: '',
   // 转发窗口（毫秒）。默认值与协议常量一致，但做成配置项：用户的网络/作息差别
   // 很大（有人 10 秒就点、有人要开手机解锁），写死一个值总有一边不合适。
-  approvalTimeoutMs: 60000,
   questionTimeoutMs: 90000,
   questionTimedTimeoutMs: 30000,
   questionLateWindowMs: 300000,
 })
 
-/** 审批转发窗口的合法范围：太短等于没问手机，太长会把桌面工具调用拖住。 */
-export const APPROVAL_TIMEOUT_MIN_MS = 5_000
-export const APPROVAL_TIMEOUT_MAX_MS = 120_000
+
 
 /**
- * 把配置里的四个转发窗口归一化（审批窗口夹在 5s..120s，其余只校验非负）。
+ * 把配置里的提问窗口归一化（只校验非负）。
  * 纯函数，便于在没有 DSH 上下文的测试里钉住行为。
- * @param {{approvalTimeoutMs?: unknown, questionTimeoutMs?: unknown, questionTimedTimeoutMs?: unknown, questionLateWindowMs?: unknown}} [config]
- * @returns {{approvalTimeoutMs: number, questionTimeoutMs: number, questionTimedTimeoutMs: number, questionLateWindowMs: number}}
+ * @param {{questionTimeoutMs?: unknown, questionTimedTimeoutMs?: unknown, questionLateWindowMs?: unknown}} [config]
+ * @returns {{questionTimeoutMs: number, questionTimedTimeoutMs: number, questionLateWindowMs: number}}
  */
 export function resolveForwardTimeouts(config = {}) {
   const finiteOr = (value, fallback) => {
@@ -99,10 +96,6 @@ export function resolveForwardTimeouts(config = {}) {
     return Number.isFinite(number) && number >= 0 ? Math.round(number) : fallback
   }
   return {
-    approvalTimeoutMs: Math.min(
-      APPROVAL_TIMEOUT_MAX_MS,
-      Math.max(APPROVAL_TIMEOUT_MIN_MS, finiteOr(config.approvalTimeoutMs, DEFAULT_CONFIG.approvalTimeoutMs)),
-    ),
     questionTimeoutMs: finiteOr(config.questionTimeoutMs, DEFAULT_CONFIG.questionTimeoutMs),
     questionTimedTimeoutMs: finiteOr(config.questionTimedTimeoutMs, DEFAULT_CONFIG.questionTimedTimeoutMs),
     questionLateWindowMs: finiteOr(config.questionLateWindowMs, DEFAULT_CONFIG.questionLateWindowMs),
@@ -137,7 +130,6 @@ async function buildConfigSchema() {
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
       // 转发窗口（毫秒）：手机不在线时这些值不影响桌面（直接走原有审批 UI）。
-      approvalTimeoutMs: z.number().default(DEFAULT_CONFIG.approvalTimeoutMs).description('审批转发等待手机的毫秒数（5000..120000，超时交回桌面；手机卡片保留，仍可转回手机作答）'),
       questionTimeoutMs: z.number().default(DEFAULT_CONFIG.questionTimeoutMs).description('阻塞式提问（ask_user_question）等待手机的毫秒数'),
       questionTimedTimeoutMs: z.number().default(DEFAULT_CONFIG.questionTimedTimeoutMs).description('带超时提问（askTimed / 计划审阅）等待手机的毫秒数，应短于调用方超时'),
       questionLateWindowMs: z.number().default(DEFAULT_CONFIG.questionLateWindowMs).description('带超时提问超时后仍可通过手机补答的窗口（毫秒）'),
@@ -187,7 +179,7 @@ let currentCleanup = null
 function volatilize(schema) {
   const dict = schema?.dict ?? {}
   const patches = {}
-  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'connectionMode', 'tunnelMode', 'approvalTimeoutMs', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
+  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'connectionMode', 'tunnelMode', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
     if (dict[key]?.volatile) patches[key] = dict[key].volatile()
   }
   return patches
@@ -292,7 +284,6 @@ export async function apply(ctx, config) {
     emit: event => gateway?.pushEvent(event),
     // 审批转发前先问网关「这个会话有没有在线手机」；没有就交回桌面。
     devicesInSession: sessionId => (gateway ? gateway.approvalDevicesFor(sessionId) : []),
-    approvalTimeoutMs: settings.approvalTimeoutMs,
     questionTimeoutMs: settings.questionTimeoutMs,
     questionTimedTimeoutMs: settings.questionTimedTimeoutMs,
     questionLateWindowMs: settings.questionLateWindowMs,

@@ -1824,6 +1824,7 @@ export class Gateway {
           ...(event.reason !== undefined ? { reason: event.reason } : {}),
           ...(event.displayReason !== undefined ? { displayReason: event.displayReason } : {}),
           ...(event.callId !== undefined ? { callId: event.callId } : {}),
+          ...(event.onDesktop === true ? { onDesktop: true } : {}),
         }
         const delivered = this.#broadcastToConversation(conversationId, frame, {
           requireCapability: CAPABILITIES.APPROVAL,
@@ -2009,6 +2010,7 @@ export class Gateway {
         ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
         ...(approval.displayReason !== undefined ? { displayReason: approval.displayReason } : {}),
         ...(approval.callId !== undefined ? { callId: approval.callId } : {}),
+        ...(approval.onDesktop === true ? { onDesktop: true } : {}),
       })
     }
   }

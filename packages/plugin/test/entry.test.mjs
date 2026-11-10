@@ -12,8 +12,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
-  APPROVAL_TIMEOUT_MAX_MS,
-  APPROVAL_TIMEOUT_MIN_MS,
   Config,
   DEFAULT_CONFIG,
   readProfileDefaultModel,
@@ -284,25 +282,15 @@ test('resolveModelSelection falls back to the profile file when the service is a
 // v3.0.0: 转发窗口可配置（审批 / 提问）
 // ---------------------------------------------------------------------------
 
-test('forwarding windows have safe defaults that match the protocol constants', () => {
-  assert.equal(DEFAULT_CONFIG.approvalTimeoutMs, 60000)
+test('question forwarding windows have safe defaults', () => {
   assert.equal(DEFAULT_CONFIG.questionTimeoutMs, 90000)
   assert.equal(DEFAULT_CONFIG.questionTimedTimeoutMs, 30000)
   assert.equal(DEFAULT_CONFIG.questionLateWindowMs, 300000)
   assert.deepEqual(resolveForwardTimeouts({}), {
-    approvalTimeoutMs: 60000,
     questionTimeoutMs: 90000,
     questionTimedTimeoutMs: 30000,
     questionLateWindowMs: 300000,
   })
-})
-
-test('the approval window is clamped into 5s..120s', () => {
-  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 1 }).approvalTimeoutMs, APPROVAL_TIMEOUT_MIN_MS)
-  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 999_999 }).approvalTimeoutMs, APPROVAL_TIMEOUT_MAX_MS)
-  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 30_000 }).approvalTimeoutMs, 30_000)
-  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: '45000' }).approvalTimeoutMs, 45_000)
-  assert.equal(resolveForwardTimeouts({ approvalTimeoutMs: 'nope' }).approvalTimeoutMs, DEFAULT_CONFIG.approvalTimeoutMs)
 })
 
 test('question windows keep their configured value but refuse garbage', () => {
@@ -331,14 +319,13 @@ test('the new timeout fields are listed as live-editable candidates', () => {
   const volatile = () => ({ type: 'number' })
   const schema = {
     dict: {
-      approvalTimeoutMs: { volatile },
       questionTimeoutMs: { volatile },
       questionTimedTimeoutMs: { volatile },
       questionLateWindowMs: { volatile },
     },
   }
   const patches = volatilize(schema)
-  for (const key of ['approvalTimeoutMs', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
+  for (const key of ['questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
     assert.ok(patches[key], `${key} must be volatilizable`)
   }
   assert.deepEqual(volatilize({ dict: {} }), {})

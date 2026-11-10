@@ -327,6 +327,23 @@ test('审批：电脑端重发同一个 approvalId 会清掉本地「已答复�
   assert.equal(model.markApprovalReplied('ap_1', 'allowed-once'), true, '重新点一次要能发出去')
 })
 
+test('审批：转到电脑端的卡片保留 onDesktop / 自动拒绝时间', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })
+  model.applyFrame({ t: 'approval/ask', approvalId: 'ap_1', toolName: 'bash', reason: 'x' })
+  assert.equal(model.approvals[0].onDesktop, undefined)
+
+  model.applyFrame({
+    t: 'approval/ask',
+    approvalId: 'ap_1',
+    toolName: 'bash',
+    reason: 'x',
+    onDesktop: true,
+  })
+  assert.equal(model.approvals.length, 1, '重发只更新同一张卡')
+  assert.equal(model.approvals[0].onDesktop, true)
+})
+
 test('审批：切会话不再清空待答审批（切回来还要能答）', () => {
   const model = makeModel()
   model.applyFrame({ t: 'session/state', sessionId: 'sess_a', sessionEpoch: 1, head: 1, snapshot: { messages: [] } })

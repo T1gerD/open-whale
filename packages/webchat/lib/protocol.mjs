@@ -222,7 +222,7 @@ export const SESSION_LIST_LIMIT = 200
  * 并给手机补一条 `approval/resolved {outcome:'cancelled', source:'timeout'}`。
  * 客户端只用来做倒计时文案，真正的裁决在电脑端。
  */
-export const APPROVAL_TIMEOUT_MS = 60_000
+export const APPROVAL_TIMEOUT_MS = 120_000
 
 /** 电脑端等手机回答阻塞式提问（ask()）的时长（比审批略长：多题、多选项、要打字）。 */
 export const QUESTION_TIMEOUT_MS = 90_000

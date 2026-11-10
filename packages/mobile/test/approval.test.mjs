@@ -151,7 +151,7 @@ test('replying needs a live connection and the approval-v1 capability', () => {
   assert.equal(approvalAvailability(true, ['approval-v1']).ok, true)
   const offline = approvalAvailability(false, ['approval-v1'])
   assert.equal(offline.ok, false)
-  assert.match(offline.hint, /交回桌面/)
+  assert.match(offline.hint, /电脑端/)
   const old = approvalAvailability(true, ['chat-echo-v1'])
   assert.equal(old.ok, false)
   assert.match(old.error, /版本较旧/)

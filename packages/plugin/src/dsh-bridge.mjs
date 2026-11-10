@@ -24,7 +24,6 @@ import { pathToFileURL } from 'node:url'
 
 import {
   APPROVAL_REPLY_OUTCOMES,
-  APPROVAL_TIMEOUT_MS,
   IdempotencyCache,
   QUESTION_LATE_WINDOW_MS,
   QUESTION_MAX_ITEMS,
@@ -40,6 +39,7 @@ import { assistantVoiceSection, VOICE_SECTION_NAME, VOICE_SECTION_ORDER } from '
 
 /** Tools whose results are files rather than text. */
 const FILE_TOOL_HINTS = ['write', 'image', 'docx', 'xlsx', 'pptx', 'pdf', 'export', 'render', 'download']
+
 
 /** 交回桌面的审批保留多久，用于重连时给手机补一条 resolved（清掉点不动的卡片）。 */
 const RECENT_RESOLUTION_TTL_MS = 3 * 60_000
@@ -78,8 +78,6 @@ export class DshBridge {
    *        decide whether an approval may be forwarded at all — registering the
    *        answerer is not the same as claiming: with no phone online the
    *        request must fall through to the desktop UI.
-   * @param {number} [options.approvalTimeoutMs] 手机没作答多久后把审批交给桌面 UI
-   *        （默认 60 秒，可配置；交回桌面后手机卡片保留，仍可「转到手机」作答）。
    * @param {() => number} [options.now]
    * @param {(input: {content: Array<{type: string, text: string}>, source: {kind: string}}) => any} [options.createUserMessage]
    *        Injected so the bridge can be exercised without the harness present.
@@ -107,9 +105,6 @@ export class DshBridge {
     this.modelSelection = options.modelSelection ?? (() => undefined)
     this.newSessionId = options.newSessionId ?? (() => randomUUID())
     this.devicesInSession = options.devicesInSession ?? (() => [])
-    this.approvalTimeoutMs = Number.isFinite(options.approvalTimeoutMs)
-      ? Math.max(0, Number(options.approvalTimeoutMs))
-      : APPROVAL_TIMEOUT_MS
     // 结构化提问（ask_user_question / 计划审阅）的转发窗口。阻塞式 ask() 可以等久一点
     // （一张卡里可能有多题、选项和自定义输入）；askTimed() 必须比调用方自己的超时短，
     // 否则 DSH 已经把模型放行了，桌面拿到的却是一个已经过期的等待。
@@ -399,7 +394,7 @@ export class DshBridge {
   // ---------------------------------------------------------------------------
 
   /**
-   * 手机对一条待答审批作答。
+   * 手机对一条待答审批作答（B 版：桌面与手机同时可答，谁先答算谁）。
    * @param {{approvalId: string, deviceId?: string, outcome: string}} input
    * @returns {boolean} 是否真的结算了一条等待中的请求
    */
@@ -409,12 +404,35 @@ export class DshBridge {
     if (!entry) return false
     const deviceId = typeof input?.deviceId === 'string' ? input.deviceId : ''
     // 只有被问过的那台手机能答，避免同会话的另一台设备抢答。
-    if (deviceId !== '' && !entry.deviceIds.has(deviceId)) return false
+    if (deviceId !== '' && !entry.deviceIds.has(deviceId)) {
+      // 请求到达时手机不在线：桌面已经在等，手机连上后仍可作答（双端可答）。
+      const online = this.#approvalDevices(entry.sessionId)
+      if (!online.includes(deviceId)) return false
+    }
     const outcome = APPROVAL_REPLY_OUTCOMES.includes(/** @type {any} */ (input?.outcome))
       ? /** @type {string} */ (input.outcome)
       : 'rejected'
-    this.#settleApproval(approvalId, outcome)
-    this.log(`approval: ${approvalId} 手机答复 → ${outcome}`)
+    if (outcome === 'delegate') {
+      // 手机主动转电脑：立刻交给桌面，请求继续挂着等桌面结果。
+      if (!entry.desktop) {
+        this.log(`approval: ${approvalId} 手机选择转到电脑`)
+        this.#transferToDesktop(entry)
+      }
+      return true
+    }
+    // B 版实验：转桌面后手机仍可作答（双端同时可答）。
+    const proxy = entry.proxyController
+    this.#settleApproval(approvalId, outcome, 'phone')
+    this.log(`approval: ${approvalId} 手机答复 → ${outcome}${entry.desktop ? '（桌面已弹窗）' : ''}`)
+    // 双端实验：用代理 signal 的 abort 把桌面原生弹窗收掉（若 hack 生效）。
+    if (proxy && entry.hackActive) {
+      try {
+        proxy.abort(new Error('answered on phone'))
+        this.log(`approval: ${approvalId} 已 abort signal 代理，通知桌面关闭弹窗`)
+      } catch (error) {
+        this.log(`approval: ${approvalId} abort signal 代理失败：${/** @type {Error} */ (error).message}`)
+      }
+    }
     return true
   }
 
@@ -533,20 +551,19 @@ export class DshBridge {
   }
 
   /**
-   * 把一条审批请求转发给手机；手机没答（60 秒，可配置）或没有手机在线时交回桌面。
+   * B 版：双端同时可见、同时可答。
+   *
+   * 请求一到达就同时推给手机并发起桌面原生弹窗（`next()`），两边都能作答；
+   * 谁先答算谁。不做 120 秒转交、不做转桌面提醒、不做自动拒绝。
    * @param {string} sessionId
    * @param {any} req
    * @param {() => Promise<any>} next
    */
   async #onApprovalRequest(sessionId, req, next) {
     if (this.disposed) return next()
-    const devices = this.#approvalDevices(sessionId)
-    if (devices.length === 0) {
-      // 没有手机在线：绝不冒领，把问题交回桌面 UI。
-      return next()
-    }
     const signal = req?.signal
     if (signal?.aborted) return next()
+    const devices = this.#approvalDevices(sessionId)
 
     const approvalId = randomUUID()
     const payload = {
@@ -558,43 +575,103 @@ export class DshBridge {
       ...(isLocalizedText(req?.displayReason) ? { displayReason: req.displayReason } : {}),
       ...(typeof req?.callId === 'string' && req.callId !== '' ? { callId: req.callId } : {}),
     }
+    /** @type {any} */
+    let entry
     const decisionPromise = new Promise(resolve => {
-      /** @type {any} */
-      const entry = { approvalId, resolve, sessionId, deviceIds: new Set(devices), timer: null, signal, onAbort: null, payload }
-      this.approvals.set(approvalId, entry)
-      if (this.approvalTimeoutMs > 0) {
-        entry.timer = setTimeout(() => this.#settleApproval(approvalId, 'timeout'), this.approvalTimeoutMs)
-        entry.timer.unref?.()
+      entry = {
+        approvalId,
+        resolve,
+        sessionId,
+        deviceIds: new Set(devices),
+        payload,
+        signal,
+        req,
+        onAbort: null,
+        next,
+        proxyController: null,
+        proxyForwardAbort: null,
+        hackActive: false,
+        desktop: false,
+        desktopAnswer: null,
       }
+      this.approvals.set(approvalId, entry)
       if (signal && typeof signal.addEventListener === 'function') {
-        entry.onAbort = () => this.#settleApproval(approvalId, 'aborted')
+        entry.onAbort = () => this.#settleApproval(approvalId, 'cancelled', 'cancelled')
         signal.addEventListener('abort', entry.onAbort, { once: true })
       }
     })
     this.emit(payload)
-    this.log(`approval: 请求 ${approvalId} session=${sessionId} 设备=${devices.join(',')} 工具=${payload.toolName}`)
+    this.log(`approval: 请求 ${approvalId} session=${sessionId} 设备=${devices.join(',') || '（无）'} 工具=${payload.toolName}`)
+
+    // 双端同时可见：立刻唤起桌面弹窗（手机卡片保持可作答）。
+    this.#transferToDesktop(entry)
 
     const decision = await decisionPromise
-    if (decision === 'delegate') {
-      // 「转到电脑」：把这次审批交给桌面 UI。
-      this.log(`approval: ${approvalId} 转交电脑 → next()`)
-      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: 'delegated', source: 'phone' })
-      return next()
+    const outcome = decision?.outcome ?? 'cancelled'
+    const by = decision?.by ?? 'cancelled'
+    if (outcome === 'allowed-once' || outcome === 'rejected') {
+      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome, source: by })
+      this.log(`approval: ${approvalId} 结束 ${outcome}（来源 ${by}）`)
+      return outcome
     }
-    if (decision === 'allowed-once' || decision === 'rejected') {
-      this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: decision, source: 'phone' })
-      return decision
+    this.log(`approval: ${approvalId} 结束（${outcome}，来源 ${by}）`)
+    this.emit({ kind: 'approval-resolved', sessionId, approvalId, outcome: 'cancelled', source: by })
+    return outcome === 'unavailable' ? 'unavailable' : 'cancelled'
+  }
+
+  /**
+   * 让桌面原生弹窗也显示这条审批（手机卡片保持可作答，双端同时可见）。
+   * @param {any} entry
+   */
+  #transferToDesktop(entry) {
+    if (!entry || entry.desktop) return
+    entry.desktop = true
+    entry.payload.onDesktop = true
+    this.emit({ ...entry.payload })
+    this.log(`approval: ${entry.approvalId} 已同时交给桌面端（双端可答）`)
+
+    // B 版实验：把下游 answerer 看到的 signal 换成我们自己的代理 signal。
+    // 原始 signal 的 abort 会转发到代理上（保证「停止/取消」仍然有效）。
+    // 注意：绝不能 abort 原始 signal——审批服务在 decide() 里已经拿它做了取消竞争。
+    try {
+      const controller = new AbortController()
+      const original = entry.signal
+      if (original && typeof original.addEventListener === 'function') {
+        entry.proxyForwardAbort = () => controller.abort(original.reason)
+        original.addEventListener('abort', entry.proxyForwardAbort, { once: true })
+        if (original.aborted) controller.abort(original.reason)
+      }
+      if (entry.req && typeof entry.req === 'object') {
+        entry.req.signal = controller.signal
+        entry.proxyController = controller
+        entry.hackActive = entry.req.signal === controller.signal
+      }
+      this.log(
+        entry.hackActive
+          ? `approval: ${entry.approvalId} signal 代理已启用（手机作答将关闭桌面弹窗）`
+          : `approval: ${entry.approvalId} signal 代理不可用（req.signal 不可写），退回残框模式`,
+      )
+    } catch (error) {
+      this.log(`approval: ${entry.approvalId} signal 代理失败，退回残框模式：${/** @type {Error} */ (error).message}`)
     }
-    // 超时 / 中止：卡片收起，交回桌面。
-    this.log(`approval: ${approvalId} 未答复（${decision}）→ 交回桌面`)
-    this.emit({
-      kind: 'approval-resolved',
-      sessionId,
-      approvalId,
-      outcome: 'cancelled',
-      source: decision === 'timeout' ? 'timeout' : 'cancelled',
+
+    let answer
+    try {
+      answer = Promise.resolve(entry.next())
+    } catch (error) {
+      answer = Promise.reject(error)
+    }
+    entry.desktopAnswer = answer
+    answer.then(raw => {
+      if (!this.approvals.has(entry.approvalId)) return
+      const outcome = raw === 'allowed-once' || raw === 'rejected'
+        ? raw
+        : raw === 'unavailable' ? 'unavailable' : 'cancelled'
+      this.#settleApproval(entry.approvalId, outcome, 'desktop')
+    }).catch(() => {
+      if (!this.approvals.has(entry.approvalId)) return
+      this.#settleApproval(entry.approvalId, 'unavailable', 'desktop')
     })
-    return next()
   }
 
   /**
@@ -612,16 +689,30 @@ export class DshBridge {
     }
   }
 
-  /** @param {string} approvalId @param {'allowed-once'|'rejected'|'delegate'|'timeout'|'aborted'|'cancelled'} outcome */
-  #settleApproval(approvalId, outcome) {
+  /**
+   * @param {string} approvalId
+   * @param {string} outcome
+   * @param {string} [by] `phone` / `desktop` / `expired` / `cancelled`
+   */
+  #settleApproval(approvalId, outcome, by = 'phone') {
     const entry = this.approvals.get(approvalId)
     if (!entry) return
     this.approvals.delete(approvalId)
-    if (entry.timer) clearTimeout(entry.timer)
+    // 原始 signal 中止（停止/取消）时要把 abort 转发给代理 signal，桌面弹窗才会关。
+    // 监听器的执行顺序不保证，所以在这里显式补一次。
+    if (entry.proxyController && entry.signal?.aborted && !entry.proxyController.signal.aborted) {
+      try {
+        entry.proxyController.abort(entry.signal.reason)
+      } catch { /* 代理已不可用 */ }
+    }
     if (entry.onAbort && typeof entry.signal?.removeEventListener === 'function') {
       entry.signal.removeEventListener('abort', entry.onAbort)
     }
-    entry.resolve(outcome)
+    if (entry.proxyForwardAbort && typeof entry.signal?.removeEventListener === 'function') {
+      entry.signal.removeEventListener('abort', entry.proxyForwardAbort)
+      entry.proxyForwardAbort = null
+    }
+    entry.resolve({ outcome, by })
   }
 
   /**
@@ -807,8 +898,19 @@ export class DshBridge {
     if (!entry) return
     this.questions.delete(questionId)
     if (entry.timer) clearTimeout(entry.timer)
+    // 原始 signal 中止（停止/取消）时要把 abort 转发给代理 signal，桌面弹窗才会关。
+    // 监听器的执行顺序不保证，所以在这里显式补一次。
+    if (entry.proxyController && entry.signal?.aborted && !entry.proxyController.signal.aborted) {
+      try {
+        entry.proxyController.abort(entry.signal.reason)
+      } catch { /* 代理已不可用 */ }
+    }
     if (entry.onAbort && typeof entry.signal?.removeEventListener === 'function') {
       entry.signal.removeEventListener('abort', entry.onAbort)
+    }
+    if (entry.proxyForwardAbort && typeof entry.signal?.removeEventListener === 'function') {
+      entry.signal.removeEventListener('abort', entry.proxyForwardAbort)
+      entry.proxyForwardAbort = null
     }
     entry.resolve(outcome)
   }

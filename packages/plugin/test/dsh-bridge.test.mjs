@@ -928,7 +928,7 @@ test('adopting a live agent registers working approval and question forwarders',
   assert.deepEqual((await questionPromise).answers[0], { id: 'q1', selected: ['A'] })
 
   // 审批转发同理：允许只授权这一次调用。
-  const approvalPromise = approvalEntry.listener({ toolName: 'bash' }, async () => 'delegated')
+  const approvalPromise = approvalEntry.listener({ toolName: 'bash' }, () => new Promise(() => {}))
   await delay(10)
   const approval = events.filter(event => event.kind === 'approval-ask').at(-1)
   assert.ok(approval, 'the adopted forwarder must emit approval-ask')
@@ -998,7 +998,7 @@ test('an agent resumed by the desktop is adopted so approvals still reach the ph
   assert.ok(questionEntry, 'a desktop-resumed agent must get a question forwarder')
   assert.equal(approvalEntry.opts?.prepend, true)
 
-  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop')
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, () => new Promise(() => {}))
   await delay(10)
   const approval = events.find(event => event.kind === 'approval-ask')
   assert.ok(approval, 'the adopted forwarder must emit approval-ask')
@@ -1018,35 +1018,108 @@ test('agent/created never double-registers the plugin own conversations', async 
   assert.equal(fake.scopedEvents.filter(entry => entry.event === 'user-questions/request').length, 1)
 })
 
-test('delegating an approval hands it to the desktop instead of rejecting', async () => {
-  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], approvalTimeoutMs: 60_000 })
+test('B 双端同时可见：请求一到就同时唤起桌面并推给手机，手机先答算手机', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
-  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'delegated-to-desktop')
-  await delay(10)
-  const approval = events.find(event => event.kind === 'approval-ask')
-  assert.ok(approval)
-  assert.equal('expiresAt' in approval, false, 'the card relies on the 60s handoff, not an expiry')
+  let desktopAsked = false
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => {
+    desktopAsked = true
+    return 'allowed-once'
+  })
+  assert.equal(desktopAsked, true, 'the desktop dialog is opened immediately, not after a wait')
 
-  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'delegate' }), true)
-  assert.equal(await approvalPromise, 'delegated-to-desktop', 'delegate must call next()')
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval, 'the phone gets its card at the same time')
+  const onDesktop = events.filter(event => event.kind === 'approval-ask' && event.approvalId === approval.approvalId).at(-1)
+  assert.equal(onDesktop.onDesktop, true, 'the card knows the desktop is showing the same prompt')
+
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
   const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
-  assert.equal(resolved.outcome, 'delegated')
   assert.equal(resolved.source, 'phone')
 })
 
-test('an approval nobody answers is handed back to the desktop after the window', async () => {
-  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], approvalTimeoutMs: 20 })
+test('B 双端同时可见：桌面先答，手机收到 desktop 来源的 resolved', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
-  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'desktop-took-over')
-  await delay(60)
-  assert.equal(await approvalPromise, 'desktop-took-over', 'timeout must fall through to the desktop UI')
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => 'rejected')
+  assert.equal(await approvalPromise, 'rejected')
   const approval = events.find(event => event.kind === 'approval-ask')
   assert.ok(approval)
   const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
-  assert.equal(resolved.outcome, 'cancelled')
-  assert.equal(resolved.source, 'timeout')
+  assert.equal(resolved.outcome, 'rejected')
+  assert.equal(resolved.source, 'desktop')
+})
+
+test('B 实验：请求一到就把 req.signal 换成代理，手机作答后 abort 代理', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const original = new AbortController()
+  const req = { toolName: 'ops_bash', signal: original.signal }
+  const approvalPromise = approvalEntry.listener(req, () => new Promise(() => {}))
+
+  assert.notEqual(req.signal, original.signal, 'the downstream answerer must see the proxy signal')
+  const proxy = req.signal
+  assert.equal(proxy.aborted, false)
+
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+  assert.equal(proxy.aborted, true, '手机作答后代理 signal 被 abort（若远端传播，桌面弹窗会关闭）')
+})
+
+test('B 实验：原始 signal 的 abort 会转发到代理（停止/取消仍然有效）', async () => {
+  const { bridge, fake } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const original = new AbortController()
+  const req = { toolName: 'ops_bash', signal: original.signal }
+  const approvalPromise = approvalEntry.listener(req, () => new Promise(() => {}))
+  const proxy = req.signal
+  original.abort(new Error('turn cancelled'))
+  await delay(5)
+  assert.equal(proxy.aborted, true, '原始 signal 的 abort 必须转发，否则「停止」失效')
+  assert.equal(await approvalPromise, 'cancelled')
+})
+
+test('B 实验：req 被冻结时自动降级为残框模式，不影响手机作答', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const original = new AbortController()
+  const req = Object.freeze({ toolName: 'ops_bash', signal: original.signal })
+  const approvalPromise = approvalEntry.listener(req, () => new Promise(() => {}))
+  assert.equal(req.signal, original.signal, 'frozen request cannot be patched')
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'rejected' }), true)
+  assert.equal(await approvalPromise, 'rejected')
+})
+
+test('B 双端同时可见：手机不在线时桌面直接弹，手机连上后仍可作答', async () => {
+  let online = []
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => online })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  let desktopAsked = false
+  const approvalPromise = approvalEntry.listener({ toolName: 'ops_bash' }, async () => {
+    desktopAsked = true
+    return 'allowed-once'
+  })
+  assert.equal(desktopAsked, true)
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  const pending = bridge.pendingApprovals('ow-dev_a')
+  assert.equal(pending.length, 1, 'the request stays replayable for a late phone')
+  assert.equal(pending[0].onDesktop, true)
+
+  online = ['dev_a']
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
 })
 
 test('desktop user messages are forwarded live, phone-injected and runtime ones are not', async () => {

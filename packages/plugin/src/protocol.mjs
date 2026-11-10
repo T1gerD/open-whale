@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: f008410a2e1651d9d6663b085745c112393b30883bf4e772ba0147030527cb60
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: c3c36360326302363c9977764536949d45868cb021954cbe59b188ac212fa949
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -549,6 +549,8 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
  * @property {string} [callId]     The chat turn this prompt belongs to, when known.
  * @property {number} [expiresAt]  Unix ms after which the computer falls back to the desktop.
+ * @property {boolean} [onDesktop] The prompt has been handed off to the desktop UI;
+ *                                 the phone card becomes read-only until the desktop decides.
  */
 
 /**
@@ -823,7 +825,7 @@ export const SESSION_LIST_LIMIT = 200
  * prompt back to its own UI. Short enough that a phone that is asleep cannot
  * freeze a desktop turn; long enough to unlock a phone and tap.
  */
-export const APPROVAL_TIMEOUT_MS = 60_000
+export const APPROVAL_TIMEOUT_MS = 120_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected', 'delegate'])

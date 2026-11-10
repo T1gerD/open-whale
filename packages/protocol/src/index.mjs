@@ -541,6 +541,8 @@ export function helloAckProofMessage(nonce, deviceId) {
  * @property {{en: string, [locale: string]: string}} [displayReason] Localized copy.
  * @property {string} [callId]     The chat turn this prompt belongs to, when known.
  * @property {number} [expiresAt]  Unix ms after which the computer falls back to the desktop.
+ * @property {boolean} [onDesktop] The prompt has been handed off to the desktop UI;
+ *                                 the phone card becomes read-only until the desktop decides.
  */
 
 /**
@@ -815,7 +817,7 @@ export const SESSION_LIST_LIMIT = 200
  * prompt back to its own UI. Short enough that a phone that is asleep cannot
  * freeze a desktop turn; long enough to unlock a phone and tap.
  */
-export const APPROVAL_TIMEOUT_MS = 60_000
+export const APPROVAL_TIMEOUT_MS = 120_000
 
 /** The only outcomes a phone may reply with; anything else is treated as `rejected`. */
 export const APPROVAL_REPLY_OUTCOMES = Object.freeze(['allowed-once', 'rejected', 'delegate'])

@@ -1470,10 +1470,12 @@ function replyApproval(approvalId, outcome) {
 function approvalCardHtml(approval) {
   const expired = approvalExpired(approval)
   const replied = approval.replied === true
+  const onDesktop = approval.onDesktop === true
   const disabled = expired || replied
   const classes = ['approval-card']
   if (expired) classes.push('is-expired')
   if (replied) classes.push('is-replied')
+  if (onDesktop && !replied) classes.push('is-on-desktop')
   const reason = escapeHtml(approvalReasonText(approval))
   const tool = escapeHtml(approval.toolName ?? '工具')
   let foot = ''
@@ -1481,7 +1483,17 @@ function approvalCardHtml(approval) {
     foot = `<p class="approval-state">${
       approval.repliedOutcome === 'allowed-once' ? '已允许（等待电脑确认）' : '已拒绝（等待电脑确认）'
     }</p>`
+  } else if (onDesktop) {
+    foot = '<p class="approval-state">电脑端也已弹出这条审批；在任意一端作答，另一端会自动收起（实验）</p>'
   }
+  const actions = `<div class="approval-actions">
+      <button class="btn btn-primary approval-allow" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}" data-outcome="allowed-once" ${disabled ? 'disabled' : ''}>允许一次</button>
+      <button class="btn btn-danger approval-deny" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
+        approval.approvalId,
+      )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
+    </div>`
   return `<div class="${classes.join(' ')}" data-approval-card="${escapeHtml(approval.approvalId)}" role="group" aria-label="权限请求">
     <div class="approval-head">
       <span class="approval-tool">${tool}</span>
@@ -1489,14 +1501,7 @@ function approvalCardHtml(approval) {
     </div>
     <p class="approval-reason">${reason}</p>
     ${foot}
-    <div class="approval-actions">
-      <button class="btn btn-primary approval-allow" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
-        approval.approvalId,
-      )}" data-outcome="allowed-once" ${disabled ? 'disabled' : ''}>允许一次</button>
-      <button class="btn btn-danger approval-deny" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
-        approval.approvalId,
-      )}" data-outcome="rejected" ${disabled ? 'disabled' : ''}>拒绝</button>
-    </div>
+    ${actions}
   </div>`
 }
 
@@ -2381,6 +2386,8 @@ function messageSignature() {
   hash = (hash * 31 + state.model.approvals.length) % 1_000_000_007
   for (const approval of state.model.approvals) {
     hash = (hash * 31 + approval.approvalId.length + (approval.replied ? 7 : 3)) % 1_000_000_007
+    // 「已转到电脑端」是只读卡片形态，必须进签名，否则状态变化不重绘。
+    hash = (hash * 31 + (approval.onDesktop ? 11 : 5)) % 1_000_000_007
   }
   // 提问卡片同理：批次、题目数量、是否已提交都影响渲染。
   hash = (hash * 31 + state.model.questions.length) % 1_000_000_007
