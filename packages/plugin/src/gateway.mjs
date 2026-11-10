@@ -673,6 +673,11 @@ export class Gateway {
         // 在线再细分前/后台：后台设备仍算可用（审批/提问照常转发），只是用户
         // 没在看页面 → 统计分开计数，connections 保持「在线设备数」的老语义。
         ...this.#presenceCounts(),
+        // 审批 signal 代理的启动自检 / DSH 版本白名单结论（3.0.1）。桥没提供时
+        // 返回 null，保证 health 形状对旧桥/测试桥仍是纯增量。
+        approvalProxy: typeof this.bridge?.approvalProxyStatus === 'function'
+          ? this.bridge.approvalProxyStatus()
+          : null,
         connections: this.byDevice.size,
         sessions: this.sessions.size,
         uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),

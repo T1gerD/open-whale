@@ -286,6 +286,22 @@ test('health route reports identity and pairing state', async t => {
   assert.equal(body.computerId, store.computerId)
   assert.equal(body.paired, false)
   assert.equal(body.connections, 0)
+  // 3.0.1：审批代理加固状态随 health 暴露；测试用的假桥没有这个可选 seam → null。
+  assert.equal(body.approvalProxy, null)
+})
+
+test('health exposes the bridge approval-proxy status when the bridge provides it', async t => {
+  const status = {
+    enabled: true,
+    selfCheck: 'passed',
+    hostVersion: '0.2.2-rc.1',
+    tested: true,
+    reason: '已实测版本 0.2.2-rc.1，signal 代理可用',
+  }
+  const { gateway, port } = await makeGateway({ bridge: { approvalProxyStatus: () => status } })
+  t.after(() => gateway.close())
+  const body = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.deepEqual(body.approvalProxy, status)
 })
 
 test('an unknown path is not handled', async t => {

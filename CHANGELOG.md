@@ -43,7 +43,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 894 项全绿**（v3.0.0 基线 855 项，新增 39 项）。
+- 测试：**54 个测试文件 / 895 项全绿**（v3.0.0 基线 855 项，新增 40 项）。
 
 ## [3.0.0] - 2026-10-30
 

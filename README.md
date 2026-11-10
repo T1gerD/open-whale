@@ -223,7 +223,7 @@ dsh plugin --profile desktop add ./packages/plugin
 
 ```bash
 cd open-whale
-node scripts/run-tests.mjs          # 全部：54 个测试文件 / 894 项测试（v3.0.1 基线）
+node scripts/run-tests.mjs          # 全部：54 个测试文件 / 895 项测试（v3.0.1 基线）
 node scripts/run-tests.mjs qr       # 只跑文件名含 "qr" 的
 node scripts/run-tests.mjs --self-test          # 自检运行器本身（CI 也跑这一步）
 node scripts/check-docs.mjs                     # 版本 / 产物名 / 文档测试计数一致性
