@@ -261,7 +261,12 @@ test('持久化：快照形状 / 恢复标签 / 恢复当前会话内容（sessi
   const store = makeStore()
   store.applyFrame(stateFrame('sess_a', [{ id: 'usr_m1', kind: 'user', text: 'A 的', at: '2026-10-30T11:00:00.000Z' }]), { now: NOW })
   store.openTab('sess_b', { activate: false })
-  assert.deepEqual(store.snapshotTabs(), { version: 1, tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_a' })
+  assert.deepEqual(store.snapshotTabs(), {
+    version: 1,
+    tabs: ['sess_a', 'sess_b'],
+    activeSessionId: 'sess_a',
+    closedSessions: [],
+  })
 
   const restored = makeStore()
   const info = restored.restoreTabs(store.snapshotTabs())
@@ -374,4 +379,24 @@ test('未知会话的后台消息会自动开标签但不抢当前标签', () =>
   assert.equal(store.activeSessionId, 'sess_a')
   assert.deepEqual(store.tabs, ['sess_a', 'sess_new'])
   assert.equal(store.unreadFor('sess_new'), 1)
+})
+
+test('关掉的会话在刷新后也不再复活（墓碑随标签一起持久化）', () => {
+  const store = makeStore()
+  store.openTab('sess_a')
+  store.openTab('sess_b')
+  store.closeTab('sess_a')
+  const saved = store.snapshotTabs()
+  assert.deepEqual(saved.closedSessions, ['sess_a'])
+
+  // 刷新：从 localStorage 恢复（旧数据没有 closedSessions 时按空处理）。
+  const restored = makeStore()
+  restored.restoreTabs(saved)
+  assert.deepEqual(restored.tabs, ['sess_b'])
+  // 电脑端重启后仍把旧绑定（sess_a）的快照推回来，不能再自动开标签。
+  restored.applyFrame(stateFrame('sess_a'))
+  assert.deepEqual(restored.tabs, ['sess_b'], '已关闭的会话不能被绑定快照弹回来')
+  // 用户主动打开时才解除墓碑。
+  restored.openTab('sess_a', { activate: false })
+  assert.deepEqual(restored.tabs, ['sess_b', 'sess_a'])
 })

@@ -2356,7 +2356,14 @@ export class ChatTabsModel {
 
   /** 标签列表要保存的最小状态（每个助理一份）。 */
   snapshotTabs() {
-    return { version: 1, tabs: this.tabs.slice(), activeSessionId: this.activeSessionId }
+    // closedSessions 必须一起落盘：否则刷新后“刚关掉的会话”又被电脑端的绑定快照
+    // 弹回来（真机：手机端删不掉已连接的会话，每回重启网页都会复现）。
+    return {
+      version: 1,
+      tabs: this.tabs.slice(),
+      activeSessionId: this.activeSessionId,
+      closedSessions: [...this.closedSessions],
+    }
   }
 
   /** 当前标签的消息快照（沿用 v2.3.0 的会话缓存，刷新后先出内容再对账）。 */
@@ -2381,7 +2388,15 @@ export class ChatTabsModel {
       }
     }
     this.tabs = ids
+    // 恢复“用户已关闭”的墓碑：电脑端仍绑定的旧会话发来快照时不能再自动开标签。
     this.closedSessions.clear()
+    for (const raw of Array.isArray(input.closedSessions) ? input.closedSessions : []) {
+      if (typeof raw !== 'string') continue
+      const id = raw.trim()
+      if (id === '' || ids.includes(id) || this.closedSessions.has(id)) continue
+      this.closedSessions.add(id)
+      if (this.closedSessions.size >= 16) break
+    }
     for (const id of ids) this.ensureChat(id)
     const wanted = typeof input.activeSessionId === 'string' ? input.activeSessionId : ''
     this.activeSessionId = ids.includes(wanted) ? wanted : ids[0] ?? ''

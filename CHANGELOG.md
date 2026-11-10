@@ -38,6 +38,7 @@
 - **手机会话工具集修复（真机：DSH 重启后手机助理“读图工具掉线”/读不了文件）**：插件创建手机会话时没写 `agentPreset`，DSH 重启后由插件 resume 时用 profile 默认预设恢复，请求前下发 34 条 `tool-removal`（`read_image`/`read`/`write`/`edit`/`ops_*`/`web_*` 全被移除，只剩 23 个插件/团队工具）；同一会话在桌面打开过（adopt 桌面 agent）时有 57 个工具。现在 `createSession` 显式写 `meta.agentPreset: 'standard'`，新手机会话恢复后即拥有全量工具。旧会话的 preset 被 DSH 视为“会话启动事实”锁定，需在桌面打开一次或新建会话。
 - **切后台后不再立刻显示离线**：移动浏览器切后台会冻结并杀掉 WebSocket，网关原先“没有 socket 就离线”会显示成“离线”。现在记录设备最后状态，**后台断开后 10 分钟宽限期内仍显示「在线（后台）」**（health 计入 online/background 但 `connections` 仍只统计真实 socket），回前台重连立刻恢复「在线（前台）」，超时才真离线。
 - **提问摘要卡自动收起 + 附件提示残留清理**（真机反馈）：已回答的「提问 · 已回答」摘要卡原先永久钉在聊天流下方，现在只做 12 秒即时反馈后自动收起（题目/答案仍在会话历史里）；手机聊天流里任何路径出现的「用户通过手机发来了…」附件提示都会被剥掉，回显消息按「同文本+时间接近」合并回本地气泡，旧缓存里的纯提示残留直接丢弃。
+- **已关闭的会话刷新后不再复活**（真机：手机端删不掉已连接的会话，每回重启网页都会复现）：`closedSessions` 墓碑此前只存在内存里，刷新即丢；电脑端仍绑着旧会话，重连时推 `session/state` 全量快照，客户端就自动开标签把它弹回来。现在墓碑随标签一起落盘（localStorage，最多 16 个），恢复后已关闭会话的快照不再自动开标签，只有用户主动打开才解除。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
@@ -47,7 +48,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 906 项全绿**（v3.0.0 基线 855 项，新增 51 项）。
+- 测试：**54 个测试文件 / 907 项全绿**（v3.0.0 基线 855 项，新增 52 项）。
 
 ## [3.0.0] - 2026-10-30
 

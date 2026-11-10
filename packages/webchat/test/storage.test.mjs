@@ -131,15 +131,18 @@ test('createStorage：绑定 / 设置 / 会话 / outbox 完整往返', () => {
   assert.deepEqual(storage.loadOutbox('web_123'), [])
 
   // 标签页状态按设备分开存：换一台电脑不会拿另一台的 sessionId 去开标签。
-  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '', closedSessions: [] })
   assert.equal(storage.saveTabs('web_123', { tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_b' }), true)
-  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_b' })
-  assert.deepEqual(storage.loadTabs('web_999'), { tabs: [], activeSessionId: '' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a', 'sess_b'], activeSessionId: 'sess_b', closedSessions: [] })
+  assert.deepEqual(storage.loadTabs('web_999'), { tabs: [], activeSessionId: '', closedSessions: [] })
   // active 不在列表里 / 非法条目会被规整掉。
   storage.saveTabs('web_123', { tabs: ['sess_a', 42, ''], activeSessionId: 'missing' })
-  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a'], activeSessionId: 'sess_a' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_a'], activeSessionId: 'sess_a', closedSessions: [] })
+  // 已关闭标签的墓碑随 tabs 一起持久化：刷新后不会再被绑定快照弹回来。
+  storage.saveTabs('web_123', { tabs: ['sess_b'], activeSessionId: 'sess_b', closedSessions: ['sess_a', 'sess_b'] })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: ['sess_b'], activeSessionId: 'sess_b', closedSessions: ['sess_a'] })
   storage.saveTabs('web_123', { tabs: [], activeSessionId: '' })
-  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '' })
+  assert.deepEqual(storage.loadTabs('web_123'), { tabs: [], activeSessionId: '', closedSessions: [] })
   assert.equal(storage.saveTabs('', { tabs: ['a'] }), false)
 
   storage.clearBinding()

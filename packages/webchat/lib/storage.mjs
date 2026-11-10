@@ -258,7 +258,15 @@ export function createStorage(storage, prefix = STORAGE_PREFIX) {
         typeof saved?.activeSessionId === 'string' && tabs.includes(saved.activeSessionId)
           ? saved.activeSessionId
           : ''
-      return { tabs: [...new Set(tabs)], activeSessionId }
+      const uniqueTabs = [...new Set(tabs)]
+      const closedSessions = Array.isArray(saved?.closedSessions)
+        ? [...new Set(saved.closedSessions
+            .filter(item => typeof item === 'string')
+            .map(item => item.trim())
+            .filter(item => item !== '' && item.length <= 200 && !uniqueTabs.includes(item)))]
+          .slice(-16)
+        : []
+      return { tabs: uniqueTabs, activeSessionId, closedSessions }
     },
     /** @param {string} deviceId @param {{tabs?: string[], activeSessionId?: string}} state */
     saveTabs(deviceId, state) {
@@ -271,7 +279,13 @@ export function createStorage(storage, prefix = STORAGE_PREFIX) {
         typeof input.activeSessionId === 'string' && tabs.includes(input.activeSessionId)
           ? input.activeSessionId
           : tabs[0] ?? ''
-      return setRaw(`tabs.${deviceId}`, JSON.stringify({ version: 1, tabs, activeSessionId }))
+      const closedSessions = Array.isArray(input.closedSessions)
+        ? [...new Set(input.closedSessions
+            .filter(item => typeof item === 'string' && item.length > 0 && item.length <= 200)
+            .filter(item => !tabs.includes(item)))]
+          .slice(-16)
+        : []
+      return setRaw(`tabs.${deviceId}`, JSON.stringify({ version: 1, tabs, activeSessionId, closedSessions }))
     },
     /** @param {string} deviceId */
     clearTabs(deviceId) {
