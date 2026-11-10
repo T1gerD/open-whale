@@ -27,7 +27,7 @@ iOS Safari、任意手机浏览器都能用）。网页版由本插件自己提�
 从 Release 的 tarball 安装：
 
 ```bash
-dsh plugin --profile <你的profile> add ./dsh-openwhale-3.0.0.tgz
+dsh plugin --profile <你的profile> add ./dsh-openwhale-3.0.1.tgz
 ```
 
 （npm 上的 `dsh-openwhale` 尚未发布，暂不要按包名安装。）

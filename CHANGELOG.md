@@ -2,6 +2,49 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.1] - 2026-11-10
+
+**真机反馈修复：手机消息顺序、前后台在线状态、会话名、结构化提问显示；审批代理加固。**
+
+### 修复
+
+- **手机端消息顺序与电脑端一致**（用户真机反馈「电脑端顺序是对的」）：手机/网页版原先按墙钟
+  `at` 排序，而 `chat/echo` 的 `at` 是网关收到补发消息的时刻——离线排队后重连补发的消息会被
+  排到所有回复之后。现在按网关事件日志的单调 `seq` 排序（`hist_<seq>` 快照同样解析），`echo`
+  的迟到 `at` 只补空缺不覆盖；只有整表都拿不到 seq（旧缓存/旧电脑端）时才退回 `at`，本地乐观
+  消息永远最后、拿到 seq 后落位。持久化也保存 `seq`/`optimistic`，刷新不会重新洗牌。
+- **手机切后台/锁屏不再谎报「在线」**：网页版心跳 `ping` 带上 `visible`，电脑端新增
+  `devicePresence()`（`foreground`/`background`/`offline`，70s 新鲜度窗口），插件页显示
+  **在线（前台）/ 在线（后台）/ 离线**，`/openwhale/health` 增加 `onlineDevices` /
+  `foregroundDevices` / `backgroundDevices`。后台仍**算可用**：审批与提问照常推送，回到前台
+  就能看到待办（转发资格没有改）。
+- **会话名区分**：DSH 的 `readTitleSnapshots()` 返回的 `value.title` 是
+  `SessionTitleSnapshot` **对象**（`title.title` 才是字符串），旧代码只认字符串，标题永远
+  取不到，同一 cwd 的会话全显示成 `default-workspace`。现在兼容对象/字符串形状、`rejected`
+  与按请求顺序兜底；没有真实标题时用 `cwd 末段 · id 后 6 位`，真实标题撞名按打开顺序
+  确定性加 `#2/#3`。
+- **结构化提问（`ask_user_question` / 计划审阅）在手机上显示题干并在答后留痕**：电脑端
+  `#sanitizeQuestions` 现在校验并透传 `intent.display`（DSH 把本地化的人话放在
+  `{question,detail,approve}`，`question` 可能为空），网页版按
+  `question → intent.display.question → header → detail` 回退，永不渲染空题干；作答后
+  可点卡片变成只读「提问 · 已回答」摘要（题目 + 所选答案），`question/resolved` 不再让
+  聊天流里凭空少一条记录，刷新后仍能从 localStorage 恢复。
+- **审批 signal 代理加固**（交接文档第六节第 3 项）：启动时跑一次**本地可验证、无副作用**的
+  自检（合成 `AbortController` 走一遍转发链），并按 DSH 版本白名单（已实测 `0.2.2-rc.1`，
+  同 `x.y.z` 家族匹配）记录状态；新增配置 **`experimentalDualApproval`**（默认开，显式
+  `false` 关闭）：关闭/自检失败时**完全不写 `req.signal`**，退回「手机作答 + 桌面弹窗自己
+  点掉」，手机卡片与先答先算不受影响。`bridge.approvalProxyStatus()` 提供给 health。
+- **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
+  「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
+  补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
+
+### 变更
+
+- 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
+  `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
+  `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
+- 测试：**54 个测试文件 / 894 项全绿**（v3.0.0 基线 855 项，新增 39 项）。
+
 ## [3.0.0] - 2026-10-30
 
 **版本号统一为 3.0.0，并补上「提问」：手机现在既能批权限，也能回答 DSH 的结构化提问。**

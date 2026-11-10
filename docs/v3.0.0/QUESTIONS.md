@@ -21,6 +21,12 @@ agentCtx.on('user-questions/request', handler, { prepend: true })
 `askTimed()` 的问题在前台等待结束后仍可通过 `ctx.userQuestions.answer(agent, callId, answer)` 回答
 （DSH 侧叫 continued question），所以手机晚答也要能生效。
 
+> **题干回退（2026-11-10 修复）**：DSH 的计划审阅 / 新版提问会把「人话」放在
+> `intent.display = { question?, detail?, approve? }`（每个字段是 `{en, zh, ...}` 本地化字典），
+> 此时 `question` 可能是空串。电脑端 `#sanitizeQuestions` 现在会校验并透传 `intent.display`
+> （`isLocalizedText`：1–32 个字符串条目、key ≤ 32、value ≤ 500），手机/网页版按
+> `question → intent.display.question → header → detail` 回退，永不渲染空题干。
+
 ## 协议（1.3.0 之上的纯增量）
 
 | 方向 | 帧 | 载荷 |
@@ -35,8 +41,11 @@ agentCtx.on('user-questions/request', handler, { prepend: true })
 `QUESTION_MAX_OPTIONS = 20`、`QUESTION_MAX_TEXT = 2000`；
 纯函数 `normalizeQuestionAnswers(questions, value)` 负责「每个问题恰好一条 + 选项必须合法」。
 
-`QuestionItem.intent` 原样透传：识别 `plan-review` 的客户端可以按「计划审批卡」渲染
-（`intent.approve` 是表示同意的选项标签），不认识的客户端渲染普通选项即可。
+`QuestionItem.intent` 会被清洗后透传（只保留 JSON 安全字段：`kind`、`approve`、`callId`、
+`display`）：识别 `plan-review` 的客户端可以按「计划审批卡」渲染
+（`intent.approve` / `intent.display.approve` 是表示同意的选项标签），不认识的客户端渲染
+普通选项即可。答完的提问在网页版聊天流里会保留一张只读「已回答」摘要（题目 + 所选答案），
+不会答完就消失。
 
 ## 电脑端行为（Lead 实现）
 

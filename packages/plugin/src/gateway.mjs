@@ -76,7 +76,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '3.0.0'
+export const PLUGIN_VERSION = '3.0.1'
 
 /**
  * How many concurrent sessions one device may hold.
@@ -96,6 +96,17 @@ const MAX_INLINE_ATTACHMENT_BYTES = 32 * 1024 * 1024
 
 /** Longest message text accepted from a phone. */
 const MAX_TEXT_LENGTH = 100_000
+
+/**
+ * 前后台判定的新鲜度窗口（毫秒）。
+ *
+ * 网页版客户端每 `DEFAULT_HEARTBEAT_MS`（25s，见 protocol）发一帧 `ping`，
+ * 切后台/锁屏时还会立刻补一帧 `ping{visible:false}`。窗口取 70s ≈ 2.8 个
+ * 心跳周期：比 3 个周期略短，移动网络抖动下也不容易误判，同时又能在一两次
+ * 丢包/浏览器冻结定时器后及时把「在线」降级成「在线（后台）」。
+ * 旧客户端不会发 `visible`，按前台处理（协议 ping.visible 注释），靠心跳续期。
+ */
+const PRESENCE_FRESHNESS_MS = 70_000
 
 /** Bodies we accept on the small JSON management routes (send-file etc.). */
 const MAX_JSON_BODY_BYTES = 64 * 1024
@@ -153,6 +164,13 @@ class Session {
     this.authenticated = false
     this.nonce = randomBytes(16).toString('base64url')
     this.lastSeenAt = Date.now()
+    /**
+     * 页面是否可见（前后台信号）。客户端在 `ping` 帧里带 `visible`（协议
+     * ping.visible）；缺省 true 表示按前台处理，兼容还没上报可见性的旧客户端。
+     */
+    this.visible = true
+    /** 最近一次收到 visible 信号（握手 / 带 visible 的心跳）的时间，用于 freshness 判定。 */
+    this.lastVisibleAt = this.gateway.now()
     this.helloDeadline = setTimeout(() => {
       this.sendError('handshake-timeout', '连接后未发送 hello，已断开')
       this.close(1008, 'handshake timeout')
@@ -353,6 +371,42 @@ export class Gateway {
    */
   deviceOnline(deviceId) {
     return (this.byDevice.get(deviceId)?.size ?? 0) > 0
+  }
+
+  /**
+   * 设备在线状态，区分「前台 / 后台 / 离线」。
+   *
+   * 手机网页版切后台、锁屏、浏览器冻结定时器时不再谎报「在线」。但后台设备
+   * **仍然算可用**：审批/提问的转发资格仍按 {@link deviceOnline}（后台也推），
+   * 用户回到前台就能看到待办；这里只影响设置页展示与 health 统计。
+   *
+   * 判定规则：没有任何已认证 socket → offline；最近一次可见信号（握手或
+   * `ping{visible:true}`）在 `PRESENCE_FRESHNESS_MS` 窗口内 → foreground；
+   * 否则（显式 hidden，或前端卡死/丢包导致心跳过期）→ background。
+   * 一台设备可能有 2 条 socket（竞速/多窗口）：任意一条前台即算前台。
+   * @param {string} deviceId
+   * @returns {'foreground'|'background'|'offline'}
+   */
+  devicePresence(deviceId) {
+    const sessions = this.sessionsForDevice(deviceId)
+    if (sessions.length === 0) return 'offline'
+    const now = this.now()
+    const foreground = sessions.some(session =>
+      session.visible !== false && now - session.lastVisibleAt <= PRESENCE_FRESHNESS_MS)
+    return foreground ? 'foreground' : 'background'
+  }
+
+  /**
+   * health 用的在线统计：在线设备里再分前台/后台。
+   * @returns {{onlineDevices: number, foregroundDevices: number, backgroundDevices: number}}
+   */
+  #presenceCounts() {
+    let foregroundDevices = 0
+    for (const deviceId of this.byDevice.keys()) {
+      if (this.devicePresence(deviceId) === 'foreground') foregroundDevices += 1
+    }
+    const onlineDevices = this.byDevice.size
+    return { onlineDevices, foregroundDevices, backgroundDevices: onlineDevices - foregroundDevices }
   }
 
   /** First live session for a device, if any (compatibility helper). */
@@ -616,6 +670,9 @@ export class Gateway {
         devices: this.store.devices.map(d => ({ id: d.id, label: d.label ?? d.deviceName })),
         // 客户端会故意并发竞速两个地址，一个设备可能同时有 2 条会话；对用户/诊断
         // 有意义的是「在线设备数」，原始 socket 数单独放在 sessions 里。
+        // 在线再细分前/后台：后台设备仍算可用（审批/提问照常转发），只是用户
+        // 没在看页面 → 统计分开计数，connections 保持「在线设备数」的老语义。
+        ...this.#presenceCounts(),
         connections: this.byDevice.size,
         sessions: this.sessions.size,
         uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
@@ -900,8 +957,14 @@ export class Gateway {
     switch (frame.t) {
       case 'hello':
         return this.#handleHello(session, frame)
-      case 'ping':
+      case 'ping': {
+        // 前后台信号（协议 `ping.visible`，缺省按前台处理，兼容旧客户端）。
+        // 只用于展示/统计，**不影响**审批与提问的转发资格（那仍按 deviceOnline）。
+        const visible = typeof frame.visible === 'boolean' ? frame.visible : true
+        session.visible = visible
+        session.lastVisibleAt = this.now()
         return session.send({ t: SERVER_FRAME.PONG, time: new Date().toISOString() })
+      }
       case 'chat/send':
         return this.#handleChatSend(session, frame)
       case 'chat/cancel':
@@ -2485,6 +2548,7 @@ export class Gateway {
       report: this.connectionModeReport(),
       devices: this.store.devices ?? [],
       online: deviceId => this.deviceOnline(deviceId),
+      presence: deviceId => this.devicePresence(deviceId),
       computerName: this.store.computerName,
       computerId: this.store.computerId,
       fingerprint: this.store.fingerprint,

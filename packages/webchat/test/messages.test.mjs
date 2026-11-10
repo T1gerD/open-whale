@@ -48,7 +48,11 @@ test('本地用户消息 + chat/echo 回显不会产生第二条气泡', () => {
   assert.equal(result.changed, true)
   assert.equal(model.messages.length, 1, 'echo 必须按 usr_<msgId> 合并，而不是新增')
   assert.equal(model.messages[0].status, MESSAGE_STATUS.SENT)
-  assert.equal(model.messages[0].at, '2026-10-26T12:00:01.000Z')
+  // echo 的 at 是网关「收到（补发）消息的时刻」，不能覆盖本地原始发送时刻——否则
+  // 一条离线补发的消息会被墙钟排序推到所有回复之后（真机 bug）。
+  assert.equal(model.messages[0].at, '2026-10-26T11:59:00.000Z')
+  assert.equal(model.messages[0].seq, 1, 'seq 才是权威次序')
+  assert.equal(model.messages[0].optimistic, false, '拿到 seq 就不再是乐观消息')
   assert.equal(model.messages[0].mine, true)
   assert.equal(model.cursor, 1)
 })
@@ -561,4 +565,191 @@ test('snapshot messages are sorted by time so the phone matches the desktop', ()
     },
   }, t0 + 6000)
   assert.deepEqual(model.messages.map(message => message.text), ['提问', '回复', '再回复'])
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.x：排序键改成「seq 优先」（真机反馈：手机顺序与电脑端不一致）
+//
+// 根因：网关给 chat/echo 的 `at` 是**它收到（补发）消息的时刻**，不是原始发送时刻；
+// 助手帧根本没有 at，手机只能拿接收时刻。所以墙钟排序在「离线/重连/补发」场景必错，
+// 而每条被记录的事件都有会话内单调的 seq。下面这组测试锁死这个契约。
+// ---------------------------------------------------------------------------
+
+const SENT_AT = '2026-11-09T11:40:00.000Z'
+
+test('a seq arriving late never jumps past messages that have no seq', () => {
+  const model = makeModel()
+  // 旧形状快照：id 不是 hist_<seq>，任何消息都没有 seq（老缓存 / 老电脑端）。
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 's',
+    sessionEpoch: 1,
+    head: 42,
+    snapshot: {
+      messages: [
+        { id: 'usr_m1', kind: 'user', text: '问', at: '2026-11-09T11:00:00.000Z' },
+        { id: 'msg_c1', kind: 'assistant', text: '答', at: '2026-11-09T11:00:01.000Z' },
+      ],
+    },
+  })
+  // 正在生成的气泡先以「没有 seq」的形状出现（chat/tool、chat/error 不进事件日志）。
+  model.applyFrame({ t: 'chat/tool', callId: 'c9', toolCallId: 't1', tool: 'bash', phase: 'tool-start' })
+  assert.deepEqual(model.messages.map(message => message.text), ['问', '答', ''])
+  // 它随后拿到 seq 43：不能因为「有 seq 了」就整条跳到历史前面。整表退回 at 排序。
+  model.applyFrame({ t: 'chat/done', callId: 'c9', text: '新答', seq: 43 })
+  assert.deepEqual(model.messages.map(message => message.text), ['问', '答', '新答'])
+  assert.deepEqual(model.messages.map(message => message.seq), [undefined, undefined, 43])
+})
+
+test('a late echo (reconnect / outbox resend) never moves my bubble after its replies', () => {
+  const model = makeModel()
+  model.addLocalUserMessage({
+    msgId: 'm_late',
+    text: '现在一万token要多少钱',
+    at: SENT_AT,
+    files: [{ name: 'a.png', size: 10 }, { name: 'b.png', size: 20 }],
+  })
+  // 手机断线期间电脑已经答完这一轮：重连后按接收时刻当 at 回放进来。
+  model.applyFrame({ t: 'chat/message', callId: 'c1', messageId: 'a1', index: 0, text: '回答', seq: 7 }, {
+    now: Date.parse('2026-11-09T12:00:00.000Z'),
+  })
+  model.applyFrame({ t: 'chat/done', callId: 'c1', text: '回答', seq: 8 }, {
+    now: Date.parse('2026-11-09T12:00:01.000Z'),
+  })
+  // outbox 补发的 echo 迟到：at 是网关收到补发的时刻（比回复还晚），seq 仍是原来的 6。
+  model.applyFrame({
+    t: 'chat/echo',
+    msgId: 'm_late',
+    deviceId: 'dev_a',
+    text: '现在一万token要多少钱',
+    at: '2026-11-09T12:20:00.000Z',
+    seq: 6,
+    files: [{ name: 'a.png', size: 10 }, { name: 'b.png', size: 20 }],
+  })
+  // 之后又来一条消息会触发重排（这正是旧实现把气泡甩到后面去的时机）。
+  model.applyFrame({ t: 'chat/echo', msgId: 'm_after', deviceId: 'dev_b', text: '再说一句', at: '2026-11-09T12:21:00.000Z', seq: 9 })
+  assert.deepEqual(model.messages.map(message => message.kind), ['user', 'assistant', 'user'])
+  assert.equal(model.messages[0].text, '现在一万token要多少钱')
+  assert.equal(model.messages[0].at, SENT_AT, '本地发送时刻不能被迟到的 at 覆盖')
+  assert.equal(model.messages[0].seq, 6)
+  assert.equal(model.messages[0].files.length, 2, '两张附件跟着气泡一起落位')
+})
+
+test('a re-broadcast echo with a newer seq does not push the bubble down', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '问', at: '2026-11-09T12:00:00.000Z', seq: 2 })
+  model.applyFrame({ t: 'chat/echo', msgId: 'm2', deviceId: 'dev_b', text: '答', at: '2026-11-09T12:01:00.000Z', seq: 5 })
+  // 电脑端重发/重连回放可能带一个更新的 seq：只认第一次落位的位置。
+  model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '问', at: '2026-11-09T12:30:00.000Z', seq: 9 })
+  assert.deepEqual(model.messages.map(message => message.text), ['问', '答'])
+  assert.equal(model.messages[0].seq, 2)
+  assert.equal(model.messages[0].at, '2026-11-09T12:00:00.000Z')
+})
+
+test('assistant frames carry no at: they sort by seq even when they arrive out of order', () => {
+  const model = makeModel()
+  // 第二轮（seq 5）先到，第一轮（seq 3）后到：接收时刻与真实顺序相反。
+  model.applyFrame({ t: 'chat/message', callId: 'c2', messageId: 'b1', index: 0, text: '第二轮', seq: 5 }, { now: 1000 })
+  model.applyFrame({ t: 'chat/message', callId: 'c1', messageId: 'a1', index: 0, text: '第一轮', seq: 3 }, { now: 2000 })
+  model.applyFrame({ t: 'chat/done', callId: 'c1', text: '第一轮', seq: 4 }, { now: 2001 })
+  assert.deepEqual(model.messages.map(message => message.text), ['第一轮', '第二轮'])
+  assert.equal(model.messages[0].seq, 3, '取这一轮第一次出现的 seq 作为落位点')
+})
+
+test('identical wall-clock at still orders by seq', () => {
+  const model = makeModel()
+  const at = '2026-11-09T12:00:00.000Z'
+  model.applyFrame({ t: 'chat/echo', msgId: 'm9', deviceId: 'dev_b', text: '后', at, seq: 9 })
+  model.applyFrame({ t: 'chat/echo', msgId: 'm3', deviceId: 'dev_b', text: '前', at, seq: 3 })
+  assert.deepEqual(model.messages.map(message => message.text), ['前', '后'])
+})
+
+test('a snapshot rebuilt from hist_<seq> keeps the live order', () => {
+  const live = makeModel()
+  live.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_a', text: '问', at: '2026-11-09T12:00:00.000Z', seq: 1 })
+  live.applyFrame({ t: 'chat/message', callId: 'c1', messageId: 'a1', index: 0, text: '答', seq: 2 })
+  live.applyFrame({ t: 'chat/done', callId: 'c1', text: '答', seq: 3 })
+  const liveOrder = live.messages.map(message => message.text)
+  assert.deepEqual(liveOrder, ['问', '答'])
+
+  const rebuilt = makeModel()
+  rebuilt.applyFrame({
+    t: 'session/state',
+    sessionId: 's1',
+    sessionEpoch: 1,
+    head: 3,
+    snapshot: {
+      messages: [
+        // 故意「时间倒挂」：只有 hist_<seq> 能纠正回来。
+        { id: 'hist_3', kind: 'assistant', text: '答', at: '2026-11-09T11:00:00.000Z' },
+        { id: 'hist_1', kind: 'user', text: '问', at: '2026-11-09T12:00:00.000Z' },
+      ],
+    },
+  })
+  assert.deepEqual(rebuilt.messages.map(message => message.text), liveOrder)
+  assert.deepEqual(rebuilt.messages.map(message => message.seq), [1, 3])
+})
+
+test('a snapshot keeps my unconfirmed messages and an ack without seq keeps them last', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'chat/echo', msgId: 'm1', deviceId: 'dev_b', text: '旧消息', at: '2026-11-09T11:00:00.000Z', seq: 1 })
+  model.addLocalUserMessage({ msgId: 'm2', text: '刚发的', at: '2026-11-09T12:00:00.000Z' })
+  // ack 不带 seq：它仍然是「没被网关确认位置」的乐观消息。
+  model.applyFrame({ t: 'chat/ack', rid: 'm2', callId: 'c2' })
+  assert.deepEqual(model.messages.map(message => message.text), ['旧消息', '刚发的'])
+  assert.equal(model.messages[1].status, MESSAGE_STATUS.SENT)
+  assert.equal(model.messages[1].optimistic, true)
+
+  // 重连快照先到：本地还没确认的消息不能丢（真机「我先发的消息消失了」）。
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 's1',
+    sessionEpoch: 1,
+    head: 1,
+    snapshot: { messages: [{ id: 'hist_1', kind: 'user', text: '旧消息', at: '2026-11-09T11:00:00.000Z' }] },
+  })
+  assert.deepEqual(model.messages.map(message => message.text), ['旧消息', '刚发的'])
+  assert.equal(model.messages[1].optimistic, true)
+
+  // echo 带着 seq 回来后才落位（这里正好排在后面）。
+  model.applyFrame({ t: 'chat/echo', msgId: 'm2', deviceId: 'dev_a', text: '刚发的', at: '2026-11-09T12:30:00.000Z', seq: 2 })
+  assert.deepEqual(model.messages.map(message => message.text), ['旧消息', '刚发的'])
+  assert.equal(model.messages[1].optimistic, false)
+  assert.equal(model.messages[1].seq, 2)
+  assert.equal(model.messages[1].at, '2026-11-09T12:00:00.000Z')
+})
+
+test('a snapshot drops my unconfirmed copy when history already has that message', () => {
+  const model = makeModel()
+  // 消息其实送到了，但手机没收到 echo（事件日志也轮转掉了那条）：快照历史里有它。
+  model.addLocalUserMessage({ msgId: 'm_dup', text: '这条其实送到了', at: '2026-11-09T11:00:00.000Z' })
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 's1',
+    sessionEpoch: 1,
+    head: 500,
+    snapshot: { messages: [{ id: 'hist_499', kind: 'user', text: '这条其实送到了', at: '2026-11-09T11:00:01.000Z' }] },
+  })
+  assert.equal(model.messages.length, 1, '同内容不能出现两条气泡')
+  assert.equal(model.messages[0].id, 'hist_499')
+  assert.equal(model.messages[0].optimistic, undefined)
+})
+
+test('the limit still trims the oldest messages after the seq switch', () => {
+  const model = new ChatModel({ limit: 20 })
+  // 先来一条没有 seq 的乐观消息（层级 2），它会一直待在最后。
+  model.addLocalUserMessage({ msgId: 'pending', text: '排队中', at: '2026-11-09T10:00:00.000Z' })
+  for (let index = 0; index < 40; index += 1) {
+    model.applyFrame({
+      t: 'chat/echo',
+      msgId: `m${index}`,
+      deviceId: 'dev_b',
+      text: `第 ${index} 条`,
+      at: new Date(Date.parse('2026-11-09T11:00:00.000Z') + index * 1000).toISOString(),
+      seq: index + 1,
+    })
+  }
+  assert.ok(model.messages.length <= 20)
+  assert.equal(model.messages.at(-1).text, '排队中', '乐观消息永远在最后')
+  assert.equal(model.messages.at(-2).text, '第 39 条', '裁剪仍然从最旧（seq 最小）那头开始')
 })

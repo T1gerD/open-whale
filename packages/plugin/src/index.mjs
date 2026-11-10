@@ -72,6 +72,10 @@ export const DEFAULT_CONFIG = Object.freeze({
   allowRemoteShutdown: true,
   shutdownDelaySeconds: 30,
   autoApproveTools: false,
+  // 实验性：双端审批。开启时手机作答会通过 AbortController 信号代理把桌面原生弹窗
+  // 一起收掉；关闭时手机卡片、先答先算照旧，只是桌面弹窗需要用户自己点掉。
+  // 非法值（非布尔）按默认 true 处理，见 resolveDualApproval。
+  experimentalDualApproval: true,
   connectionMode: 'auto',
   tunnelMode: 'off',
   cloudflaredPath: '',
@@ -103,6 +107,19 @@ export function resolveForwardTimeouts(config = {}) {
 }
 
 /**
+ * 归一化实验性双端审批开关：只有**显式 `false`** 才关闭，其余（缺省/非法值）都是开。
+ *
+ * 「双端审批」指手机作答后用 `AbortController` 信号代理把桌面原生弹窗一起收掉，
+ * 依赖 DSH 内部实现（`req.signal` 可写、abort 能传回 `ui-approval`），所以必须有
+ * 一个开关能一键退回「桌面自己点掉」。语义见 docs/v3.0.0/APPROVAL.md。
+ * @param {any} [config]
+ * @returns {boolean}
+ */
+export function resolveDualApproval(config = {}) {
+  return config?.experimentalDualApproval !== false
+}
+
+/**
  * Build the config schema from the harness's schemastery.
  *
  * Loaded dynamically on purpose. `@deepseek-ai/schemastery` is provided by the
@@ -126,6 +143,7 @@ async function buildConfigSchema() {
       allowRemoteShutdown: z.boolean().default(true).description('允许手机远程关机/重启（取消始终可用）'),
       shutdownDelaySeconds: z.number().default(30).description('远程关机的宽限秒数，期间可取消'),
       autoApproveTools: z.boolean().default(false).description('手机会话是否自动批准所有工具调用（默认关闭，走 DSH 原有审批策略）'),
+      experimentalDualApproval: z.boolean().default(true).description('实验性：双端审批（手机作答后用 signal 代理关闭桌面原生弹窗）。关闭后手机卡片仍可作答、仍先答先算，但桌面弹窗要自己点掉'),
       connectionMode: z.string().default('auto').description('连接方式偏好：auto（Tailscale→局域网→隧道）| lan | tailscale | tunnel'),
       tunnelMode: z.string().default('off').description('公网隧道：off | quick（cloudflared 快速隧道，适合临时使用）'),
       cloudflaredPath: z.string().default('').description('cloudflared 可执行文件路径（留空则自动探测）'),
@@ -179,7 +197,7 @@ let currentCleanup = null
 function volatilize(schema) {
   const dict = schema?.dict ?? {}
   const patches = {}
-  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'connectionMode', 'tunnelMode', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
+  for (const key of ['host', 'voice', 'assistantName', 'enabled', 'lanEnabled', 'allowRemoteShutdown', 'shutdownDelaySeconds', 'autoApproveTools', 'experimentalDualApproval', 'connectionMode', 'tunnelMode', 'questionTimeoutMs', 'questionTimedTimeoutMs', 'questionLateWindowMs']) {
     if (dict[key]?.volatile) patches[key] = dict[key].volatile()
   }
   return patches
@@ -202,6 +220,7 @@ export async function apply(ctx, config) {
     allowRemoteShutdown: config.allowRemoteShutdown !== false,
     shutdownDelaySeconds: config.shutdownDelaySeconds ?? 30,
     autoApproveTools: config.autoApproveTools === true,
+    experimentalDualApproval: resolveDualApproval(config),
     connectionMode: config.connectionMode ?? 'auto',
     tunnelMode: config.tunnelMode ?? 'off',
     cloudflaredPath: config.cloudflaredPath ?? '',
@@ -279,6 +298,7 @@ export async function apply(ctx, config) {
       assistantName: settings.assistantName,
       cwd: settings.cwd,
       autoApproveTools: settings.autoApproveTools,
+      experimentalDualApproval: settings.experimentalDualApproval,
       agentOptions: {},
     },
     emit: event => gateway?.pushEvent(event),

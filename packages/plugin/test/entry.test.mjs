@@ -15,6 +15,7 @@ import {
   Config,
   DEFAULT_CONFIG,
   readProfileDefaultModel,
+  resolveDualApproval,
   resolveForwardTimeouts,
   resolveModelSelection,
   volatilize,
@@ -329,4 +330,30 @@ test('the new timeout fields are listed as live-editable candidates', () => {
     assert.ok(patches[key], `${key} must be volatilizable`)
   }
   assert.deepEqual(volatilize({ dict: {} }), {})
+})
+
+test('实验性双端审批开关默认开启，缺省/非法值都按开启处理', () => {
+  assert.equal(DEFAULT_CONFIG.experimentalDualApproval, true)
+  assert.equal(resolveDualApproval({}), true)
+  assert.equal(resolveDualApproval(undefined), true)
+  assert.equal(resolveDualApproval(null), true)
+  assert.equal(resolveDualApproval({ experimentalDualApproval: 'false' }), true, '非法值按默认 true')
+  assert.equal(resolveDualApproval({ experimentalDualApproval: 0 }), true, '只有显式 false 才关闭')
+  assert.equal(resolveDualApproval({ experimentalDualApproval: false }), false)
+})
+
+test('双端审批开关是设置页可热改的字段', () => {
+  const volatile = () => ({ type: 'boolean' })
+  const patches = volatilize({ dict: { experimentalDualApproval: { volatile } } })
+  assert.ok(patches.experimentalDualApproval, 'experimentalDualApproval 必须可热改')
+})
+
+test('配置 schema 暴露双端审批开关（有 schemastery 时是布尔且默认 true）', () => {
+  // 插件零运行时依赖：`link:` 安装时常拿不到 schemastery，`Config` 就是 undefined，
+  // 此时配置表由 DEFAULT_CONFIG 兜底（上面已有断言）。只有真拿到 schema 才查字段，
+  // 避免测试依赖插件安装方式。
+  if (!Config || typeof Config !== 'object' || !Config.dict) return
+  const field = Config.dict.experimentalDualApproval
+  assert.ok(field, 'schema 必须包含 experimentalDualApproval')
+  assert.equal(field.meta?.default, true)
 })

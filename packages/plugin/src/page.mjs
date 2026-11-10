@@ -36,13 +36,31 @@ export function connectionModeLabel(mode) {
  * @property {string} mode               当前连接方式偏好
  * @property {{detected?: Record<string, string[]>}} report 连接方式报告
  * @property {Array<{id: string, label?: string, deviceName?: string}>} devices 已绑定设备
- * @property {(deviceId: string) => boolean} online 某设备当前是否在线
+ * @property {(deviceId: string) => boolean} online 某设备当前是否在线（旧口径，保留兼容）
+ * @property {(deviceId: string) => 'foreground'|'background'|'offline'} [presence]
+ *           某设备的前后台状态（在线细分：前台=用户正在看，后台=锁屏/切走了但仍可用）
  * @property {string} computerName
  * @property {string} computerId
  * @property {string} fingerprint
  * @property {boolean} webClientAvailable 网页版静态资源是否就绪
  * @property {number} port
  */
+
+/**
+ * 设备在线状态文案（前/后台/离线）。
+ *
+ * 「在线（后台）」不是离线：锁屏/切后台的手机仍能收到审批与提问，只是用户
+ * 此刻没在看页面。文案要把这层差别说清楚，避免用户以为手机关掉了连接。
+ * @param {'foreground'|'background'|'offline'|undefined} state
+ * @returns {string}
+ */
+export function devicePresenceLabel(state) {
+  switch (state) {
+    case 'foreground': return '在线（前台）'
+    case 'background': return '在线（后台）'
+    default: return '离线'
+  }
+}
 
 /**
  * 渲染 `/openwhale` 绑定页（同时也是 DSH 设置里的插件页内容）。
@@ -52,7 +70,7 @@ export function connectionModeLabel(mode) {
  */
 export function renderPageHtml(view, deps) {
   const { payload, qr, webEntries, webUrl, endpoints, local } = view
-  const { version, mode, report, devices, online, computerName, computerId, fingerprint, webClientAvailable, port } = deps
+  const { version, mode, report, devices, online, presence, computerName, computerId, fingerprint, webClientAvailable, port } = deps
   const boundDevices = devices ?? []
   const remaining = Math.max(0, MAX_DEVICES - boundDevices.length)
   const expiry = payload.ok ? new Date(payload.payload.expires).toLocaleString('zh-CN') : ''
@@ -70,12 +88,22 @@ export function renderPageHtml(view, deps) {
     })
     .join('')
 
+  // 设备状态：两种视图都显示。local 视图保留改名/移除按钮，状态和按钮同排。
+  const presenceOf = deviceId => {
+    if (typeof presence === 'function') return presence(deviceId)
+    // 兼容只传 online() 的旧调用方（外部渲染入口 / 旧测试）：只能区分在线/离线。
+    return online(deviceId) ? 'foreground' : 'offline'
+  }
   const deviceRows = boundDevices.length
-    ? `<ul class="devs">${boundDevices.map(device => `<li><span>${escapeHtml(device.label ?? device.deviceName)}</span>${
-      local
-        ? `<span><button class="btn-sm" data-rename="${escapeHtml(device.id)}">改名</button> <button class="btn-sm" data-unbind="${escapeHtml(device.id)}">移除</button></span>`
-        : `<span class="hint">${online(device.id) ? '在线' : '离线'}</span>`
-    }</li>`).join('')}</ul>`
+    ? `<ul class="devs">${boundDevices.map(device => {
+      const state = presenceOf(device.id)
+      const status = `<span class="presence is-${state === 'foreground' ? 'fg' : state === 'background' ? 'bg' : 'off'}">${devicePresenceLabel(state)}</span>`
+      return `<li><span>${escapeHtml(device.label ?? device.deviceName)}</span><span class="dev-actions">${status}${
+        local
+          ? ` <button class="btn-sm" data-rename="${escapeHtml(device.id)}">改名</button> <button class="btn-sm" data-unbind="${escapeHtml(device.id)}">移除</button>`
+          : ''
+      }</span></li>`
+    }).join('')}</ul>`
     : '<p class="hint">还没有绑定任何手机。用 Open Whale 应用扫描二维码即可绑定。</p>'
 
   // 向导第二步：只有真的存在对应地址的线路才可点（Tailscale/隧道没开就禁用）。
@@ -113,6 +141,11 @@ export function renderPageHtml(view, deps) {
  .btn-sm:hover{background:#475569} .btn-sm[disabled]{opacity:.5;cursor:not-allowed}
  .devs{list-style:none;padding:0;margin:6px 0 2px}
  .devs li{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:6px 10px;background:#0b1220;border:1px solid #24304d;border-radius:8px;margin:6px 0;font-size:14px}
+ .dev-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+ .presence{font-size:13px}
+ .presence.is-fg{color:#9ee7c0}
+ .presence.is-bg{color:#ffd479}
+ .presence.is-off{color:#93a4c8}
  .tag{display:inline-block;background:#1d4ed8;color:#fff;border-radius:999px;padding:1px 8px;font-size:12px}
  .banner{background:#3b1d1d;border:1px solid #7f1d1d;color:#ffb4b4;border-radius:10px;padding:10px 14px;margin-bottom:18px;font-size:13px}
  input[type=text]{background:#0b1220;border:1px solid #24304d;border-radius:8px;color:#e8eefc;padding:8px 10px;font-size:14px;min-width:260px}

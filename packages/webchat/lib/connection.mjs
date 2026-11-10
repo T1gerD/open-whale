@@ -197,6 +197,11 @@ export class ConnectionManager {
     /** @type {Array<{id: any}>} 尚未触发的定时器。 */
     this.timers = []
     this.heartbeatMs = DEFAULT_APP_HEARTBEAT_MS
+    /**
+     * 当前页面前后台状态。心跳帧带 `visible`，电脑端据此区分「在线（前台）」
+     * 与「在线（后台）」；缺省 true，和旧服务端「连着就算在线」的语义一致。
+     */
+    this.visible = true
     this.watchdogTimer = null
     this.reconnectTimer = null
     this.lastInboundAt = 0
@@ -300,6 +305,24 @@ export class ConnectionManager {
     }
     this.state = CONNECTION_STATE.RECONNECTING
     this.#connectCycle()
+  }
+
+  /**
+   * 上报页面前后台状态（幂等）。
+   *
+   * visibilitychange 会成对触发，值没变就直接返回；值变化时立刻补发一帧 ping，
+   * 不等下一个心跳周期——锁屏/切后台后电脑端要马上从「前台」变「后台」，回到
+   * 前台也要马上恢复。未连接时只记状态、不抛错也不排队：重连后的第一帧心跳
+   * 自然会带上（协议 ping.visible，缺省按前台处理）。
+   * @param {boolean} visible
+   * @returns {boolean} 状态是否发生变化
+   */
+  setVisible(visible) {
+    const next = visible === true
+    if (next === this.visible) return false
+    this.visible = next
+    this.send({ t: 'ping', visible: next })
+    return true
   }
 
   /** 当前状态的可读文案。 */
@@ -729,7 +752,7 @@ export class ConnectionManager {
         this.#handleDrop('连接超时（长时间没有收到电脑响应）')
         return
       }
-      this.send({ t: 'ping' })
+      this.send({ t: 'ping', visible: this.visible })
       this.watchdogTimer = this.setTimeoutImpl(tick, interval)
     }
     this.watchdogTimer = this.setTimeoutImpl(tick, interval)

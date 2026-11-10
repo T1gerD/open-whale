@@ -18,6 +18,7 @@
 // bound to, and may list / select / create those sessions (`session/*`) and
 // answer the computer's approval prompts (`approval/*`).
 import { createHash, randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -46,6 +47,159 @@ const RECENT_RESOLUTION_TTL_MS = 3 * 60_000
 
 /** 每个会话最多保留多少条最近的审批结果。 */
 const RECENT_RESOLUTION_LIMIT = 20
+
+/** 会话标题展示上限（字符）：超长标题在手机列表/标签里截断，避免撑破界面。 */
+const SESSION_TITLE_MAX_LENGTH = 80
+
+/**
+ * 已实测「signal 代理能关掉桌面弹窗」的 DSH 版本白名单。
+ *
+ * 手机作答后自动关闭桌面原生弹窗，靠的是把审批请求的 `req.signal` 换成我们自己的
+ * `AbortController` 代理（见 `#installSignalProxy`）。这依赖 DSH 内部实现：
+ * `ui-approval` 的 `PendingApproval` 只在自己被作答或 `request.signal` abort 时关闭。
+ * 升级后可能一变就失效，所以：
+ *  - 启动时跑一次本地自检（`runApprovalProxySelfCheck`），失败就整场退回「不代理」；
+ *  - 自检通过但版本不在本表里时**仍然启用**，只记一条「未实测，代理可能失效」的
+ *    警告日志，并在 `bridge.approvalProxyStatus()` 里体现 `tested:false`。
+ *
+ * 维护规则：升级 DSH 后跑一次双端审批冒烟（手机先答 → 桌面弹窗自动消失），通过了
+ * 才把新版本加进来。当前值来自 2026-11-10 实测的桌面版 `0.2.2-rc.1`（updater 的
+ * `pending/update-info.json` 与 profile 里同批 `@deepseek-ai/*` 依赖都是 0.2.2-rc.1）。
+ * 同一 `x.y.z` 家族的预发布/正式版共用同一份 `ui-approval` 实现，所以家族匹配
+ * （`0.2.2` 与 `0.2.2-rc.1`）也算已实测；跨小版本不算。
+ */
+export const TESTED_DSH_VERSIONS = Object.freeze(['0.2.2-rc.1'])
+
+/** 去掉 `v` 前缀与构建元数据（`+sha`），便于比较。 */
+function stripVersionNoise(version) {
+  return String(version).trim().replace(/^v/i, '').split('+')[0]
+}
+
+/**
+ * 把一个版本号归一化成 `x.y.z[-预发布]`，认不出来返回 `null`。
+ * 不用正则里的数字类，避免转义问题：按 `-` 和 `.` 手工切。
+ * @param {unknown} version
+ * @returns {string | null}
+ */
+export function normalizeDshVersion(version) {
+  if (typeof version !== 'string') return null
+  const text = stripVersionNoise(version)
+  const dash = text.indexOf('-')
+  const core = dash >= 0 ? text.slice(0, dash) : text
+  const parts = core.split('.')
+  if (parts.length !== 3) return null
+  if (!parts.every(part => part !== '' && [...part].every(digit => digit >= '0' && digit <= '9'))) return null
+  const prerelease = dash >= 0 ? text.slice(dash + 1) : ''
+  if (prerelease !== '' && !/^[0-9A-Za-z.-]+$/.test(prerelease)) return null
+  return text
+}
+
+/**
+ * 这个 DSH 版本是否在已实测白名单里（含同 `x.y.z` 家族）。
+ * 版本不可读（`null`）一律算未实测。
+ * @param {unknown} version
+ * @returns {boolean}
+ */
+export function isTestedDshVersion(version) {
+  const normalized = normalizeDshVersion(version)
+  if (!normalized) return false
+  if (TESTED_DSH_VERSIONS.includes(normalized)) return true
+  const family = normalized.split('-')[0]
+  return TESTED_DSH_VERSIONS.some(tested => stripVersionNoise(tested).split('-')[0] === family)
+}
+
+/**
+ * 读宿主 DSH 版本，读不到返回 `null`（不抛）。
+ *
+ * 依次尝试：显式覆盖（`OPENWHALE_DSH_VERSION` 环境变量）→ 宿主上下文里可能暴露的
+ * version → 宿主包清单（Electron 里 `app.asar` 内的 package.json 可以当普通文件读）
+ * → 桌面版根 package.json。任何一步失败都继续下一步：版本只用于「已实测」判定，
+ * 读不到不影响功能，只是 `approvalProxyStatus()` 里标成未实测。
+ * @param {any} [ctx]
+ * @returns {string | null}
+ */
+export function readHostDshVersion(ctx) {
+  const fromEnv = process.env?.OPENWHALE_DSH_VERSION
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  // 宿主上下文暴露的位置随版本变化，逐个探；服务不存在/未声明时 get() 会抛，吞掉继续。
+  const probes = [
+    () => ctx?.get?.('app')?.version,
+    () => ctx?.app?.version,
+    () => ctx?.get?.('dsh')?.version,
+    () => ctx?.dsh?.version,
+  ]
+  for (const probe of probes) {
+    try {
+      const value = probe()
+      if (typeof value === 'string' && value.trim() !== '') return value.trim()
+    } catch { /* 该 seam 不存在：继续 */ }
+  }
+  const manifests = []
+  for (const root of HOST_MODULE_ROOTS) {
+    for (const name of ['@deepseek-ai/dsh', '@deepseek-ai/dsh-base']) {
+      manifests.push(join(root, ...name.split('/'), 'package.json'))
+    }
+  }
+  if (typeof process.resourcesPath === 'string' && process.resourcesPath !== '') {
+    manifests.push(join(process.resourcesPath, 'app.asar', 'package.json'))
+    manifests.push(join(process.resourcesPath, 'app.asar', 'dsh', 'package.json'))
+  }
+  for (const manifest of manifests) {
+    try {
+      const version = JSON.parse(readFileSync(manifest, 'utf8'))?.version
+      if (typeof version === 'string' && version.trim() !== '') return version.trim()
+    } catch { /* 文件不存在或不是 JSON：继续 */ }
+  }
+  return null
+}
+
+/**
+ * signal 代理的启动自检：**本地可验证、无副作用**。
+ *
+ * 用合成的 `AbortController` 走一遍真实的转发链，证明这个 JS 运行时里：
+ *  1. `AbortSignal` 支持 `addEventListener`；
+ *  2. 原始 signal 的 abort 能转发到代理 signal（「停止/取消」仍然有效）；
+ *  3. 代理 signal 能写进一个普通对象的 `signal` 属性（审批请求就是这个形状）；
+ *  4. 代理 signal 自己 abort 后 `aborted` 可读（手机作答关弹窗走这条）。
+ *
+ * 只说运行时这一侧的事：它无法证明 DSH 审批服务会把下游 answerer 眼里 signal 的
+ * abort 传回前端弹窗——那需要真实双端审批冒烟，所以另有版本白名单兜底。
+ * 全程只新建对象、不碰 ctx 与全局状态，失败也返回结果而不是抛。
+ * @returns {{ok: true} | {ok: false, reason: string}}
+ */
+export function runApprovalProxySelfCheck() {
+  try {
+    if (typeof AbortController !== 'function') return { ok: false, reason: '运行时没有 AbortController' }
+    const original = new AbortController()
+    const proxy = new AbortController()
+    if (!original.signal || typeof original.signal.addEventListener !== 'function') {
+      return { ok: false, reason: 'AbortSignal 不支持 addEventListener' }
+    }
+    if (!proxy.signal || typeof proxy.signal.addEventListener !== 'function') {
+      return { ok: false, reason: '代理 AbortSignal 缺少 addEventListener' }
+    }
+    let forwarded = false
+    original.signal.addEventListener('abort', () => {
+      forwarded = true
+      proxy.abort(original.signal.reason)
+    }, { once: true })
+    if (original.signal.aborted) return { ok: false, reason: '新建的 signal 已经是 aborted' }
+    original.abort(new Error('openwhale-selfcheck'))
+    if (!forwarded) return { ok: false, reason: '原始 signal 的 abort 没有触发转发' }
+    if (!proxy.signal.aborted) return { ok: false, reason: 'abort 没有转发到代理 signal' }
+    const syntheticRequest = {}
+    syntheticRequest.signal = proxy.signal
+    if (syntheticRequest.signal !== proxy.signal) {
+      return { ok: false, reason: '代理 signal 写不进请求对象的 signal 属性' }
+    }
+    const answered = new AbortController()
+    answered.abort(new Error('answered-on-phone'))
+    if (!answered.signal.aborted) return { ok: false, reason: '代理 signal 的 abort 不可读' }
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, reason: `自检抛错：${/** @type {Error} */ (error)?.message ?? String(error)}` }
+  }
+}
 
 /**
  * @typedef {object} BridgeEvent
@@ -158,6 +312,9 @@ export class DshBridge {
     /** questionId → 前台等待超时后仍可补答的提问（DSH 的 askTimed/continued） */
     this.lateQuestions = new Map()
     this.disposed = false
+    // 审批 signal 代理的启动自检 + 版本判定（只跑一次；结论进日志与 health）。
+    // 配置关闭或自检失败都只降级为「不代理」，不影响手机卡片与「先答先算」，也绝不抛。
+    this.#initApprovalProxy(options)
     this.subscriptions = []
   }
 
@@ -285,18 +442,30 @@ export class DshBridge {
     const limited = roots.slice(0, SESSION_LIST_LIMIT)
 
     const titles = await this.#titles(limited.map(record => record.header.id))
+    // 没有真实标题的会话按 cwd 兜底：同一个 cwd 下有多个时全部补 id 后缀，
+    // 否则手机列表里一排「default-workspace」无法区分（用户实测反馈）。
+    const fallbackCounts = new Map()
+    for (const record of limited) {
+      if (titles.has(record.header.id)) continue
+      const key = this.#titleFallbackBase(record.header)
+      fallbackCounts.set(key, (fallbackCounts.get(key) ?? 0) + 1)
+    }
     const sessions = limited.map(record => {
       const header = record.header
       const live = record.live === true || Boolean(this.ctx.agents.get(header.id))
+      const realTitle = titles.get(header.id)
+      const fallback = this.#titleFallbackBase(header)
       return {
         id: header.id,
-        title: titles.get(header.id) ?? this.#titleFallback(header),
+        title: realTitle
+          ?? this.#titleFallback(header, { distinct: (fallbackCounts.get(fallback) ?? 0) > 1 }),
         ...(typeof header.cwd === 'string' && header.cwd !== '' ? { cwd: header.cwd } : {}),
         createdAt: Number(header.createdAt) || 0,
         live,
       }
     })
-    return { sessions, truncated }
+    // 真实标题也可能撞名（DSH 自动标题是内容摘要）：确定性去重，后出现的加 #2/#3。
+    return { sessions: this.#dedupeSessionTitles(sessions), truncated }
   }
 
   /**
@@ -392,6 +561,90 @@ export class DshBridge {
   // ---------------------------------------------------------------------------
   // 审批转发（v2.3.0）
   // ---------------------------------------------------------------------------
+
+  /**
+   * 审批 signal 代理的启动自检 + 版本判定（构造函数里只跑一次）。
+   *
+   * 结果放在 `this.approvalProxy`：
+   *  - `enabled`：本进程是否真的会去写 `req.signal`。配置关闭或自检失败时是 `false`，
+   *    此时 `#installSignalProxy` 直接返回，`req.signal` 一个字节都不改；
+   *  - `selfCheck`：`'passed'` / `'failed'` / `'skipped'`（配置关闭时跳过自检）；
+   *  - `hostVersion`：探测到的 DSH 版本，读不到是 `null`；
+   *  - `tested`：版本是否在 `TESTED_DSH_VERSIONS` 里（未实测仍启用，只是可能失效）；
+   *  - `reason`：一句中文结论，直接进日志与 health。
+   * 自检失败/探测失败/日志本身失败都不抛：审批降级为「桌面留框」，手机卡片与
+   * 「先答先算」不受影响。
+   * @param {any} options
+   */
+  #initApprovalProxy(options) {
+    const status = {
+      enabled: false,
+      selfCheck: 'failed',
+      hostVersion: null,
+      tested: false,
+      reason: '代理状态未初始化',
+    }
+    try {
+      const configured = this.config?.experimentalDualApproval !== false
+      const forced = options != null && Object.prototype.hasOwnProperty.call(options, 'hostVersion')
+      const hostVersion = forced ? options.hostVersion : readHostDshVersion(this.ctx)
+      // 配置关闭时连自检都不跑（自检只是为了判断「能不能安全地写 req.signal」）。
+      const check = !configured
+        ? null
+        : (typeof options?.approvalSelfCheck === 'function'
+          ? options.approvalSelfCheck()
+          : runApprovalProxySelfCheck())
+      status.hostVersion = typeof hostVersion === 'string' && hostVersion.trim() !== '' ? hostVersion.trim() : null
+      status.tested = isTestedDshVersion(status.hostVersion)
+      if (!configured) {
+        status.selfCheck = 'skipped'
+        status.enabled = false
+        status.reason = 'experimentalDualApproval 已关闭：不做 signal 代理，桌面弹窗需用户自己点掉'
+        this.log('approval: 实验性双端审批已关闭（experimentalDualApproval=false）→ 不做 signal 代理，桌面弹窗需手动点掉；手机卡片与「先答先算」仍然生效')
+      } else if (check?.ok !== true) {
+        status.selfCheck = 'failed'
+        status.enabled = false
+        status.reason = `代理自检失败：${check?.reason ?? '未知原因'}`
+        this.log(`approval: 代理自检失败（${check?.reason ?? '未知原因'}）→ 自动退回「不代理」模式：手机仍可作答，桌面弹窗需手动点掉`)
+      } else {
+        status.selfCheck = 'passed'
+        status.enabled = true
+        if (status.tested) {
+          status.reason = `已实测版本 ${status.hostVersion}，signal 代理可用`
+          this.log(`approval: 代理自检通过（AbortController 转发链可用）；DSH ${status.hostVersion} 已实测 → 手机作答会关闭桌面弹窗`)
+        } else if (status.hostVersion) {
+          status.reason = `未实测版本 ${status.hostVersion}，代理可能失效`
+          this.log(`approval: 代理自检通过，但 DSH ${status.hostVersion} 未实测，代理可能失效（建议跑一次双端审批冒烟：手机先答 → 看桌面弹窗是否关闭）`)
+        } else {
+          status.reason = '运行时 DSH 版本不可读，无法确认是否已实测，代理可能失效'
+          this.log('approval: 代理自检通过，但运行时 DSH 版本不可读，无法确认是否已实测，代理可能失效（代理仍启用）')
+        }
+      }
+    } catch (error) {
+      status.enabled = false
+      status.selfCheck = 'failed'
+      status.reason = `代理自检异常：${/** @type {Error} */ (error)?.message ?? String(error)}`
+      try {
+        this.log(`approval: ${status.reason} → 自动退回「不代理」模式`)
+      } catch { /* 日志本身失败也不能影响插件 */ }
+    }
+    this.approvalProxy = status
+  }
+
+  /**
+   * 审批 signal 代理的当前状态（health 用；JSON 安全，不暴露内部对象）。
+   * @returns {{enabled: boolean, selfCheck: string, hostVersion: string | null, tested: boolean, reason: string}}
+   */
+  approvalProxyStatus() {
+    const state = this.approvalProxy ?? {}
+    return {
+      enabled: state.enabled === true,
+      selfCheck: typeof state.selfCheck === 'string' ? state.selfCheck : 'failed',
+      hostVersion: typeof state.hostVersion === 'string' ? state.hostVersion : null,
+      tested: state.tested === true,
+      reason: typeof state.reason === 'string' ? state.reason : '代理状态未初始化',
+    }
+  }
 
   /**
    * 手机对一条待答审批作答（B 版：桌面与手机同时可答，谁先答算谁）。
@@ -630,30 +883,10 @@ export class DshBridge {
     this.emit({ ...entry.payload })
     this.log(`approval: ${entry.approvalId} 已同时交给桌面端（双端可答）`)
 
-    // B 版实验：把下游 answerer 看到的 signal 换成我们自己的代理 signal。
-    // 原始 signal 的 abort 会转发到代理上（保证「停止/取消」仍然有效）。
-    // 注意：绝不能 abort 原始 signal——审批服务在 decide() 里已经拿它做了取消竞争。
-    try {
-      const controller = new AbortController()
-      const original = entry.signal
-      if (original && typeof original.addEventListener === 'function') {
-        entry.proxyForwardAbort = () => controller.abort(original.reason)
-        original.addEventListener('abort', entry.proxyForwardAbort, { once: true })
-        if (original.aborted) controller.abort(original.reason)
-      }
-      if (entry.req && typeof entry.req === 'object') {
-        entry.req.signal = controller.signal
-        entry.proxyController = controller
-        entry.hackActive = entry.req.signal === controller.signal
-      }
-      this.log(
-        entry.hackActive
-          ? `approval: ${entry.approvalId} signal 代理已启用（手机作答将关闭桌面弹窗）`
-          : `approval: ${entry.approvalId} signal 代理不可用（req.signal 不可写），退回残框模式`,
-      )
-    } catch (error) {
-      this.log(`approval: ${entry.approvalId} signal 代理失败，退回残框模式：${/** @type {Error} */ (error).message}`)
-    }
+    // 装 signal 代理：手机作答时 abort 它，桌面原生弹窗就收掉了。是否真的动手由
+    // 启动自检 + experimentalDualApproval 决定——关闭或自检失败时 req.signal
+    // 一个字节都不改，桌面弹窗留给用户自己点掉（手机卡片与「先答先算」不受影响）。
+    this.#installSignalProxy(entry)
 
     let answer
     try {
@@ -672,6 +905,50 @@ export class DshBridge {
       if (!this.approvals.has(entry.approvalId)) return
       this.#settleApproval(entry.approvalId, 'unavailable', 'desktop')
     })
+  }
+
+  /**
+   * 给一条审批请求装 signal 代理（手机作答时关掉桌面原生弹窗）。
+   *
+   * **只在启动自检通过且 `experimentalDualApproval` 未关闭时才动手**：否则直接返回，
+   * `req.signal` 保持原样（一个字节都不写），桌面弹窗由用户自己点掉——手机卡片与
+   * 「先答先算」都不受影响。这样 DSH 升级把 hack 弄失效时，最坏结果只是「桌面留框」。
+   * 写不进去的请求（冻结对象、只读属性）也只降级不抛，手机作答照旧生效。
+   * @param {any} entry
+   */
+  #installSignalProxy(entry) {
+    if (!entry) return
+    // 开关关闭 / 自检失败：绝不写 req.signal。
+    if (this.approvalProxy?.enabled !== true) return
+    const req = entry.req
+    if (!req || typeof req !== 'object') {
+      this.log(`approval: ${entry.approvalId} 审批请求不可写，装不了 signal 代理（桌面弹窗需手动关闭）`)
+      return
+    }
+    try {
+      const controller = new AbortController()
+      const original = entry.signal
+      // 原始 signal 的 abort（停止/取消）必须转发到代理上，否则「停止」不再关弹窗。
+      // 注意：绝不能 abort 原始 signal——审批服务在 decide() 里已经拿它做了取消竞争。
+      if (original && typeof original.addEventListener === 'function') {
+        entry.proxyForwardAbort = () => controller.abort(original.reason)
+        original.addEventListener('abort', entry.proxyForwardAbort, { once: true })
+        if (original.aborted) controller.abort(original.reason)
+      }
+      req.signal = controller.signal
+      entry.proxyController = controller
+      entry.hackActive = req.signal === controller.signal
+      this.log(
+        entry.hackActive
+          ? `approval: ${entry.approvalId} signal 代理已启用（手机作答将关闭桌面弹窗）`
+          : `approval: ${entry.approvalId} signal 代理不可用（req.signal 不可写），退回残框模式`,
+      )
+    } catch (error) {
+      // 代理装不上只是「桌面留框」，手机作答仍然有效：绝不把异常抛给审批瀑布。
+      entry.proxyController = null
+      entry.hackActive = false
+      this.log(`approval: ${entry.approvalId} signal 代理失败，退回残框模式：${/** @type {Error} */ (error).message}`)
+    }
   }
 
   /**
@@ -880,12 +1157,23 @@ export class DshBridge {
         if (options.length > 0) item.options = options
       }
       if (q.multiSelect === true) item.multiSelect = true
-      if (q.intent && typeof q.intent === 'object' && q.intent.kind === 'plan-review' && typeof q.intent.approve === 'string') {
-        item.intent = {
-          kind: 'plan-review',
-          approve: q.intent.approve.slice(0, 200),
-          ...(typeof q.intent.callId === 'string' ? { callId: q.intent.callId } : {}),
-        }
+      // 新版 DSH 把「人话」放在 `intent.display`（本地化字典：question/detail/approve），
+      // 而计划审阅/新版提问的 `question` 可能只是一个空串：不把 display 转发出去，手机
+      // 卡片就只剩「需要你的回答」+选项，题干永远不显示（用户 #4 的服务端根因）。
+      // 形状与 webchat 的 `questionDisplayOf(candidate.intent)` 对齐：`intent.display`。
+      if (q.intent && typeof q.intent === 'object' && !Array.isArray(q.intent)) {
+        const source = /** @type {Record<string, any>} */ (q.intent)
+        /** @type {Record<string, any>} */
+        const intent = {}
+        // `kind` 决定卡片类型（plan-review / 普通提问 / approval intent 都保留）。
+        if (typeof source.kind === 'string' && source.kind !== '') intent.kind = source.kind.slice(0, 64)
+        // 旧的 `intent.approve` 字符串保留：webchat 仍把它当按批准文案的回退来源。
+        if (typeof source.approve === 'string') intent.approve = source.approve.slice(0, 200)
+        if (typeof source.callId === 'string') intent.callId = source.callId
+        const display = sanitizeQuestionDisplay(source.display)
+        if (display) intent.display = display
+        // 一个字段都没有时不要凭空造 `intent: {}`（旧行为是整块不发）。
+        if (Object.keys(intent).length > 0) item.intent = intent
       }
       items.push(item)
     }
@@ -955,6 +1243,15 @@ export class DshBridge {
   }
 
   /**
+   * 读会话标题。
+   *
+   * DSH 的 `readTitleSnapshots()` 返回 `SessionTitleObservationResult[]`：
+   *   {sessionId, status:'fulfilled', value:{session: SessionHeader, title?: SessionTitleSnapshot}}
+   * 其中 `SessionTitleSnapshot` 是**对象**（`SessionTitleEventData` 的子类，含
+   * `title: string`、`messageSeqs`、`source`、`eventSeq`、`updatedAt`），不是
+   * 字符串。v3.0.0 之前把 `value.title` 当字符串判定，标题永远取不到，同一 cwd
+   * 的会话于是全退回 `default-workspace`（用户报「会话名仍未区分」）。这里同时
+   * 兼容字符串与对象两种形状，并对 rejected / 缺字段 / 空白标题做校验。
    * @param {string[]} sessionIds
    * @returns {Promise<Map<string, string>>} sessionId → 标题
    */
@@ -965,10 +1262,16 @@ export class DshBridge {
     if (sessionIds.length === 0 || typeof query?.readTitleSnapshots !== 'function') return titles
     try {
       const snapshots = await query.readTitleSnapshots(sessionIds)
-      for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
-        const title = snapshot?.value?.title
-        if (snapshot?.status === 'fulfilled' && typeof title === 'string' && title.trim() !== '') {
-          titles.set(snapshot.sessionId, title.trim())
+      const results = Array.isArray(snapshots) ? snapshots : []
+      for (let index = 0; index < results.length; index += 1) {
+        const snapshot = results[index]
+        if (!snapshot || snapshot.status !== 'fulfilled') continue
+        // 宿主返回的 sessionId 优先；形状再变就退回请求顺序（readTitleSnapshots
+        // 按入参 ids 返回数组）。
+        const sessionId = this.#snapshotSessionId(snapshot) ?? sessionIds[index]
+        const title = this.#snapshotTitle(snapshot.value)
+        if (typeof sessionId === 'string' && sessionId !== '' && title !== undefined) {
+          titles.set(sessionId, title)
         }
       }
     } catch (error) {
@@ -977,11 +1280,111 @@ export class DshBridge {
     return titles
   }
 
-  /** @param {any} header */
-  #titleFallback(header) {
+  /**
+   * 从一条 observation 里取 sessionId（兼容 value.session.id 与顶层 sessionId）。
+   * @param {any} snapshot
+   * @returns {string | undefined}
+   */
+  #snapshotSessionId(snapshot) {
+    const candidates = [
+      snapshot?.sessionId,
+      snapshot?.value?.session?.id,
+      snapshot?.value?.session?.sessionId,
+      snapshot?.value?.sessionId,
+    ]
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim() !== '') return candidate.trim()
+    }
+    return undefined
+  }
+
+  /**
+   * 从一个 title observation 的 value 里取标题文本。
+   *
+   * 真实形状是 `{session, title: SessionTitleSnapshot}`（`title.title` 才是
+   * 字符串）；旧代码/旧宿主也可能直接给字符串。兜底再看 header 上的 title
+   * 字段，最后做 trim / 空白折叠 / 截断。
+   * @param {any} value
+   * @returns {string | undefined}
+   */
+  #snapshotTitle(value) {
+    const candidates = [
+      value?.title?.title,   // SessionTitleSnapshot: {title: string, ...}
+      value?.title,          // 字符串标题（旧形状），或对象本身
+      value?.session?.title, // 兜底：SessionHeader 上的 title（宿主以后可能加）
+      typeof value === 'string' ? value : undefined,
+    ]
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') continue
+      const title = this.#clampTitle(candidate)
+      if (title !== '') return title
+    }
+    return undefined
+  }
+
+  /** 标题展示用：trim、折叠连续空白、超长截断。 @param {string} title @returns {string} */
+  #clampTitle(title) {
+    const normalized = title.replace(/\s+/g, ' ').trim()
+    return normalized.length > SESSION_TITLE_MAX_LENGTH
+      ? `${normalized.slice(0, SESSION_TITLE_MAX_LENGTH - 1)}…`
+      : normalized
+  }
+
+  /**
+   * 无标题时的兜底展示名：cwd 最后一段（或「新会话」）。
+   * @param {any} header
+   * @returns {string}
+   */
+  #titleFallbackBase(header) {
     const cwd = typeof header?.cwd === 'string' ? header.cwd.replace(/[\\/]+$/, '') : ''
     const last = cwd.split(/[\\/]/).pop()
     return last && last !== cwd ? last : '新会话'
+  }
+
+  /**
+   * 无标题时的兜底展示名。
+   *
+   * DSH 标题是 log-backed 的（session/title 事件），刚建的会话可能真的还没有
+   * 标题；同一工作目录下多个无标题会话都退回 cwd 末段时，手机上是一排一样的
+   * 「default-workspace」（用户实测）。此时追加 session id 后 6 位，保证任何
+   * 时刻都能区分，且跨刷新稳定（id 不变，后缀不变）。
+   * @param {any} header
+   * @param {{distinct?: boolean}} [options] distinct=true 时追加 id 后缀
+   * @returns {string}
+   */
+  #titleFallback(header, options = {}) {
+    const base = this.#titleFallbackBase(header)
+    const suffix = shortSessionIdSuffix(header?.id)
+    return options.distinct === true && suffix !== '' ? `${base} · ${suffix}` : base
+  }
+
+  /**
+   * 会话标题确定性去重：完全同名的第 2、3 个追加 `#2`、`#3`。
+   *
+   * 只用「打开顺序」（listSessions 已按 createdAt 倒序）决定序号，不依赖
+   * 随机数或 Map/Set 遍历顺序；同一份输入多次调用结果一致。返回新数组、不改
+   * 入参，避免调用方复用时被污染。
+   * @param {Array<{id: string, title: string}>} sessions
+   * @returns {Array<any>}
+   */
+  #dedupeSessionTitles(sessions) {
+    const used = new Set()
+    const nextIndex = new Map()
+    return sessions.map(session => {
+      let title = session.title
+      if (used.has(title)) {
+        let index = nextIndex.get(title) ?? 1
+        let candidate = title
+        do {
+          index += 1
+          candidate = `${title} #${index}`
+        } while (used.has(candidate))
+        nextIndex.set(title, index)
+        title = candidate
+      }
+      used.add(title)
+      return title === session.title ? session : { ...session, title }
+    })
   }
 
   /**
@@ -1890,6 +2293,41 @@ export function isLocalizedText(value) {
   return entries.every(([key, text]) => key.length <= 32 && typeof text === 'string' && text.length <= 500)
 }
 
+/** `intent.display` 里允许转发的人话字段（与 webchat 的 `questionDisplayOf` 一一对应）。 */
+const QUESTION_DISPLAY_FIELDS = ['question', 'detail', 'approve']
+
+/**
+ * 深拷贝一份合法的本地化字典；非法（数组/数字/嵌套非字符串/超长）返回 `undefined`。
+ *
+ * 只复制字符串值，用 `Object.fromEntries`（定义自有属性）避免把 `__proto__` 之类
+ * 的键写进原型，结果一定是 JSON 安全的普通对象。
+ * @param {unknown} value
+ * @returns {Record<string, string> | undefined}
+ */
+function copyLocalizedText(value) {
+  if (!isLocalizedText(value)) return undefined
+  return Object.fromEntries(Object.entries(/** @type {Record<string, string>} */ (value)))
+}
+
+/**
+ * 校验并深拷贝 `intent.display`：`question` / `detail` / `approve` 逐个校验，
+ * 非法或缺失的子项只丢自己——不丢整条提问，也不丢 display 里的其它子项。
+ * @param {unknown} display
+ * @returns {Record<string, Record<string, string>> | undefined}
+ */
+function sanitizeQuestionDisplay(display) {
+  if (!display || typeof display !== 'object' || Array.isArray(display)) return undefined
+  const source = /** @type {Record<string, unknown>} */ (display)
+  /** @type {Record<string, Record<string, string>>} */
+  const forwarded = {}
+  for (const field of QUESTION_DISPLAY_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) continue
+    const text = copyLocalizedText(source[field])
+    if (text) forwarded[field] = text
+  }
+  return Object.keys(forwarded).length > 0 ? forwarded : undefined
+}
+
 /**
  * Best-effort text extraction from an `assistant/attempt` stream.
  *
@@ -1933,6 +2371,20 @@ export function summarizeToolCall(name, argsJson) {
   if (/image/i.test(tool)) return '正在处理图片'
   if (FILE_TOOL_HINTS.some(hint => tool.toLowerCase().includes(hint))) return `正在生成文件${short}`
   return `正在使用${tool}`
+}
+
+/**
+ * session id 的短后缀（取末 6 位），用于无标题会话的兜底区分。
+ *
+ * DSH 的 SessionId 是 UUID；测试里也可能是短 id。只保留字母数字（去掉了
+ * 连字符/下划线等分隔符），不足 6 位时原样返回，空则返回 ''。
+ * @param {unknown} sessionId
+ * @returns {string}
+ */
+function shortSessionIdSuffix(sessionId) {
+  if (typeof sessionId !== 'string') return ''
+  const compact = sessionId.replace(/[^A-Za-z0-9]/g, '')
+  return compact.length <= 6 ? compact : compact.slice(-6)
 }
 
 /**

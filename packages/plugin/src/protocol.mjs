@@ -5,7 +5,7 @@
 // import reaching outside the package breaks at load time; the protocol therefore
 // has to live inside `src/`. The authoritative source stays in `packages/protocol`,
 // and `npm run sync:protocol` regenerates this file.
-// OPENWHALE-PROTOCOL-SOURCE-SHA256: 01cc8804f4ca9ae89fae01fdf3b844e420d834fcbbe4e2e2f65a0bbc7854719e
+// OPENWHALE-PROTOCOL-SOURCE-SHA256: c2f9e7cce6432bdcde5a395d9f93a47dab7cc8297cc31441e78ee0f5914d48ed
 /**
  * Open Whale wire protocol — the single source of truth shared by the DSH computer
  * plugin (`dsh-openwhale`) and the Open Whale mobile app.
@@ -582,17 +582,32 @@ export function helloAckProofMessage(nonce, deviceId) {
  */
 
 /**
+ * @typedef {object} QuestionDisplay
+ * Localized human-readable strings for one question (`{ en: string, zh?: string, ... }`).
+ * DSH moved the plan-review wording here, so a client MUST fall back to these when
+ * `QuestionItem.question` is empty.
+ * @property {Record<string, string>} [question]
+ * @property {Record<string, string>} [detail]
+ * @property {Record<string, string>} [approve]
+ */
+
+/**
  * @typedef {object} QuestionItem
  * One question of a batch. `intent` is passed through untouched: a client that
  * recognises `plan-review` may render it as a plan approval card, one that does
  * not just shows the options.
+ *
+ * `question` stays a string for compatibility but MAY be empty (or only carry the
+ * machine form) when the localizable wording lives in `intent.display`; readers
+ * should fall back `question` → `intent.display.question` → `header` → `detail`
+ * rather than render a blank prompt.
  * @property {string} id
  * @property {string} question
  * @property {string} [detail]
  * @property {string} [header]
  * @property {QuestionOption[]} [options]
  * @property {boolean} [multiSelect]
- * @property {{kind: 'plan-review', approve: string, callId?: string}} [intent]
+ * @property {{kind: 'plan-review'|'approval', approve?: string, reject?: string, callId?: string, display?: QuestionDisplay}} [intent]
  */
 
 /**

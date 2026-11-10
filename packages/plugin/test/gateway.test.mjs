@@ -681,6 +681,77 @@ test('ping is answered with pong once authenticated, and refused before that', a
   client.close()
 })
 
+test('device presence separates foreground from background and expires stale heartbeats', async t => {
+  // 注入时钟：freshness 窗口（70s）可以一次性跳过，不用真的等。
+  let now = 1_000_000
+  const { gateway, port } = await makeGateway({ now: () => now })
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const { client, ack } = await pairDevice(port, device)
+
+  const waitPresence = async expected => {
+    for (let i = 0; i < 200; i += 1) {
+      if (gateway.devicePresence(device.deviceId) === expected) return true
+      await delay(5)
+    }
+    return false
+  }
+
+  // 握手即视为前台（旧客户端不发 visible，协议规定按前台处理）。
+  assert.equal(gateway.devicePresence(device.deviceId), 'foreground')
+  assert.equal(gateway.deviceOnline(device.deviceId), true)
+
+  // 显式后台：锁屏/切后台的新客户端会立刻补一帧 ping{visible:false}。
+  client.send({ t: 'ping', visible: false })
+  assert.ok(await client.waitFor(f => f.t === 'pong'))
+  assert.ok(await waitPresence('background'))
+  assert.equal(gateway.deviceOnline(device.deviceId), true, '后台设备仍然在线')
+  assert.deepEqual(
+    gateway.devicesInSession(ack.sessionId),
+    [device.deviceId],
+    '前后台只影响展示，不改变审批/提问的转发资格',
+  )
+
+  // 回到前台：visible:true 的心跳立即恢复。
+  client.send({ t: 'ping', visible: true })
+  assert.ok(await waitPresence('foreground'))
+
+  // 心跳过期（浏览器冻结/丢包）：没有任何新帧，只靠时间也应降级为后台。
+  now += 71_000
+  assert.equal(gateway.devicePresence(device.deviceId), 'background', '超过 freshness 窗口的可见心跳视为后台')
+
+  // 旧客户端不带 visible：按前台处理，但仍必须靠心跳续期。
+  client.send({ t: 'ping' })
+  assert.ok(await waitPresence('foreground'))
+
+  // health：在线设备数（connections）语义不变，另给出前台/后台细分。
+  client.send({ t: 'ping', visible: false })
+  assert.ok(await waitPresence('background'))
+  const health = await (await fetch(`http://127.0.0.1:${port}/openwhale/health`)).json()
+  assert.equal(health.onlineDevices, 1)
+  assert.equal(health.foregroundDevices, 0)
+  assert.equal(health.backgroundDevices, 1)
+  assert.equal(health.connections, 1, 'connections 仍是「在线设备数」')
+  assert.equal(health.sessions, 1)
+
+  // 同一设备两条 socket（竞速/多窗口）：任意一条前台就算前台；关掉后按剩下的
+  // 那条正确退回，不能把「还有一条后台 socket」当成离线。
+  const second = await reconnectSession(port, device)
+  client.send({ t: 'ping', visible: false })
+  second.send({ t: 'ping', visible: true })
+  assert.ok(await waitPresence('foreground'), '任意一条 socket 前台即算前台')
+  second.send({ t: 'ping', visible: false })
+  assert.ok(await waitPresence('background'))
+  second.close()
+  await delay(80)
+  assert.ok(await waitPresence('background'), '一条 socket 关闭后按剩下那条的状态')
+
+  client.close()
+  await delay(80)
+  assert.equal(gateway.devicePresence(device.deviceId), 'offline')
+  assert.equal(gateway.deviceOnline(device.deviceId), false)
+})
+
 test('an unauthenticated socket is registered before it ever authenticates', async t => {
   const { gateway, port } = await makeGateway()
   t.after(() => gateway.close())
@@ -2375,6 +2446,7 @@ test('the page renderer escapes untrusted values and hides local-only controls r
     report: { detected: { lan: ['http://192.168.1.9:8787'] } },
     devices: [{ id: 'd1', label: '<script>alert(1)</script>' }],
     online: () => true,
+    presence: () => 'background',
     computerName: '<img src=x>',
     computerId: 'cmp_test',
     fingerprint: 'abcdef',
@@ -2387,9 +2459,17 @@ test('the page renderer escapes untrusted values and hides local-only controls r
   assert.match(local, /&lt;img src=x&gt;/)
   assert.match(local, /data-unbind="d1"/)
   assert.match(local, /id="send-file-btn"/)
+  // v3.0.0：local 视图也要显示状态（改名前/移除按钮同排），后台不算离线。
+  assert.equal(local.includes('在线（后台）'), true, 'local view must show the device presence')
 
   const remote = renderPageHtml({ ...view, local: false }, deps)
   assert.match(remote, /请在本机浏览器/)
   assert.equal(remote.includes('id="send-file-btn"'), false)
   assert.equal(remote.includes('data-unbind="d1"'), false)
+  assert.equal(remote.includes('在线（后台）'), true, 'remote view must say online-but-background')
+
+  const foreground = renderPageHtml(view, { ...deps, presence: () => 'foreground' })
+  assert.equal(foreground.includes('在线（前台）'), true)
+  const offline = renderPageHtml({ ...view, local: false }, { ...deps, presence: () => 'offline' })
+  assert.equal(offline.includes('离线'), true)
 })

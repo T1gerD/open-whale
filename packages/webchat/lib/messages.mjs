@@ -91,6 +91,17 @@ export function composerAction(input = {}) {
 export const QUESTION_QUEUE_LIMIT = 4
 
 /**
+ * 保留多少张「已作答」的提问摘要卡。
+ *
+ * 答完的卡片不能凭空消失（真机反馈「答完之后聊天流里没有任何记录」），但也不能
+ * 无限堆在聊天流里，所以只留最近若干张。
+ */
+export const QUESTION_LOG_LIMIT = 20
+
+/** 题干彻底取不到时的兜底文案：宁可显示一句实话，也不要渲染一行空白。 */
+export const QUESTION_FALLBACK_TEXT = '电脑端没有给出题干内容'
+
+/**
  * 标签条最多同时打开多少个会话：当前会话 + `SESSION_WATCH_LIMIT` 个后台会话。
  * 多出来的后台会话电脑端根本不会推事件，标签上只能是一片死气，所以干脆不让开。
  */
@@ -157,6 +168,61 @@ export function fileMessageId(fileId) {
 }
 
 /**
+ * 把帧里的 seq 变成一个可信的数字（`undefined` = 这条消息没有权威次序）。
+ * 注意不能直接 `Number(x)`：`Number(null)` 和 `Number('')` 都是 0，会被当成
+ * 「seq 0」，把消息顶到会话最前面。
+ * @param {unknown} value
+ * @returns {number | undefined}
+ */
+function finiteSeq(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+/**
+ * 历史消息 id（网关历史快照里的 `hist_<seq>`）携带的会话序号。
+ * @param {unknown} id
+ * @returns {number | undefined}
+ */
+export function historyMessageSeq(id) {
+  const match = /^hist_([0-9]+)$/.exec(String(id ?? ''))
+  return match ? Number(match[1]) : undefined
+}
+
+/**
+ * 快照消息的落位 seq：显式 `seq` 优先，其次从 `hist_<seq>` 形式的 id 解析。
+ * @param {any} raw
+ * @returns {number | undefined}
+ */
+function snapSeqOf(raw) {
+  return finiteSeq(raw?.seq) ?? historyMessageSeq(raw?.id)
+}
+
+/**
+ * 一条消息的排序键（纯函数版，导出给测试与调试用）。
+ * 与 `ChatModel.#orderKey` 完全同构：`[层级, 次序, 时间]`。
+ *
+ * `bySeq` 为 false 时整表退回墙钟：见 `ChatModel.#sortMessages` 的说明——只要有
+ * 任何一条已确认消息没有 seq，就不能把「有 seq 的」和「没 seq 的」混在两个层级里，
+ * 否则后拿到 seq 的那条会整条跳到最前面（历史快照 + 正在生成的气泡就会这样）。
+ * @param {any} message
+ * @param {boolean} [bySeq]
+ * @returns {[number, number, number]}
+ */
+export function messageOrderKey(message, bySeq = true) {
+  const at = Date.parse(String(message?.at ?? '')) || 0
+  // 本地乐观消息永远在最后：它们的 seq 还不存在，位置只能等网关确认。
+  if (message?.optimistic === true) return [2, at, 0]
+  const seq = finiteSeq(message?.seq)
+  if (bySeq && seq !== undefined) return [0, seq, at]
+  return [1, at, 0]
+}
+
+/**
  * 归一化一条 `sessions` 里的会话摘要（`SessionSummary`）。
  * 缺 id 的条目直接丢掉：没有 id 就没法 `session/select`。
  * @param {any} raw
@@ -215,7 +281,61 @@ export function normalizeApproval(raw, now = Date.now()) {
 }
 
 /**
+ * 从本地化字典（`{en, zh, 'zh-CN', ...}`）或普通字符串里取一段可显示文本。
+ *
+ * DSH 的 `intent.display` 是这种形状：中文优先、英文兜底——网页版界面是中文，
+ * 回退到 en 也好过在手机上留一行空白。
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function localizedText(value) {
+  if (typeof value === 'string') return value.trim()
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  for (const key of ['zh', 'zh-CN', 'zh-Hans', 'zh-Hant', 'zh-TW', 'en']) {
+    const text = value[key]
+    if (typeof text === 'string' && text.trim() !== '') return text.trim()
+  }
+  for (const text of Object.values(value)) {
+    if (typeof text === 'string' && text.trim() !== '') return text.trim()
+  }
+  return ''
+}
+
+/** @param {...unknown} values @returns {string} 第一段非空的可显示文本 */
+function firstVisibleText(...values) {
+  for (const value of values) {
+    const text = localizedText(value)
+    if (text !== '') return text
+  }
+  return ''
+}
+
+/**
+ * DSH 新版把「人话」放在 `intent.display`（本地化的 question/detail/approve）。
+ * @param {unknown} intent
+ * @returns {{question: string, detail: string, approve: string}}
+ */
+export function questionDisplayOf(intent) {
+  const display = intent && typeof intent === 'object' ? intent.display : undefined
+  if (!display || typeof display !== 'object' || Array.isArray(display)) {
+    return { question: '', detail: '', approve: '' }
+  }
+  return {
+    question: localizedText(display.question),
+    detail: localizedText(display.detail),
+    approve: localizedText(display.approve),
+  }
+}
+
+/**
  * 归一化一条 `question/ask`（3.0.0 的结构化提问）。
+ *
+ * 题干有两条来源：老的 `item.question`，以及 DSH 新版 `intent.display.question`
+ * （本地化字典）。计划审阅 / 新版提问里 `question` 可能是空串甚至缺省——只认
+ * `question` 会让手机卡片只剩「需要你的回答」和选项、题目那一行是空的
+ * （真机反馈「提问语句手机上不显示，但能在手机上回答」）。所以逐级回退：
+ * `question` → `intent.display.question` → `header` → `detail` →
+ * `intent.display.detail` → 兜底文案；`detail` / `approve` 同样支持 display 回退。
  * @param {any} raw
  * @param {number} now
  * @returns {any | undefined}
@@ -228,7 +348,10 @@ export function normalizeQuestion(raw, now = Date.now()) {
   for (const candidate of Array.isArray(raw.items) ? raw.items : []) {
     if (items.length >= QUESTION_MAX_ITEMS) break
     if (!candidate || typeof candidate !== 'object') continue
-    if (typeof candidate.id !== 'string' || candidate.id.trim() === '' || typeof candidate.question !== 'string') continue
+    // 注意：**不再**要求 `question` 是字符串。新版 shape 可能没有它（文字在
+    // intent.display 里），直接 continue 会让整批提问变成空数组、卡片根本不出现。
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : ''
+    if (id === '') continue
     const options = []
     for (const option of Array.isArray(candidate.options) ? candidate.options : []) {
       if (options.length >= QUESTION_MAX_OPTIONS) break
@@ -240,15 +363,22 @@ export function normalizeQuestion(raw, now = Date.now()) {
           : {}),
       })
     }
+    const display = questionDisplayOf(candidate.intent)
+    const header = firstVisibleText(candidate.header)
+    const detail = firstVisibleText(candidate.detail, display.detail)
+    const prompt = firstVisibleText(candidate.question, display.question, header, detail) || QUESTION_FALLBACK_TEXT
+    const approve = firstVisibleText(candidate.intent?.approve, display.approve)
+    const planReview = candidate.intent?.kind === 'plan-review'
     items.push({
-      id: candidate.id.trim(),
-      question: candidate.question.slice(0, QUESTION_MAX_TEXT),
-      ...(typeof candidate.detail === 'string' && candidate.detail !== '' ? { detail: candidate.detail.slice(0, QUESTION_MAX_TEXT) } : {}),
-      ...(typeof candidate.header === 'string' && candidate.header !== '' ? { header: candidate.header.slice(0, 200) } : {}),
+      id,
+      question: prompt.slice(0, QUESTION_MAX_TEXT),
+      // 回退后 detail/header 常和题干撞车（display.question === header），不再渲染第二遍。
+      ...(detail !== '' && detail !== prompt ? { detail: detail.slice(0, QUESTION_MAX_TEXT) } : {}),
+      ...(header !== '' && header !== prompt ? { header: header.slice(0, 200) } : {}),
       ...(options.length > 0 ? { options } : {}),
       ...(candidate.multiSelect === true ? { multiSelect: true } : {}),
-      ...(candidate.intent && candidate.intent.kind === 'plan-review' && typeof candidate.intent.approve === 'string'
-        ? { intent: { kind: 'plan-review', approve: candidate.intent.approve.slice(0, 200) } }
+      ...(planReview
+        ? { intent: { kind: 'plan-review', ...(approve !== '' ? { approve: approve.slice(0, 200) } : {}) } }
         : {}),
     })
   }
@@ -263,6 +393,47 @@ export function normalizeQuestion(raw, now = Date.now()) {
     at: new Date(now).toISOString(),
     /** 本地是否已经提交过（避免连点）。 */
     replied: false,
+  }
+}
+
+/**
+ * 归一化一条「已作答提问」摘要（模型内部生成 / localStorage 恢复）。
+ * @param {any} raw
+ * @returns {any | undefined}
+ */
+export function normalizeQuestionLogEntry(raw) {
+  if (!raw || typeof raw !== 'object') return undefined
+  const questionId = typeof raw.questionId === 'string' ? raw.questionId.trim() : ''
+  if (questionId === '') return undefined
+  const items = []
+  for (const candidate of Array.isArray(raw.items) ? raw.items : []) {
+    if (items.length >= QUESTION_MAX_ITEMS) break
+    if (!candidate || typeof candidate !== 'object') continue
+    if (typeof candidate.id !== 'string' || candidate.id === '') continue
+    const selected = []
+    for (const label of Array.isArray(candidate.selected) ? candidate.selected : []) {
+      if (typeof label !== 'string' || label === '') continue
+      if (selected.length >= QUESTION_MAX_OPTIONS) break
+      selected.push(label.slice(0, 200))
+    }
+    items.push({
+      id: candidate.id.slice(0, 200),
+      question: String(candidate.question ?? '').slice(0, QUESTION_MAX_TEXT),
+      ...(typeof candidate.header === 'string' && candidate.header !== '' ? { header: candidate.header.slice(0, 200) } : {}),
+      selected,
+      ...(typeof candidate.custom === 'string' && candidate.custom !== ''
+        ? { custom: candidate.custom.slice(0, QUESTION_MAX_TEXT) }
+        : {}),
+    })
+  }
+  if (items.length === 0) return undefined
+  return {
+    questionId,
+    items,
+    outcome: typeof raw.outcome === 'string' ? raw.outcome : '',
+    source: typeof raw.source === 'string' ? raw.source : '',
+    answered: raw.answered === true,
+    at: typeof raw.at === 'string' ? raw.at : new Date().toISOString(),
   }
 }
 
@@ -354,6 +525,12 @@ export class ChatModel {
     this.questions = []
     /** @type {Map<string, any>} */
     this.questionsById = new Map()
+    /**
+     * 已经收尾的提问（只读摘要：题目 + 所选答案 + 结果）。
+     * 答完的卡片不能凭空消失——真机反馈「答完之后聊天流里没有任何记录」。
+     * @type {any[]}
+     */
+    this.questionLog = []
     /** @type {{message: string, code?: string, at: string} | null} */
     this.lastError = null
     this.myDeviceId = options.myDeviceId ?? ''
@@ -389,13 +566,74 @@ export class ChatModel {
    * @param {any} message
    * @returns {boolean}
    */
-  /** 按时间稳定排序：快照/回放/乐观消息混在一起时，保证气泡顺序与电脑端一致。 */
-  #sortByTime() {
+  /**
+   * 一条消息的权威次序键：`[层级, 次序, 时间]`。
+   *
+   * 为什么不能只按墙钟 `at` 排：网关给 `chat/echo` 的 `at` 是**它收到消息的时刻**。
+   * 手机离线时消息进 outbox，重连补发才被记录，于是「先发的那条」拿到的 at 比它
+   * 自己的回复还晚——按 at 排就把用户气泡排到所有回复之后（真机反馈「手机顺序与
+   * 电脑端不一致，电脑端才是对的」）。每一条被网关记录的事件都带会话内单调的
+   * `seq`（快照里的历史消息 id 是 `hist_<seq>`），它才是权威次序。
+   *
+   * 三层：
+   *  0. 有 seq（已被电脑端落库）：按 seq；
+   *  1. 没有 seq 的历史/快照消息（老电脑端、旧缓存），或整表退回墙钟时：按 at；
+   *  2. 本地乐观消息（还没被网关确认，`optimistic`）：一律排在所有已确认消息
+   *     之后，echo / 回放带着 seq 回来后再落位。
+   * @param {any} message
+   * @param {boolean} bySeq
+   * @returns {[number, number, number]}
+   */
+  #orderKey(message, bySeq) {
+    return messageOrderKey(message, bySeq)
+  }
+
+  /**
+   * 「整张列表的已确认消息是不是都有 seq」。
+   *
+   * 为什么需要这个开关：有两种来源的消息必然没有 seq——旧 localStorage 缓存、
+   * 以及老电脑端 / `chat/error` 这类不进事件日志的帧。如果让「有 seq 的」和
+   * 「没 seq 的」各占一层，那么一条消息后拿到 seq 时（例如正在生成的气泡收到
+   * `chat/message`）会整条跳到最前面，把历史顺序打乱。所以：
+   *   全都有 seq → 按 seq 排（权威、与电脑端一致）；
+   *   有一条没有  → 整表退回按 at 排（保持老行为，绝不制造新的跳位）。
+   * @returns {boolean}
+   */
+  #allConfirmedHaveSeq() {
+    for (const message of this.messages) {
+      if (message?.optimistic === true) continue
+      if (finiteSeq(message?.seq) === undefined) return false
+    }
+    return true
+  }
+
+  /**
+   * 按 (层级, seq / at) 稳定排序。`Array#sort` 保证相同键保持原有插入顺序，
+   * 所以乐观消息之间仍然是「先发的在前」。
+   */
+  #sortMessages() {
+    const bySeq = this.#allConfirmedHaveSeq()
     this.messages.sort((left, right) => {
-      const a = Date.parse(left?.at ?? '') || 0
-      const b = Date.parse(right?.at ?? '') || 0
-      return a - b
+      const a = this.#orderKey(left, bySeq)
+      const b = this.#orderKey(right, bySeq)
+      return a[0] - b[0] || a[1] - b[1] || a[2] - b[2]
     })
+  }
+
+  /**
+   * 记住一条消息的落位 seq。同一个气泡的重发 / 回放可能带着**更新**的 seq，
+   * 只保留最小值（它第一次被记录的位置），否则气泡会被迟到帧推着来回跳。
+   * @param {any} message
+   * @param {unknown} seq
+   * @returns {boolean} 位置是否变了（调用方据此决定要不要重排）
+   */
+  #noteSeq(message, seq) {
+    const value = finiteSeq(seq)
+    if (value === undefined || !message) return false
+    const current = finiteSeq(message.seq)
+    if (current !== undefined && current <= value) return false
+    message.seq = value
+    return true
   }
 
   #insert(message) {
@@ -404,7 +642,7 @@ export class ChatModel {
     if (message.kind === 'user' && isInjectedHistoryText(message.text)) return false
     this.byId.set(message.id, message)
     this.messages.push(message)
-    this.#sortByTime()
+    this.#sortMessages()
     this.#trim()
     return true
   }
@@ -456,6 +694,86 @@ export class ChatModel {
   clearQuestions() {
     this.questions = []
     this.questionsById.clear()
+    this.questionLog = []
+  }
+
+  /**
+   * 把一批提问记成只读摘要（同一 questionId 只留一份，重复调用只更新结果）。
+   *
+   * 目的：答完的提问**不能凭空消失**。真机反馈「手机上答完之后聊天流里没有任何
+   * 记录」——原实现收到 `question/resolved` 就直接出队，卡片连同题目一起没了。
+   * 现在改成入一张只读卡（题目 + 所选答案 + 结果），resolved 只更新结果不删卡。
+   * @param {any} question
+   * @param {Array<{id?: string, selected?: string[], custom?: string}>} [answers]
+   * @param {string} [outcome]
+   * @param {string} [source]
+   * @returns {any | undefined}
+   */
+  #rememberQuestion(question, answers = [], outcome = '', source = '') {
+    const questionId = String(question?.questionId ?? '')
+    if (questionId === '') return undefined
+    const answeredById = new Map()
+    for (const answer of Array.isArray(answers) ? answers : []) {
+      if (!answer || typeof answer.id !== 'string') continue
+      answeredById.set(answer.id, answer)
+    }
+    const previousIndex = this.questionLog.findIndex(entry => entry.questionId === questionId)
+    const previous = previousIndex >= 0 ? this.questionLog[previousIndex] : undefined
+    const previousById = new Map((previous?.items ?? []).map(item => [item.id, item]))
+    const items = (Array.isArray(question.items) ? question.items : []).map(item => {
+      const answer = answeredById.get(item.id)
+      const fallback = previousById.get(item.id)
+      // 新一轮答案为空（例如 resolved 后到）时保留之前记下的选择，不能清空战绩。
+      const selected = Array.isArray(answer?.selected)
+        ? answer.selected.filter(label => typeof label === 'string')
+        : fallback?.selected ?? []
+      const custom = typeof answer?.custom === 'string' ? answer.custom : fallback?.custom ?? ''
+      return {
+        id: String(item.id),
+        question: String(item.question ?? ''),
+        ...(item.header ? { header: item.header } : {}),
+        selected,
+        ...(custom !== '' ? { custom } : {}),
+      }
+    })
+    const entry = {
+      questionId,
+      items,
+      outcome: String(outcome ?? ''),
+      source: String(source ?? ''),
+      answered: outcome === 'answered'
+        || items.some(item => (item.selected?.length ?? 0) > 0 || (item.custom ?? '') !== ''),
+      // 保留第一次记录的时间：同一批只更新结果，卡片不要因为更新而跳到时间线末尾。
+      at: previous?.at ?? new Date().toISOString(),
+    }
+    if (previous) this.questionLog[previousIndex] = entry
+    else {
+      this.questionLog.push(entry)
+      while (this.questionLog.length > QUESTION_LOG_LIMIT) this.questionLog.shift()
+    }
+    this.#touch()
+    return entry
+  }
+
+  /**
+   * 本地已经提交了这一批答案：除了标记已回复，还要落一张只读摘要卡。
+   * @param {string} questionId
+   * @param {Array<{id?: string, selected?: string[], custom?: string}>} [answers]
+   * @returns {boolean}
+   */
+  recordQuestionAnswer(questionId, answers = []) {
+    const question = this.questionsById.get(String(questionId ?? ''))
+    if (!question) return false
+    if (!this.markQuestionReplied(questionId)) return false
+    this.#rememberQuestion(question, answers, 'answered', 'phone')
+    return true
+  }
+
+  /** 某个 questionId 的只读摘要（渲染层用）。 */
+  questionSummary(questionId) {
+    const id = String(questionId ?? '')
+    if (id === '') return undefined
+    return this.questionLog.find(entry => entry.questionId === id)
   }
 
   /**
@@ -515,6 +833,9 @@ export class ChatModel {
       msgId,
       mine: true,
       streaming: false,
+      // 还没被网关确认：排序时先放在所有已确认消息之后（见 #orderKey），
+      // 等 echo / 回放带回 seq 再落到它在事件日志里的真实位置。
+      optimistic: true,
     }
     if (!this.#insert(message)) {
       const existing = this.byId.get(message.id)
@@ -635,15 +956,21 @@ export class ChatModel {
     const existing = this.byId.get(id)
     if (existing) {
       // 本地乐观消息 or 回放重复：用电脑端权威内容覆盖，但保住本地状态里更有用的信息。
+      const files = normalizeAttachments(frame.files)
       Object.assign(existing, {
         text: typeof frame.text === 'string' && frame.text !== '' ? frame.text : existing.text,
-        at: String(frame.at ?? existing.at),
-        files: normalizeAttachments(frame.files).length > 0 ? normalizeAttachments(frame.files) : existing.files,
+        // 只补空缺，绝不覆盖：echo 的 at 是「网关收到补发消息的时刻」，比原始发送
+        // 时刻晚得多。用它替换本地 at 会让这条气泡在墙钟兜底排序里被推到后面，
+        // 这正是真机「我先发的消息被排到所有回复之后」的直接原因。
+        at: typeof existing.at === 'string' && existing.at !== '' ? existing.at : String(frame.at ?? ''),
+        files: files.length > 0 ? files : existing.files,
         status: MESSAGE_STATUS.SENT,
         deviceId: frame.deviceId,
-        seq: Number.isFinite(Number(frame.seq)) ? Number(frame.seq) : existing.seq,
       })
+      // seq 才是权威次序：一旦拿到就把它从「乐观」层级挪到日志里的真实位置。
+      if (this.#noteSeq(existing, frame.seq)) existing.optimistic = false
       this.#advanceCursor(frame.seq)
+      this.#sortMessages()
       this.#touch(now)
       return { handled: true, changed: true, frame }
     }
@@ -705,6 +1032,9 @@ export class ChatModel {
     this.parts.set(callId, parts)
     const { message, inserted } = this.#ensureAssistantMessage(callId, now)
     this.#advanceCursor(frame.seq)
+    // 助手帧没有 `at`（手机只能拿接收时刻当时间），落位一律靠 seq：重连回放时
+    // 一堆帧同时到达，接收时刻和真实发生顺序完全无关。
+    if (this.#noteSeq(message, frame.seq)) this.#sortMessages()
     // 已经 chat/done 收尾的消息不允许被迟到的 chat/message 回退（重连回放时可能出现）。
     if (!inserted && message.status === MESSAGE_STATUS.DONE) return { handled: true, changed: false, frame }
     const text = this.#joinParts(callId)
@@ -744,12 +1074,14 @@ export class ChatModel {
   #onDone(frame, now) {
     const callId = String(frame.callId ?? '')
     if (callId === '') return { handled: true, changed: false, frame }
-    const { message, inserted } = this.#ensureAssistantMessage(callId, now)
+    const { message } = this.#ensureAssistantMessage(callId, now)
     const authoritative = typeof frame.text === 'string' ? frame.text : ''
     const joined = this.#joinParts(callId)
     const next = authoritative !== '' ? authoritative : joined !== '' ? joined : message.text
     message.text = next
     message.status = MESSAGE_STATUS.DONE
+    // chat/done 也带会话 seq：气泡的落位点是这一轮第一次出现的位置（取最小值）。
+    if (this.#noteSeq(message, frame.seq)) this.#sortMessages()
     message.truncated = frame.truncated === true
     message.durationMs = Number.isFinite(Number(frame.durationMs)) ? Number(frame.durationMs) : undefined
     if (Array.isArray(frame.files) && frame.files.length > 0) message.files = normalizeAttachments(frame.files)
@@ -864,10 +1196,36 @@ export class ChatModel {
       }
       if (activeCall.typing !== false) this.typing.add(activeCall.callId)
     }
-    this.messages = nextMessages.slice(-this.limit)
-    // 快照里的消息可能不是严格按时间排的（回放/乐观消息混入），统一按时间排，
-    // 否则手机会出现「我的提问排在回复后面」（真机反馈：和电脑端顺序不一致）。
-    this.#sortByTime()
+    // 快照是权威的，但**同会话里本地还没被确认的乐观消息**不能说没就没：重连时
+    // 快照可能先到、outbox 里的消息还在等补发，丢掉它就是「我先发出的消息消失了」。
+    // 换标签时必须丢掉（那些消息属于上一个会话，不能搬到新会话里）。
+    //
+    // 但也不能留着一条历史里**已经存在**的同内容消息（消息其实送到了、只是手机没
+    // 收到 echo，且事件日志已经轮转掉了它）——那会在流里变成两条一样的气泡。
+    // 这里按「kind + text」计数抵消，和网关 mergeSnapshotMessages 的思路一致。
+    const sameSession = this.sessionId == null || sessionId === this.sessionId
+    const snapshotKeys = new Map()
+    for (const message of nextMessages) {
+      const key = JSON.stringify([message.kind, message.text])
+      snapshotKeys.set(key, (snapshotKeys.get(key) ?? 0) + 1)
+    }
+    const pendingLocal = sameSession
+      ? this.messages.filter(message => {
+        if (message?.optimistic !== true || nextById.has(message.id)) return false
+        const key = JSON.stringify([message.kind, message.text])
+        const count = snapshotKeys.get(key) ?? 0
+        if (count > 0) {
+          snapshotKeys.set(key, count - 1)
+          return false
+        }
+        return true
+      })
+      : []
+    this.messages = [...nextMessages.slice(-this.limit), ...pendingLocal]
+    // 快照消息按 seq（历史 id 是 `hist_<seq>`）排，乐观消息永远排最后：
+    // 手机会话「我的提问排在回复后面」就是这里按墙钟排错的。
+    this.#sortMessages()
+    this.#trim()
     this.byId = new Map(this.messages.map(message => [message.id, message]))
     this.parts.clear()
     this.deltaSeq.clear()
@@ -907,6 +1265,9 @@ export class ChatModel {
       status: kind === 'assistant' ? MESSAGE_STATUS.DONE : MESSAGE_STATUS.SENT,
       msgId: raw.msgId,
       callId: raw.callId,
+      // 网关的历史消息 id 是 `hist_<seq>`。能解析就用 seq 排序：at 只有毫秒精度，
+      // 一轮问答里很容易撞在一起，而 seq 是会话内严格单调的。
+      seq: snapSeqOf(raw),
       mine: kind === 'user' && this.myDeviceId !== '' ? false : undefined,
     }
   }
@@ -1004,6 +1365,10 @@ export class ChatModel {
   #onQuestionAsk(frame, now) {
     const question = normalizeQuestion(frame, now)
     if (!question) return { handled: true, changed: false, frame }
+    // 同一批重新推过来（电脑端重发 / 断线后补推）说明它又活了：把旧的只读摘要
+    // 摘掉，保证同一 questionId 在任何时刻只有一张卡（可点的这张）。
+    const logged = this.questionLog.findIndex(item => item.questionId === question.questionId)
+    if (logged >= 0) this.questionLog.splice(logged, 1)
     const existing = this.questionsById.get(question.questionId)
     if (existing) {
       Object.assign(existing, question, { replied: existing.replied === true, repliedAt: existing.repliedAt })
@@ -1021,20 +1386,30 @@ export class ChatModel {
   }
 
   /**
-   * `question/resolved`：出队（无论结果如何都不该再显示可点的表单）。
+   * `question/resolved`：出队（无论结果如何都不该再显示可点的表单），
+   * 但**留下一张只读摘要卡**——题目 +（已知的）所选答案 + 结果，答完不会凭空消失。
    * @param {any} frame
    * @param {number} now
    */
   #onQuestionResolved(frame, now) {
     const questionId = String(frame.questionId ?? '')
     if (questionId === '') return { handled: true, changed: false, frame }
+    const question = this.questionsById.get(questionId)
     const index = this.questions.findIndex(item => item.questionId === questionId)
     this.questionsById.delete(questionId)
     if (index >= 0) this.questions.splice(index, 1)
     const outcome = typeof frame.outcome === 'string' ? frame.outcome : ''
     const source = typeof frame.source === 'string' ? frame.source : ''
-    if (index >= 0) this.#touch(now)
-    return { handled: true, changed: index >= 0, frame, resolved: { questionId, outcome, source } }
+    // 已经答过（本地提交时已落摘要）就只更新结果，不重复插卡。
+    const summary = question ? this.#rememberQuestion(question, [], outcome, source) : undefined
+    if (index >= 0 || summary) this.#touch(now)
+    return {
+      handled: true,
+      changed: index >= 0 || summary !== undefined,
+      frame,
+      resolved: { questionId, outcome, source },
+      question: summary,
+    }
   }
 
   /** @param {any} frame @param {number} now */
@@ -1054,7 +1429,9 @@ export class ChatModel {
     this.files.set(fileId, { ...(this.files.get(fileId) ?? {}), ...meta })
     const id = fileMessageId(fileId)
     if (this.byId.has(id)) {
+      const existing = this.byId.get(id)
       this.#update(id, { file: meta })
+      if (this.#noteSeq(existing, frame.seq)) this.#sortMessages()
       this.#advanceCursor(frame.seq)
       this.#touch(now)
       return { handled: true, changed: true, frame }
@@ -1067,6 +1444,7 @@ export class ChatModel {
       file: meta,
       callId: undefined,
       status: MESSAGE_STATUS.DONE,
+      seq: meta.seq,
     })
     this.#advanceCursor(frame.seq)
     if (inserted) this.#touch(now)
@@ -1115,6 +1493,19 @@ export class ChatModel {
         msgId: message.msgId,
         file: message.file,
         truncated: message.truncated,
+        // seq / optimistic 必须落盘：刷新后若丢掉 seq，消息就退回「按 at 兜底」，
+        // 顺序会在一次刷新后重新洗牌（正是这次要修的 bug）。
+        seq: Number.isFinite(Number(message.seq)) ? Number(message.seq) : undefined,
+        ...(message.optimistic === true ? { optimistic: true } : {}),
+      })),
+      // 已收尾的提问摘要也落盘：刷新后聊天流里仍能看到之前问过什么、答了什么。
+      questionLog: this.questionLog.slice(-QUESTION_LOG_LIMIT).map(entry => ({
+        questionId: entry.questionId,
+        items: entry.items,
+        outcome: entry.outcome,
+        source: entry.source,
+        answered: entry.answered === true,
+        at: entry.at,
       })),
     }
   }
@@ -1142,13 +1533,25 @@ export class ChatModel {
       if (message.kind === 'user' && isInjectedHistoryText(message.text)) continue
       if (message.kind === 'file' && message.file?.fileId) this.files.set(message.file.fileId, message.file)
       if (this.byId.has(message.id)) continue
+      // 缓存里的 seq 是权威次序的一部分，恢复时不能丢（丢了就退回按 at 兜底排序）。
+      if (Number.isFinite(Number(raw.seq))) message.seq = Number(raw.seq)
+      else delete message.seq
+      message.optimistic = raw.optimistic === true
       this.byId.set(message.id, message)
       this.messages.push(message)
+    }
+    this.questionLog = []
+    for (const raw of Array.isArray(saved.questionLog) ? saved.questionLog : []) {
+      const entry = normalizeQuestionLogEntry(raw)
+      if (entry) this.questionLog.push(entry)
+      if (this.questionLog.length >= QUESTION_LOG_LIMIT) break
     }
     this.sessionId = typeof saved.sessionId === 'string' ? saved.sessionId : null
     this.sessionEpoch = Number.isFinite(Number(saved.sessionEpoch)) ? Number(saved.sessionEpoch) : 0
     this.sessionTitle = typeof saved.sessionTitle === 'string' ? saved.sessionTitle : ''
     this.cursor = Number.isFinite(Number(saved.cursor)) ? Number(saved.cursor) : 0
+    // 旧缓存可能不是排序后的顺序：恢复完统一按同一套键重排一次。
+    this.#sortMessages()
     this.#trim()
     this.#touch()
     return true
@@ -1289,6 +1692,11 @@ export class ChatTabsModel {
 
   get questionsById() {
     return this.active?.questionsById ?? EMPTY_MAP
+  }
+
+  /** 当前标签里已收尾的提问摘要（只读卡片，答完留在聊天流里）。 */
+  get questionLog() {
+    return this.active?.questionLog ?? EMPTY_ARRAY
   }
 
   get hasPendingQuestions() {
@@ -1787,6 +2195,31 @@ export class ChatTabsModel {
     const found = this.findQuestion(questionId)
     if (!found) return false
     return found.chat.markQuestionReplied(questionId)
+  }
+
+  /**
+   * 提交一批答案：标记已回复 + 在当前标签落一张只读摘要卡。
+   * @param {string} questionId
+   * @param {Array<{id?: string, selected?: string[], custom?: string}>} [answers]
+   * @returns {boolean}
+   */
+  recordQuestionAnswer(questionId, answers = []) {
+    const found = this.findQuestion(questionId)
+    if (!found) return false
+    const changed = found.chat.recordQuestionAnswer(questionId, answers)
+    if (changed) this.#touch()
+    return changed
+  }
+
+  /** 某个 questionId 的只读摘要（渲染层用；跨标签查找）。 */
+  questionSummary(questionId) {
+    const id = String(questionId ?? '')
+    if (id === '') return undefined
+    for (const chat of this.chats.values()) {
+      const summary = chat.questionSummary(id)
+      if (summary) return summary
+    }
+    return undefined
   }
 
   /** 清空当前标签的消息（「清空本机聊天记录」）。 */

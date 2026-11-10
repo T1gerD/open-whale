@@ -45,7 +45,7 @@ import {
   signHello,
   verifyHelloAckProof,
 } from './lib/keys.mjs'
-import { ChatTabsModel, MESSAGE_STATUS, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs'
 import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
 import { createStorage } from './lib/storage.mjs'
 import {
@@ -833,6 +833,9 @@ function handleOnline(ack, context) {
   state.sessionListLoading = false
   state.pendingSelect = null
   state.pendingSnapshots = new Map()
+  // 这次重连可能发生在页面切到后台期间：连上后立刻同步一次前后台状态
+  // （幂等；前台不会多发帧，后台会补一帧 visible:false）。
+  state.connection?.setVisible?.(document.visibilityState === 'visible')
 
   // 电脑端当前的绑定。插件重启会忘掉「这台设备在哪个会话」并新建一个：
   // 我们以恢复出来的标签为准，让它重新 select 当前标签；一个标签都没有时
@@ -1544,6 +1547,9 @@ function questionCardHtml(question) {
   const planReview = question.items.some(item => item.intent?.kind === 'plan-review')
   const items = question.items.map((item, index) => {
     const selection = draft[item.id] ?? { selected: [] }
+    // 题干：模型层已经做过 `intent.display.question` 回退；这里再兜一层，
+    // 宁可显示一句占位，也不要出现「只有选项、题目那行是空的」卡片。
+    const prompt = typeof item.question === 'string' && item.question.trim() !== '' ? item.question : QUESTION_FALLBACK_TEXT
     const options = (item.options ?? []).map(option => {
       const selected = (selection.selected ?? []).includes(option.label)
       const approve = item.intent?.kind === 'plan-review' && item.intent.approve === option.label
@@ -1560,9 +1566,9 @@ function questionCardHtml(question) {
       </button>`
     })
     return `<div class="question-item">
-      <p class="question-text">${question.items.length > 1 ? `${index + 1}. ` : ''}${escapeHtml(item.question)}</p>
-      ${item.header ? `<p class="question-item-header">${escapeHtml(item.header)}</p>` : ''}
-      ${item.detail ? `<p class="question-detail">${escapeHtml(item.detail)}</p>` : ''}
+      <p class="question-text">${question.items.length > 1 ? `${index + 1}. ` : ''}${escapeHtml(prompt)}</p>
+      ${item.header && item.header !== prompt ? `<p class="question-item-header">${escapeHtml(item.header)}</p>` : ''}
+      ${item.detail && item.detail !== prompt ? `<p class="question-detail">${escapeHtml(item.detail)}</p>` : ''}
       ${options.length > 0 ? `<div class="question-options">${options.join('')}</div>` : ''}
       <input class="question-custom" type="text" autocomplete="off"
         data-question-id="${escapeHtml(question.questionId)}" data-item-id="${escapeHtml(item.id)}"
@@ -1623,11 +1629,54 @@ function toggleQuestionOption(button) {
   }
 }
 
-/** 所有待回答提问的卡片栈（没有则返回空串）。 */
+/**
+ * 已作答提问的只读摘要卡。
+ *
+ * 为什么要有它：`question/resolved` 一到，原来的实现就把整张卡从队列里删掉，
+ * 手机聊天流里什么都不剩（真机反馈「答完之后不会出现消息」）。现在收尾的提问
+ * 会记在 `ChatModel.questionLog` 里，以只读卡留在聊天流底部：题目 + 所选答案。
+ * @param {any} entry
+ */
+function questionSummaryCardHtml(entry) {
+  if (!entry || !Array.isArray(entry.items) || entry.items.length === 0) return ''
+  const label = entry.outcome === 'timeout'
+    ? '已超时'
+    : entry.source === 'desktop'
+      ? '已在电脑上回答'
+      : entry.answered === true
+        ? '已回答'
+        : '已处理'
+  const items = entry.items.map((item, index) => {
+    const prompt = typeof item.question === 'string' && item.question.trim() !== '' ? item.question : QUESTION_FALLBACK_TEXT
+    const chosen = [
+      ...(Array.isArray(item.selected) ? item.selected : []),
+      ...(typeof item.custom === 'string' && item.custom !== '' ? [item.custom] : []),
+    ]
+    const answer = chosen.length > 0 ? chosen.map(value => escapeHtml(String(value))).join('、') : '（未作答）'
+    return `<div class="question-item">
+      <p class="question-text">${entry.items.length > 1 ? `${index + 1}. ` : ''}${escapeHtml(prompt)}</p>
+      <p class="question-answer">${answer}</p>
+    </div>`
+  })
+  return `<div class="question-card question-summary is-resolved"
+    data-question-summary="${escapeHtml(entry.questionId)}" role="group" aria-label="已作答的提问">
+    <div class="question-head">
+      <span class="question-title">提问 · ${escapeHtml(label)}</span>
+    </div>
+    ${items.join('')}
+  </div>`
+}
+
+/** 所有提问卡片（待回答的可点卡 + 已作答的只读摘要），没有则返回空串。 */
 function questionCardsHtml() {
-  const questions = state.model?.questions ?? []
-  if (questions.length === 0) return ''
-  return `<div class="question-stack" aria-live="polite">${questions.map(questionCardHtml).join('')}</div>`
+  const model = state.model
+  if (!model) return ''
+  const live = (model.questions ?? []).map(questionCardHtml)
+  const done = (model.questionLog ?? []).map(questionSummaryCardHtml).filter(html => html !== '')
+  if (live.length === 0 && done.length === 0) return ''
+  // 只有还在等回答的卡片才需要 aria-live；历史摘要不该被反复朗读。
+  const ariaLive = live.length > 0 ? 'polite' : 'off'
+  return `<div class="question-stack" aria-live="${ariaLive}">${[...live, ...done].join('')}</div>`
 }
 
 /**
@@ -1648,7 +1697,9 @@ function submitQuestion(questionId) {
     showToast('这批提问已经失效了', 'error', 3200)
     return
   }
-  if (!model.markQuestionReplied(questionId)) return
+  // recordQuestionAnswer 同时做两件事：标记已回复（防连点）+ 落一张只读摘要卡。
+  // 只标记不记录的话，question/resolved 一到卡片就整张消失，聊天流里没有痕迹。
+  if (!model.recordQuestionAnswer(questionId, reply.answers)) return
   state.connection.send({ t: CLIENT_FRAME.QUESTION_REPLY, ...reply })
   scheduleRender()
   syncApprovalTicker()
@@ -2393,6 +2444,11 @@ function messageSignature() {
   hash = (hash * 31 + state.model.questions.length) % 1_000_000_007
   for (const question of state.model.questions) {
     hash = (hash * 31 + question.questionId.length + question.items.length + (question.replied ? 7 : 3)) % 1_000_000_007
+  }
+  // 已作答的只读摘要卡也在同一份 DOM 里：条数 / 结果变化都要重绘。
+  hash = (hash * 31 + (state.model.questionLog?.length ?? 0)) % 1_000_000_007
+  for (const entry of state.model.questionLog ?? []) {
+    hash = (hash * 31 + entry.questionId.length + entry.outcome.length + (entry.answered ? 7 : 3)) % 1_000_000_007
   }
   hash = (hash * 31 + state.model.sessionTitle.length) % 1_000_000_007
   return String(hash)
@@ -3203,6 +3259,9 @@ function setupLifecycleEvents() {
   })
   window.addEventListener('offline', () => showToast('网络已断开', 'error'))
   document.addEventListener('visibilitychange', () => {
+    // 前后台信号：切后台/锁屏时告诉电脑端「还在线但不在前台」（设置页显示
+    // 在线（后台），审批/提问仍会推送），回到前台立刻恢复前台状态。
+    state.connection?.setVisible?.(document.visibilityState === 'visible')
     if (document.visibilityState !== 'visible') return
     if (state.connection && !state.connection.online && state.status?.state !== CONNECTION_STATE.REJECTED) {
       state.connection.reconnect()
@@ -3222,7 +3281,13 @@ function setupLifecycleEvents() {
     persistNow()
   })
   window.addEventListener('pagehide', () => {
+    // 页面被关掉/进 bfcache：尽可能告诉电脑端已不在前台（不等于断线）。
+    state.connection?.setVisible?.(false)
     persistNow()
+  })
+  window.addEventListener('pageshow', () => {
+    // 从 bfcache 恢复时不一定触发 visibilitychange，这里补一次前后台同步。
+    state.connection?.setVisible?.(document.visibilityState === 'visible')
   })
   window.addEventListener('error', event => {
     const message = event?.message ?? ''

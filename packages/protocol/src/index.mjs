@@ -574,17 +574,32 @@ export function helloAckProofMessage(nonce, deviceId) {
  */
 
 /**
+ * @typedef {object} QuestionDisplay
+ * Localized human-readable strings for one question (`{ en: string, zh?: string, ... }`).
+ * DSH moved the plan-review wording here, so a client MUST fall back to these when
+ * `QuestionItem.question` is empty.
+ * @property {Record<string, string>} [question]
+ * @property {Record<string, string>} [detail]
+ * @property {Record<string, string>} [approve]
+ */
+
+/**
  * @typedef {object} QuestionItem
  * One question of a batch. `intent` is passed through untouched: a client that
  * recognises `plan-review` may render it as a plan approval card, one that does
  * not just shows the options.
+ *
+ * `question` stays a string for compatibility but MAY be empty (or only carry the
+ * machine form) when the localizable wording lives in `intent.display`; readers
+ * should fall back `question` → `intent.display.question` → `header` → `detail`
+ * rather than render a blank prompt.
  * @property {string} id
  * @property {string} question
  * @property {string} [detail]
  * @property {string} [header]
  * @property {QuestionOption[]} [options]
  * @property {boolean} [multiSelect]
- * @property {{kind: 'plan-review', approve: string, callId?: string}} [intent]
+ * @property {{kind: 'plan-review'|'approval', approve?: string, reject?: string, callId?: string, display?: QuestionDisplay}} [intent]
  */
 
 /**

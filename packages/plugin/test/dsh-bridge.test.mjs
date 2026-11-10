@@ -4,10 +4,13 @@ import { join } from 'node:path'
 
 import {
   DshBridge,
+  TESTED_DSH_VERSIONS,
   describeFailure,
   extractAssistantText,
   historyMessageOf,
   isInjectedUserMessage,
+  isTestedDshVersion,
+  runApprovalProxySelfCheck,
   summarizeToolCall,
 } from '../src/dsh-bridge.mjs'
 import { VOICE_SECTION_NAME, assistantVoiceSection } from '../src/voice.mjs'
@@ -859,6 +862,130 @@ test('a blocking question that times out is not kept for late answers', async ()
   assert.equal(bridge.answerQuestion({ questionId: ask.questionId, answers: [] }), false)
 })
 
+test('提问转发：intent.display 的三类人话（question/detail/approve）原样到达手机', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  // 新版 DSH 的形状：`question` 只是空串，人话全在 intent.display（本地化字典）。
+  const display = {
+    question: { zh: '要执行这个计划吗？', en: 'Run this plan?' },
+    detail: { zh: '会影响 3 个文件', en: 'It touches 3 files' },
+    approve: { zh: '批准并执行', en: 'Approve and run' },
+  }
+  const answerPromise = handler.listener({
+    questions: [
+      { id: 'plan-1', question: '', intent: { kind: 'plan-review', approve: 'Approve?', callId: 'call-1', display } },
+      { id: 'q-2', question: '选哪个？', intent: { kind: 'question', display: { question: { zh: '选哪个？', en: 'Which one?' } } } },
+    ],
+    agent: { id: 'agent-1' },
+  }, async () => 'delegated')
+  await delay(20)
+
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.ok(ask, 'the phone must receive the question card')
+  assert.deepEqual(ask.items.map(item => item.id), ['plan-1', 'q-2'])
+  assert.deepEqual(ask.items[0].intent.display, display, 'display 三个子项原样转发（含 zh/en）')
+  assert.equal(ask.items[0].intent.kind, 'plan-review')
+  assert.equal(ask.items[0].intent.approve, 'Approve?', '旧的 intent.approve 字符串仍然保留')
+  assert.equal(ask.items[0].question, '', '题干照原样转发，空串由 display 兜底（webchat 的回退顺序）')
+  assert.deepEqual(ask.items[1].intent.display, { question: { zh: '选哪个？', en: 'Which one?' } }, '普通提问也带 display')
+  assert.deepEqual(JSON.parse(JSON.stringify(ask.items)), ask.items, '帧必须是纯 JSON，webchat 可直接消费')
+
+  // 深拷贝：手机侧改自己拿到的字典，不能反改 DSH 的请求对象。
+  ask.items[0].intent.display.question.zh = 'mutated'
+  assert.equal(display.question.zh, '要执行这个计划吗？', 'display 必须是深拷贝')
+
+  bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: [{ id: 'plan-1', selected: [] }, { id: 'q-2', selected: [] }],
+  })
+  await answerPromise
+})
+
+test('提问转发：display 非法子项只丢自己，item 与题干照常转发', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const tooLongKey = 'k'.repeat(33)
+  const questions = [
+    {
+      id: 'bad-1',
+      question: '保留题干',
+      // question 是数字、detail 里混了非字符串、approve 超长、note 不在白名单：逐个丢弃。
+      intent: {
+        kind: 'plan-review',
+        display: {
+          question: { zh: '问题在', en: 'question' },
+          detail: { zh: 'ok', en: 7 },
+          approve: { zh: 'x'.repeat(501) },
+          note: { zh: '不在白名单' },
+        },
+      },
+    },
+    { id: 'bad-2', question: '数组 display', intent: { display: [] } },
+    { id: 'bad-3', question: '标量 display', intent: { display: 'nope' } },
+    { id: 'bad-4', question: '超长 key', intent: { display: { question: { [tooLongKey]: 'v' } } } },
+  ]
+  const answerPromise = handler.listener({ questions, agent: { id: 'agent-1' } }, async () => 'delegated')
+  await delay(20)
+
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.ok(ask)
+  assert.deepEqual(ask.items.map(item => item.id), ['bad-1', 'bad-2', 'bad-3', 'bad-4'], '非法 display 不能丢整条提问')
+  assert.equal(ask.items[0].question, '保留题干', '题干不受 display 校验影响')
+  assert.deepEqual(ask.items[0].intent.display, { question: { zh: '问题在', en: 'question' } }, '只保留合法子项')
+  assert.equal('detail' in ask.items[0].intent.display, false, '混入非字符串的字典整子项丢弃')
+  assert.equal('approve' in ask.items[0].intent.display, false, '超长字典整子项丢弃')
+  assert.equal('note' in ask.items[0].intent.display, false, '不在白名单的子项不转发')
+  assert.equal(ask.items[0].intent.kind, 'plan-review')
+  for (const item of ask.items.slice(1)) {
+    assert.equal('intent' in item, false, '非法 display 不该凭空造出空 intent')
+    assert.ok(item.question.length > 0)
+  }
+  assert.deepEqual(JSON.parse(JSON.stringify(ask.items)), ask.items)
+
+  bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: ask.items.map(item => ({ id: item.id, selected: [] })),
+  })
+  await answerPromise
+})
+
+test('提问转发：没有 intent.display 的旧形状完全不受影响（回归）', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const handler = questionHandler(fake)
+  const answerPromise = handler.listener(questionRequest({
+    questions: [
+      { id: 'plain', question: '普通提问', detail: '细节', header: 'H', options: [{ label: 'A', description: 'a' }] },
+      { id: 'plan', question: '批准？', intent: { kind: 'plan-review', approve: 'Approve 按钮' } },
+    ],
+  }), async () => 'delegated')
+  await delay(20)
+
+  const ask = events.find(event => event.kind === 'question-ask')
+  assert.ok(ask)
+  assert.deepEqual(ask.items[0], {
+    id: 'plain',
+    question: '普通提问',
+    detail: '细节',
+    header: 'H',
+    options: [{ label: 'A', description: 'a' }],
+  }, '旧形状一个字段都不多')
+  assert.equal('intent' in ask.items[0], false, '没有 intent 就不该出现 intent 键')
+  assert.deepEqual(ask.items[1].intent, { kind: 'plan-review', approve: 'Approve 按钮' }, 'plan-review 旧字段原样保留')
+  assert.equal('display' in ask.items[1].intent, false)
+
+  bridge.answerQuestion({
+    questionId: ask.questionId,
+    deviceId: 'dev_a',
+    answers: [{ id: 'plain', selected: ['A'] }, { id: 'plan', selected: [] }],
+  })
+  await answerPromise
+})
+
 // ---------------------------------------------------------------------------
 // v3.0.0: live-adopt —— 接管桌面上已经在跑的会话
 // ---------------------------------------------------------------------------
@@ -1122,6 +1249,156 @@ test('B 双端同时可见：手机不在线时桌面直接弹，手机连上后
   assert.equal(await approvalPromise, 'allowed-once')
 })
 
+test('代理状态：自检通过且版本在白名单里 → enabled/tested，启动只写一行中文日志', () => {
+  const logs = []
+  const { bridge } = makeBridge({ hostVersion: '0.2.2-rc.1', log: line => logs.push(line) })
+  const status = bridge.approvalProxyStatus()
+  assert.equal(status.enabled, true)
+  assert.equal(status.selfCheck, 'passed')
+  assert.equal(status.hostVersion, '0.2.2-rc.1')
+  assert.equal(status.tested, true)
+  assert.equal(logs.length, 1, '启动自检只留一行结论日志')
+  assert.match(logs[0], /代理自检通过/)
+  assert.match(logs[0], /已实测/)
+})
+
+test('代理状态：未实测版本仍然启用，但 tested=false 并明确警告', () => {
+  const logs = []
+  const { bridge } = makeBridge({ hostVersion: '9.9.9', log: line => logs.push(line) })
+  const status = bridge.approvalProxyStatus()
+  assert.equal(status.enabled, true, '未实测版本不关闭功能，只是代理可能失效')
+  assert.equal(status.tested, false)
+  assert.match(status.reason, /未实测/)
+  assert.match(logs[0], /未实测/)
+})
+
+test('代理状态：运行时版本不可读时 tested=false，reason 说明不可读', () => {
+  const { bridge } = makeBridge({ hostVersion: null })
+  const status = bridge.approvalProxyStatus()
+  assert.equal(status.hostVersion, null)
+  assert.equal(status.enabled, true)
+  assert.equal(status.tested, false)
+  assert.match(status.reason, /不可读/)
+})
+
+test('版本白名单：命中已实测/同家族，跨小版本与不可读一律不命中', () => {
+  assert.deepEqual([...TESTED_DSH_VERSIONS], ['0.2.2-rc.1'])
+  assert.equal(isTestedDshVersion('0.2.2-rc.1'), true)
+  assert.equal(isTestedDshVersion('v0.2.2'), true, '去 v 前缀且同家族 = 已实测')
+  assert.equal(isTestedDshVersion('0.2.2+build.7'), true, '构建元数据不影响判定')
+  assert.equal(isTestedDshVersion('0.3.0'), false)
+  assert.equal(isTestedDshVersion(''), false)
+  assert.equal(isTestedDshVersion(null), false)
+  assert.equal(isTestedDshVersion('not-a-version'), false)
+})
+
+test('启动自检在本运行时通过，且不替换全局 AbortController', () => {
+  const controller = globalThis.AbortController
+  assert.deepEqual(runApprovalProxySelfCheck(), { ok: true })
+  assert.equal(globalThis.AbortController, controller)
+})
+
+test('自检失败 → 不抛、退回不代理，但桌面弹窗照开、手机仍能作答', async () => {
+  const logs = []
+  const { bridge, fake, events } = makeBridge({
+    devicesInSession: () => ['dev_a'],
+    approvalSelfCheck: () => ({ ok: false, reason: '合成的自检失败' }),
+    log: line => logs.push(line),
+  })
+  const status = bridge.approvalProxyStatus()
+  assert.equal(status.enabled, false)
+  assert.equal(status.selfCheck, 'failed')
+  assert.match(status.reason, /自检失败/)
+  assert.match(logs[0], /自检失败/)
+
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const original = new AbortController()
+  const req = { toolName: 'ops_bash', signal: original.signal }
+  let desktopAsked = false
+  const approvalPromise = approvalEntry.listener(req, () => {
+    desktopAsked = true
+    return new Promise(() => {})
+  })
+  assert.equal(desktopAsked, true, '自检失败只影响关窗，不影响唤起桌面弹窗')
+  assert.equal(req.signal, original.signal, '自检失败时绝不写 req.signal')
+
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+})
+
+test('experimentalDualApproval 关闭：不写 req.signal、next() 仍调用、手机仍能结算', async () => {
+  const logs = []
+  const { bridge, fake, events } = makeBridge({
+    config: { experimentalDualApproval: false },
+    devicesInSession: () => ['dev_a'],
+    log: line => logs.push(line),
+  })
+  const status = bridge.approvalProxyStatus()
+  assert.equal(status.enabled, false)
+  assert.equal(status.selfCheck, 'skipped')
+  assert.match(status.reason, /已关闭/)
+  assert.equal(logs.length, 1, '开关关闭也只留一行说明日志')
+  assert.match(logs[0], /已关闭/)
+
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const req = { toolName: 'ops_bash' }
+  let desktopAsked = false
+  const approvalPromise = approvalEntry.listener(req, () => {
+    desktopAsked = true
+    return new Promise(() => {})
+  })
+  assert.equal(desktopAsked, true, '开关关闭也必须唤起桌面弹窗（由用户自己点掉）')
+  assert.equal('signal' in req, false, '开关关闭时不得往请求对象写 signal')
+
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  const onDesktop = events.filter(event => event.kind === 'approval-ask').at(-1)
+  assert.equal(onDesktop.onDesktop, true, '手机卡片照旧，且标注桌面也已弹出')
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'allowed-once' }), true)
+  assert.equal(await approvalPromise, 'allowed-once')
+  const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
+  assert.equal(resolved.source, 'phone', '先答先算：手机先答就是 phone')
+})
+
+test('experimentalDualApproval 关闭：桌面先答仍以 desktop 来源结算', async () => {
+  const { bridge, fake, events } = makeBridge({
+    config: { experimentalDualApproval: false },
+    devicesInSession: () => ['dev_a'],
+  })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const req = { toolName: 'ops_bash' }
+  const approvalPromise = approvalEntry.listener(req, async () => 'rejected')
+  assert.equal(await approvalPromise, 'rejected')
+  assert.equal('signal' in req, false, '桌面先答也不能留下 signal 代理')
+  const approval = events.find(event => event.kind === 'approval-ask')
+  const resolved = events.find(event => event.kind === 'approval-resolved' && event.approvalId === approval.approvalId)
+  assert.equal(resolved.source, 'desktop')
+})
+
+test('req.signal 只读时代理降级、不抛，手机作答照旧生效', async () => {
+  const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'] })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  const approvalEntry = fake.scopedEvents.find(entry => entry.event === 'approval/request')
+  const original = new AbortController()
+  const req = {}
+  Object.defineProperty(req, 'signal', {
+    get: () => original.signal,
+    set: () => { throw new TypeError('readonly signal') },
+    configurable: true,
+  })
+  const approvalPromise = approvalEntry.listener(req, () => new Promise(() => {}))
+  assert.equal(req.signal, original.signal, '写不进去就保持原样')
+  const approval = events.find(event => event.kind === 'approval-ask')
+  assert.ok(approval)
+  assert.equal(bridge.answerApproval({ approvalId: approval.approvalId, deviceId: 'dev_a', outcome: 'rejected' }), true)
+  assert.equal(await approvalPromise, 'rejected')
+})
+
 test('desktop user messages are forwarded live, phone-injected and runtime ones are not', async () => {
   const { bridge, fake, events } = makeBridge()
   const { sessionId } = await bridge.createSession('dev_a')
@@ -1202,5 +1479,112 @@ test('harness-injected user messages never become blue bubbles', () => {
   assert.ok(real)
   assert.equal(real.kind, 'user')
   assert.equal(real.text, '你好')
+})
+
+// ---------------------------------------------------------------------------
+// v3.0.0 会话标题：readTitleSnapshots 的真实形状 / 兜底区分 / 确定性去重
+// ---------------------------------------------------------------------------
+
+/**
+ * 只含会话列表 / 标题快照的 sessionQuery 假实现。
+ * @param {Array<any>} records listSessions() 的返回值
+ * @param {(ids: string[]) => Array<any>} readTitles readTitleSnapshots() 的返回值
+ */
+function sessionQueryFixture(records, readTitles) {
+  return {
+    listSessions: async () => records,
+    readTitleSnapshots: async ids => readTitles(ids),
+  }
+}
+
+/**
+ * 一条 DSH `SessionTitleObservation`：`title` 是**对象**（SessionTitleSnapshot），
+ * 不是字符串——这正是 v3.0.0 之前取不到标题的根因。
+ */
+function titleObservation(sessionId, title) {
+  return {
+    sessionId,
+    status: 'fulfilled',
+    value: {
+      session: { id: sessionId, createdAt: 1, cwd: '/work/proj' },
+      title: { title, messageSeqs: [1], source: 'auto', eventSeq: 3, updatedAt: 4 },
+    },
+  }
+}
+
+test('会话标题：value.title 是 SessionTitleSnapshot 对象（带 title 字符串）也能取到', async () => {
+  const { bridge, fake } = makeBridge()
+  fake.ctx.sessionQuery = sessionQueryFixture(
+    [
+      { header: { id: 'sess-a', createdAt: 2, cwd: '/work/proj' } },
+      { header: { id: 'sess-b', createdAt: 1, cwd: '/work/other' } },
+    ],
+    ids => [
+      titleObservation(ids[0], `标题-${ids[0]}`),
+      // 真实 observation 里顶层不一定有 sessionId：退回 value.session.id / 请求顺序。
+      { status: 'fulfilled', value: { session: { id: ids[1] }, title: { title: `标题-${ids[1]}` } } },
+    ],
+  )
+  const { sessions } = await bridge.listSessions()
+  assert.deepEqual(sessions.map(session => session.title), ['标题-sess-a', '标题-sess-b'])
+})
+
+test('会话标题：字符串形状仍兼容；rejected 的会话退回 cwd 兜底（唯一时不加 id）', async () => {
+  const { bridge, fake } = makeBridge()
+  fake.ctx.sessionQuery = sessionQueryFixture(
+    [
+      { header: { id: 'sess-a', createdAt: 2, cwd: '/work/proj' } },
+      { header: { id: 'sess-b', createdAt: 1, cwd: '/work/proj' } },
+    ],
+    ids => [
+      { sessionId: ids[0], status: 'fulfilled', value: { session: { id: ids[0] }, title: '字符串标题' } },
+      { sessionId: ids[1], status: 'rejected', reason: new Error('读不到标题') },
+    ],
+  )
+  const { sessions } = await bridge.listSessions()
+  assert.equal(sessions[0].title, '字符串标题')
+  // 同一 cwd 下只有一个无标题会话：不加 id 后缀，保持干净。
+  assert.equal(sessions[1].title, 'proj')
+})
+
+test('会话标题：同 cwd 多个无标题会话用 id 后 6 位区分，且跨刷新稳定', async () => {
+  const records = [
+    { header: { id: '0f9c2b1e-aaaa-bbbb-cccc-3f2a19', createdAt: 3, cwd: '/work/default-workspace' } },
+    { header: { id: '0f9c2b1e-aaaa-bbbb-cccc-7d81e4', createdAt: 2, cwd: '/work/default-workspace' } },
+    { header: { id: '0f9c2b1e-aaaa-bbbb-cccc-9c0b55', createdAt: 1, cwd: '/work/default-workspace' } },
+  ]
+  const { bridge, fake } = makeBridge()
+  fake.ctx.sessionQuery = sessionQueryFixture(
+    records,
+    ids => ids.map(id => ({ sessionId: id, status: 'rejected', reason: 'no title' })),
+  )
+  const first = await bridge.listSessions()
+  assert.deepEqual(first.sessions.map(session => session.title), [
+    'default-workspace · 3f2a19',
+    'default-workspace · 7d81e4',
+    'default-workspace · 9c0b55',
+  ])
+  const second = await bridge.listSessions()
+  assert.deepEqual(second.sessions, first.sessions, '同一份输入必须稳定（不依赖随机/遍历顺序）')
+})
+
+test('会话标题：真实标题同名时确定性追加 #2/#3，非同名标题保持原样', async () => {
+  const { bridge, fake } = makeBridge()
+  fake.ctx.sessionQuery = sessionQueryFixture(
+    [
+      { header: { id: 'sess-a', createdAt: 3, cwd: '/work/a' } },
+      { header: { id: 'sess-b', createdAt: 2, cwd: '/work/b' } },
+      { header: { id: 'sess-c', createdAt: 1, cwd: '/work/c' } },
+    ],
+    ids => ids.map((id, index) => titleObservation(id, index === 2 ? '另一个标题' : '同一个标题')),
+  )
+  const first = await bridge.listSessions()
+  assert.deepEqual(first.sessions.map(session => session.title), [
+    '同一个标题',
+    '同一个标题 #2',
+    '另一个标题',
+  ])
+  const second = await bridge.listSessions()
+  assert.deepEqual(second.sessions, first.sessions, '去重序号必须稳定')
 })
 

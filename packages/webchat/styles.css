@@ -1261,6 +1261,35 @@ pre {
   background: color-mix(in srgb, var(--song-soft) 45%, var(--bubble-ai));
 }
 
+/* 已作答的只读摘要卡：留在聊天流里当记录，不再有点击态。 */
+.question-card.question-summary {
+  border-color: var(--line);
+  background: var(--surface);
+  box-shadow: none;
+  opacity: 0.92;
+}
+
+.question-card.question-summary .question-title {
+  color: var(--text-dim);
+}
+
+.question-card.question-summary .question-text {
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.question-answer {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  font-weight: 600;
+  color: var(--text);
+  padding-left: 9px;
+  border-left: 3px solid color-mix(in srgb, var(--song) 55%, var(--line));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .question-head {
   display: flex;
   align-items: baseline;

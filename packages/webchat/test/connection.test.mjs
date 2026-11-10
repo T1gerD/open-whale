@@ -306,6 +306,42 @@ test('心跳：到点发 ping，长时间无入站帧判定连接已死', () => 
   assert.equal(manager.online, false)
 })
 
+test('前后台：setVisible 幂等，变化时立刻补发带 visible 的 ping，心跳也带 visible', () => {
+  FakeSocket.reset()
+  const clock = createClock()
+  const { manager } = createManager(clock, { candidates: [LAN] })
+  manager.start()
+  const socket = FakeSocket.instances[0]
+
+  // 未连接时只记状态、不抛错，也不往没打开的 socket 写帧；重连后的心跳会带上。
+  assert.equal(manager.setVisible(false), true)
+  assert.equal(manager.visible, false)
+  assert.equal(socket.sent.length, 0, '未连接时不该发帧')
+  assert.equal(manager.setVisible(false), false, '同值重复上报必须幂等')
+
+  socket.open()
+  socket.receive({ t: 'hello/ack', paired: true, heartbeatMs: 20_000 })
+  // 已经处于后台：心跳帧必须带 visible:false。
+  clock.advance(20_000)
+  const hidden = socket.framesOf('ping')
+  assert.equal(hidden.length, 1)
+  assert.equal(hidden[0].visible, false, '后台心跳要带 visible:false')
+
+  // 回到前台：立即补一帧，不等下一个心跳周期。
+  assert.equal(manager.setVisible(true), true)
+  const immediate = socket.framesOf('ping')
+  assert.equal(immediate.length, 2, '可见性恢复要立刻补一帧 ping')
+  assert.equal(immediate[1].visible, true)
+  assert.equal(manager.setVisible(true), false)
+
+  // 之后的定时心跳也带 visible:true。
+  socket.receive({ t: 'pong' })
+  clock.advance(20_000)
+  const pings = socket.framesOf('ping')
+  assert.equal(pings.length, 3)
+  assert.equal(pings[2].visible, true)
+})
+
 test('send() 离线返回 false、在线真的写入 socket', () => {
   FakeSocket.reset()
   const clock = createClock()
