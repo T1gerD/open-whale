@@ -168,6 +168,23 @@ export function fileMessageId(fileId) {
 }
 
 /**
+ * 去掉电脑端给「手机附件消息」注入的提示段，只留下用户真正输入的文字。
+ *
+ * 服务端历史快照已经会剥掉；这里再兜一层（老服务端 / 旧缓存里仍可能带原文），
+ * 避免手机聊天流里出现一长串「用户通过手机发来了 N 个附件…」的路径文本。
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function stripInjectedAttachmentNotice(text) {
+  const raw = String(text ?? '')
+  const marker = '用户通过手机发来了 '
+  const index = raw.indexOf(marker)
+  if (index === -1) return raw
+  const kept = raw.slice(0, index).trim()
+  return kept !== '' ? kept : '（来自手机的附件）'
+}
+
+/**
  * 把帧里的 seq 变成一个可信的数字（`undefined` = 这条消息没有权威次序）。
  * 注意不能直接 `Number(x)`：`Number(null)` 和 `Number('')` 都是 0，会被当成
  * 「seq 0」，把消息顶到会话最前面。
@@ -1162,9 +1179,37 @@ export class ChatModel {
     const nextMessages = []
     /** @type {Map<string, any>} */
     const nextById = new Map()
+    /** 本地是否已有「同文本」的用户气泡（老服务端快照没有 msgId 时的去重兜底）。 */
+    const localUserText = message => {
+      if (message?.kind !== 'user' || typeof message.text !== 'string') return false
+      const text = message.text.trim()
+      if (text === '') return false
+      const at = Date.parse(String(message.at ?? '')) || 0
+      return message.optimistic === true || Math.abs(now - at) < 120_000
+    }
     for (const raw of incoming) {
-      const normalized = this.#normalizeSnapshotMessage(raw, now)
+      let normalized = this.#normalizeSnapshotMessage(raw, now)
       if (!normalized || nextById.has(normalized.id)) continue
+      // 兜底（服务端尚未带 msgId 的旧版本）：同文本且时间接近的本地用户气泡视为同一条，
+      // 沿用本地 id，避免重连/切标签后同一条消息出现两个蓝色气泡。
+      if (normalized.kind === 'user' && (typeof normalized.msgId !== 'string' || normalized.msgId === '')) {
+        const duplicate = this.messages.find(message => localUserText(message)
+          && message.text.trim() === normalized.text.trim()
+          && !nextById.has(message.id))
+        if (duplicate) normalized.id = duplicate.id
+      }
+      // 同一条消息在本地可能已经有更完整的乐观气泡（附件卡、mine 标记、干净文本）。
+      // 快照是权威文本，但不要因此丢掉这些本地信息，更不能再插一条重复气泡。
+      const previous = this.byId.get(normalized.id)
+      if (previous) {
+        if (Array.isArray(previous.files) && previous.files.length > 0) normalized.files = previous.files
+        if (previous.mine === true) normalized.mine = true
+        if (normalized.kind === 'user' && typeof previous.text === 'string' && previous.text.trim() !== ''
+          && normalized.text.length > previous.text.length && normalized.text.startsWith(previous.text)) {
+          // 服务端已剥离附件提示；仍出现「本地文本 + 注入提示」的超集时保留干净文本。
+          normalized.text = previous.text
+        }
+      }
       nextById.set(normalized.id, normalized)
       nextMessages.push(normalized)
     }
@@ -1251,7 +1296,11 @@ export class ChatModel {
     if (!raw || typeof raw !== 'object') return undefined
     const kind = raw.kind === 'assistant' ? 'assistant' : 'user'
     let id = typeof raw.id === 'string' && raw.id !== '' ? raw.id : ''
-    if (id === '') {
+    // 用户消息只要带了 msgId，就一律用本地气泡 id（usr_<msgId>）：服务端历史里同一条
+    // 手机消息的 id 是 hist_<seq>，不统一就会出现「同一句消息显示两遍」（真机反馈）。
+    if (kind === 'user' && typeof raw.msgId === 'string' && raw.msgId !== '') {
+      id = userMessageId(raw.msgId)
+    } else if (id === '') {
       if (kind === 'user' && typeof raw.msgId === 'string') id = userMessageId(raw.msgId)
       else if (kind === 'assistant' && typeof raw.callId === 'string') id = assistantMessageId(raw.callId)
       else return undefined
@@ -1259,7 +1308,7 @@ export class ChatModel {
     return {
       id,
       kind,
-      text: String(raw.text ?? ''),
+      text: kind === 'user' ? stripInjectedAttachmentNotice(String(raw.text ?? '')) : String(raw.text ?? ''),
       at: String(raw.at ?? new Date(now).toISOString()),
       files: normalizeAttachments(raw.files),
       status: kind === 'assistant' ? MESSAGE_STATUS.DONE : MESSAGE_STATUS.SENT,

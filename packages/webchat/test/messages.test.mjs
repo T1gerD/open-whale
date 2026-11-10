@@ -731,7 +731,9 @@ test('a snapshot drops my unconfirmed copy when history already has that message
     snapshot: { messages: [{ id: 'hist_499', kind: 'user', text: '这条其实送到了', at: '2026-11-09T11:00:01.000Z' }] },
   })
   assert.equal(model.messages.length, 1, '同内容不能出现两条气泡')
-  assert.equal(model.messages[0].id, 'hist_499')
+  // 2026-11-10：优先保留本地气泡 id（附件卡 / mine 标记 / 干净文本都在本地），
+  // 快照只负责把 seq 与权威状态补上，不再是快照 id 覆盖本地。
+  assert.equal(model.messages[0].id, userMessageId('m_dup'))
   assert.equal(model.messages[0].optimistic, undefined)
 })
 
@@ -752,4 +754,84 @@ test('the limit still trims the oldest messages after the seq switch', () => {
   assert.ok(model.messages.length <= 20)
   assert.equal(model.messages.at(-1).text, '排队中', '乐观消息永远在最后')
   assert.equal(model.messages.at(-2).text, '第 39 条', '裁剪仍然从最旧（seq 最小）那头开始')
+})
+
+test('快照重连不会把手机自己的消息显示成两条（msgId 合并本地气泡）', () => {
+  const model = makeModel()
+  model.addLocalUserMessage({ msgId: 'm1', text: '看这个', at: '2026-10-26T11:58:00.000Z' })
+  const local = model.messages[0]
+  local.files = [{ name: 'image.jpg', size: 260, mime: 'image/jpeg' }]
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: model.sessionId ?? 'sess_1',
+    sessionEpoch: 0,
+    head: 10,
+    snapshot: {
+      messages: [
+        { id: 'hist_9', kind: 'user', msgId: 'm1', text: '看这个', at: '2026-10-26T11:58:00.000Z', seq: 9 },
+        { id: 'hist_10', kind: 'assistant', text: '收到', at: '2026-10-26T11:58:05.000Z', seq: 10 },
+      ],
+    },
+  })
+  assert.equal(model.messages.length, 2, '本地气泡与历史同一条消息必须合并，而不是插两条')
+  assert.equal(model.messages[0].id, userMessageId('m1'))
+  assert.equal(model.messages[0].text, '看这个')
+  assert.deepEqual(model.messages[0].files, local.files, '附件卡不能因为快照合并而丢掉')
+  assert.equal(model.messages[0].mine, true)
+})
+
+test('快照文本若仍带注入的附件提示，合并时保留本地干净文本', () => {
+  const model = makeModel()
+  model.addLocalUserMessage({ msgId: 'm2', text: '看这个', at: '2026-10-26T11:58:00.000Z' })
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 'sess_1',
+    sessionEpoch: 0,
+    head: 3,
+    snapshot: {
+      messages: [
+        { id: 'hist_2', kind: 'user', msgId: 'm2', text: '看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上：…', at: '2026-10-26T11:58:00.000Z', seq: 2 },
+      ],
+    },
+  })
+  assert.equal(model.messages.length, 1)
+  assert.equal(model.messages[0].text, '看这个')
+})
+
+test('桌面消息的实时 echo 与历史快照用同一 id（dsh_<id>）合并', () => {
+  const model = makeModel()
+  model.applyFrame({ t: 'chat/echo', msgId: 'dsh_m2', text: '桌面发的问题', at: '2026-10-26T11:58:00.000Z', deviceId: 'dev_x' })
+  assert.equal(model.messages.length, 1)
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 'sess_1',
+    sessionEpoch: 0,
+    head: 4,
+    snapshot: {
+      messages: [
+        { id: 'hist_3', kind: 'user', msgId: 'dsh_m2', text: '桌面发的问题', at: '2026-10-26T11:58:00.000Z', seq: 3 },
+      ],
+    },
+  })
+  assert.equal(model.messages.length, 1, '同一条桌面消息不能因为快照多一条')
+  assert.equal(model.messages[0].id, userMessageId('dsh_m2'))
+})
+
+test('老服务端快照没有 msgId 时，同文本本地气泡也不会重复（兜底去重）', () => {
+  const model = makeModel()
+  model.addLocalUserMessage({ msgId: 'm3', text: '看这个', at: new Date().toISOString() })
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 'sess_1',
+    sessionEpoch: 0,
+    head: 5,
+    snapshot: {
+      messages: [
+        { id: 'hist_4', kind: 'user', text: '看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上：…', at: new Date().toISOString(), seq: 4 },
+      ],
+    },
+  })
+  assert.equal(model.messages.length, 1, '老服务端快照也要能按文本兜底合并')
+  assert.equal(model.messages[0].id, userMessageId('m3'))
+  assert.equal(model.messages[0].text, '看这个', '注入的附件提示必须剥掉')
 })

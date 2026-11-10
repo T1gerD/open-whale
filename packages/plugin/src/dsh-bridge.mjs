@@ -299,6 +299,16 @@ export class DshBridge {
     this.calls = new Map()
     /** 已受理过的 (deviceId, callId)：网关幂等表之后的第二道防线。 */
     this.seenCalls = new IdempotencyCache()
+    /**
+     * 手机注入的 DSH 消息 id → 手机端 msgId。
+     *
+     * 会话历史快照（`session/state`）是从 DSH 日志重建的，同一条手机消息在日志里
+     * 的 id 与手机本地气泡的 `usr_<msgId>` 不同——不映射就会出现「同一句消息在
+     * 手机上出现两遍」：本地乐观气泡一条、快照重建一条（后者还带着附件提示原文）。
+     * 有界 Map：手机消息只在「最近可能重连」的窗口内需要，超过上限丢最旧的。
+     * @type {Map<string, string>}
+     */
+    this.phoneMessageIds = new Map()
     /** sessionId → 已投递给 DSH、还没等到 turn/start 的回合队列 */
     this.pendingCalls = new Map()
     /** `${sessionId}:${turn}` → 该轮次属于哪个手机消息 */
@@ -535,7 +545,7 @@ export class DshBridge {
    * `session/state` 用的历史快照：来自 DSH 会话日志，而不仅是本进程收到的事件。
    * 读历史失败时降级为空数组（调用方会退回进程内日志），绝不抛。
    * @param {string} sessionId
-   * @returns {Promise<Array<{id: string, kind: 'user'|'assistant', text: string, at: string}>>}
+   * @returns {Promise<Array<{id: string, kind: 'user'|'assistant', text: string, at: string, msgId?: string, seq?: number}>>}
    */
   async historyMessages(sessionId) {
     const query = this.#sessionQuery()
@@ -553,7 +563,20 @@ export class DshBridge {
     const messages = []
     for (const event of events) {
       const mapped = historyMessageOf(event)
-      if (mapped) messages.push(mapped)
+      if (!mapped) continue
+      if (mapped.kind === 'user') {
+        const messageId = typeof event?.data?.id === 'string' ? event.data.id : ''
+        const phoneMsgId = messageId !== '' ? this.phoneMessageIds.get(messageId) : undefined
+        if (phoneMsgId !== undefined) {
+          // 手机自己发的：映射回本地气泡 id，并去掉插件注入的附件提示（只该给模型看）。
+          mapped.msgId = phoneMsgId
+        } else if (messageId !== '' && typeof event?.data?.source?.rpcId === 'string' && event.data.source.rpcId !== '') {
+          // 桌面 GUI 消息：手机实时收到的是 chat/echo（msgId=dsh_<id>），历史用同一个 id 才能去重。
+          mapped.msgId = `dsh_${messageId}`
+        }
+        mapped.text = stripPhoneAttachmentNotice(mapped.text)
+      }
+      messages.push(mapped)
     }
     return messages.slice(-SESSION_SNAPSHOT_LIMIT)
   }
@@ -1454,10 +1477,15 @@ export class DshBridge {
 
     const createUserMessage = this.createUserMessage ?? await loadCreateUserMessage()
     bridgeDiagnostic('bridge: createUserMessage 已就绪，准备 followup')
-    entry.agent.followup(createUserMessage({
+    const userMessage = createUserMessage({
       content: [{ type: 'text', text }],
       source: { kind: 'user' },
-    }))
+    })
+    entry.agent.followup(userMessage)
+    // 记住「手机注入的 DSH 消息 id → 手机端 msgId」：历史快照里同一条消息必须映射回
+    // 手机本地气泡的 id（usr_<msgId>），否则重连/切标签后会多出一条重复气泡
+    // （真机反馈：同一句「看这个」在手机上出现两遍，第二遍还带着附件提示原文）。
+    this.#rememberPhoneMessage(userMessage?.id, input.callId)
     // 只有 followup 真正提交后才记住，这样投递失败时网关可以释放占位重试。
     this.seenCalls.remember(callKey, true)
     bridgeDiagnostic(`bridge: followup 已提交 callId=${input.callId}`)
@@ -1525,6 +1553,23 @@ export class DshBridge {
   }
 
   // ---------------------------------------------------------------------------
+
+  /**
+   * 记住一条手机注入消息的 DSH 消息 id → 手机端 msgId（有界，最多 500 条）。
+   * @param {unknown} dshMessageId
+   * @param {unknown} phoneMsgId
+   */
+  #rememberPhoneMessage(dshMessageId, phoneMsgId) {
+    if (typeof dshMessageId !== 'string' || dshMessageId === '') return
+    if (typeof phoneMsgId !== 'string' || phoneMsgId === '') return
+    this.phoneMessageIds.set(dshMessageId, phoneMsgId)
+    // Map 保持插入顺序；超过上限删最旧的。
+    while (this.phoneMessageIds.size > 500) {
+      const oldest = this.phoneMessageIds.keys().next().value
+      if (oldest === undefined) break
+      this.phoneMessageIds.delete(oldest)
+    }
+  }
 
   /** @param {object} input */
   #composeText(input) {
@@ -1740,13 +1785,15 @@ export class DshBridge {
   #onUserMessage(sessionId, event) {
     const data = event?.data
     if (isInjectedUserMessage(data)) return
+    const messageId = typeof data?.id === 'string' ? data.id : ''
+    // 手机自己注入的消息即使被宿主打上 rpcId，也绝不能再回显给手机（会多一条重复气泡）。
+    if (messageId !== '' && this.phoneMessageIds.has(messageId)) return
     const source = data?.source
     if (!source || source.kind !== 'user') return
     if (typeof source.rpcId !== 'string' || source.rpcId === '') return
     const text = extractUserText(data)
     if (text === '') return
     const at = Number(event?.time)
-    const messageId = typeof data?.id === 'string' ? data.id : ''
     this.emit({
       kind: 'user-message',
       sessionId,
@@ -2272,7 +2319,27 @@ export function historyMessageOf(event) {
     kind,
     text,
     at: isoTimeOf(event?.time),
+    // 显式 seq：客户端对「有 msgId 的历史消息」用本地气泡 id 去重后，仍需要 seq 排序。
+    ...(Number.isFinite(Number(event?.seq)) ? { seq: Number(event.seq) } : {}),
   }
+}
+
+/**
+ * 去掉插件注入的附件提示段，只留下用户真正输入的文字。
+ *
+ * 手机消息进入 DSH 日志时会被拼上「用户通过手机发来了 N 个附件…」一段；模型需要它，
+ * 但历史快照显示给手机时不能照搬（真机上表现为第二个重复气泡里出现一长串路径）。
+ * 提示段总在最后；用户没写文字时给一个简短占位。
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function stripPhoneAttachmentNotice(text) {
+  const raw = String(text ?? '')
+  const marker = '用户通过手机发来了 '
+  const index = raw.indexOf(marker)
+  if (index === -1) return raw
+  const kept = raw.slice(0, index).trim()
+  return kept !== '' ? kept : '（来自手机的附件）'
 }
 
 /** @param {unknown} value */

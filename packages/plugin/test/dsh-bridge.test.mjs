@@ -11,6 +11,7 @@ import {
   isInjectedUserMessage,
   isTestedDshVersion,
   runApprovalProxySelfCheck,
+  stripPhoneAttachmentNotice,
   summarizeToolCall,
 } from '../src/dsh-bridge.mjs'
 import { VOICE_SECTION_NAME, assistantVoiceSection } from '../src/voice.mjs'
@@ -1588,3 +1589,39 @@ test('会话标题：真实标题同名时确定性追加 #2/#3，非同名标�
   assert.deepEqual(second.sessions, first.sessions, '去重序号必须稳定')
 })
 
+
+test('历史快照把手机消息映射回本地 msgId，并剥掉附件提示', async () => {
+  const { bridge, fake } = makeBridge()
+  bridge.phoneMessageIds.set('m_phone', 'pm-1')
+  fake.ctx.sessionQuery = {
+    readSession: async () => ({
+      events: [
+        {
+          type: 'user/message', seq: 5, time: 1700000000000,
+          data: {
+            id: 'm_phone', role: 'user', source: { kind: 'user' },
+            content: [{ type: 'text', text: '看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上（路径相对本次对话的工作目录）：\n- 图片：a.jpg；请按需读取这些文件；图片请用图像读取工具查看。' }],
+          },
+        },
+        {
+          type: 'user/message', seq: 6, time: 1700000001000,
+          data: {
+            id: 'm_desktop', role: 'user', source: { kind: 'user', rpcId: 'rpc-1' },
+            content: [{ type: 'text', text: '桌面发的问题' }],
+          },
+        },
+      ],
+    }),
+  }
+  const messages = await bridge.historyMessages('ow-dev_a')
+  assert.deepEqual(messages.map(m => ({ id: m.id, msgId: m.msgId, text: m.text, seq: m.seq })), [
+    { id: 'hist_5', msgId: 'pm-1', text: '看这个', seq: 5 },
+    { id: 'hist_6', msgId: 'dsh_m_desktop', text: '桌面发的问题', seq: 6 },
+  ])
+})
+
+test('stripPhoneAttachmentNotice：纯文本不变 / 剥离注入段 / 只有附件时给占位', () => {
+  assert.equal(stripPhoneAttachmentNotice('你好'), '你好')
+  assert.equal(stripPhoneAttachmentNotice('看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上：…'), '看这个')
+  assert.equal(stripPhoneAttachmentNotice('用户通过手机发来了 1 个附件，已保存到电脑上：…'), '（来自手机的附件）')
+})
