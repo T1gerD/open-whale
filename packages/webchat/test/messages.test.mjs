@@ -878,3 +878,42 @@ test('已回答的提问摘要可以被 UI 收起（不再永久钉在下方）'
   assert.equal(model.questionLog.length, 0)
   assert.equal(model.dismissQuestionSummary('q1'), false, '重复收起是幂等的')
 })
+
+test('工具流在切会话/熄屏重连后的 session/state 快照里不会消失', () => {
+  const model = makeModel()
+  model.sessionId = 'sess_1'
+  model.applyFrame({ t: 'chat/typing', sessionId: 'sess_1', callId: 'c1', active: true }, { now: NOW })
+  model.applyFrame({
+    t: 'chat/tool',
+    sessionId: 'sess_1',
+    callId: 'c1',
+    toolCallId: 'tc1',
+    tool: 'read_image',
+    phase: 'tool-end',
+    summary: '读图完成',
+  }, { now: NOW + 10 })
+  model.applyFrame({ t: 'chat/done', sessionId: 'sess_1', callId: 'c1', text: '看完了', seq: 9 }, { now: NOW + 20 })
+  const before = model.messages.find(message => message.kind === 'assistant')
+  assert.ok(before)
+  assert.equal(before.tools.length, 1, '实时帧要有工具流')
+
+  // 切标签/熄屏重连后电脑端会推 session/state；历史快照里助手消息的 id 是 hist_<seq>，
+  // 而且不带 tools 字段。合并时必须把本地工具流保留回同一条气泡。
+  model.applyFrame({
+    t: 'session/state',
+    sessionId: 'sess_1',
+    sessionEpoch: 1,
+    head: 9,
+    snapshot: {
+      messages: [
+        { id: 'hist_9', kind: 'assistant', text: '看完了', at: new Date(NOW + 20).toISOString(), seq: 9 },
+      ],
+    },
+  }, { now: NOW + 30 })
+
+  const after = model.messages.filter(message => message.kind === 'assistant')
+  assert.equal(after.length, 1, '不能多出一条重复的助手消息')
+  assert.equal(after[0].id, before.id, '沿用实时气泡的 id（后续 tool 帧仍能落到这条上）')
+  assert.equal(after[0].tools.length, 1, '工具流必须保留')
+  assert.equal(after[0].tools[0].tool, 'read_image')
+})

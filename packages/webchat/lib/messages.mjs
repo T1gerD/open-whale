@@ -1258,10 +1258,18 @@ export class ChatModel {
       }
       // 同一条消息在本地可能已经有更完整的乐观气泡（附件卡、mine 标记、干净文本）。
       // 快照是权威文本，但不要因此丢掉这些本地信息，更不能再插一条重复气泡。
-      const previous = this.byId.get(normalized.id)
+      //
+      // 助手消息还有第二层问题：快照 id 是 `hist_<seq>`，实时帧建的是 `asst_<callId>`，
+      // 只按 id 匹配会让「工具流」在切标签/熄屏重连后整段消失。这里按 seq → callId →
+      // 同文本找到本地旧消息，沿用它的 id（后续 tool 帧才会落到同一条气泡上）。
+      const previous = this.byId.get(normalized.id) ?? this.#snapshotCounterpart(normalized)
+      if (previous && previous.id !== normalized.id) normalized.id = previous.id
       if (previous) {
         if (Array.isArray(previous.files) && previous.files.length > 0) normalized.files = previous.files
         if (previous.mine === true) normalized.mine = true
+        if (Array.isArray(previous.tools) && previous.tools.length > 0) normalized.tools = previous.tools
+        if (Number.isFinite(Number(previous.durationMs))) normalized.durationMs = previous.durationMs
+        if (previous.truncated === true) normalized.truncated = true
         if (normalized.kind === 'user' && typeof previous.text === 'string' && previous.text.trim() !== ''
           && normalized.text.length > previous.text.length && normalized.text.startsWith(previous.text)) {
           // 服务端已剥离附件提示；仍出现「本地文本 + 注入提示」的超集时保留干净文本。
@@ -1285,6 +1293,9 @@ export class ChatModel {
         existing.status = MESSAGE_STATUS.STREAMING
         existing.text = String(activeCall.text ?? existing.text ?? '')
       } else {
+        // 快照只带 activeCall、没有历史消息行时，也要把实时工具流接回来。
+        const previousActive = this.messages.find(message => message?.kind === 'assistant'
+          && message.callId === activeCall.callId)
         const message = {
           id,
           kind: 'assistant',
@@ -1292,7 +1303,9 @@ export class ChatModel {
           at: new Date(now).toISOString(),
           callId: activeCall.callId,
           status: MESSAGE_STATUS.STREAMING,
-          tools: [],
+          tools: Array.isArray(previousActive?.tools) && previousActive.tools.length > 0
+            ? previousActive.tools
+            : [],
         }
         nextById.set(id, message)
         nextMessages.push(message)
@@ -1343,6 +1356,27 @@ export class ChatModel {
     }
     this.#touch(now)
     return { handled: true, changed: true, sessionChanged, frame }
+  }
+
+  /**
+   * 快照消息与本地已有消息的对应关系（按 seq → callId → 同文本，最近的优先）。
+   * 用于把实时帧积累的 `tools`（工具流）保留到快照重建后的气泡上。
+   * @param {any} normalized
+   * @returns {any | undefined}
+   */
+  #snapshotCounterpart(normalized) {
+    const seq = Number(normalized.seq)
+    const callId = typeof normalized.callId === 'string' ? normalized.callId : ''
+    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.messages[index]
+      if (message?.kind !== normalized.kind) continue
+      if (Number.isFinite(seq) && seq > 0 && Number(message.seq) === seq) return message
+      if (normalized.kind === 'assistant') {
+        if (callId !== '' && message.callId === callId) return message
+        if (normalized.text !== '' && message.text === normalized.text) return message
+      }
+    }
+    return undefined
   }
 
   /**
