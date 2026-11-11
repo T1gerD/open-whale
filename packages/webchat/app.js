@@ -1690,9 +1690,9 @@ function approvalCardHtml(approval) {
     foot = `<p class="approval-state">${
       approval.repliedOutcome === 'allowed-once' ? '已允许（等待电脑确认）' : '已拒绝（等待电脑确认）'
     }</p>`
-  } else if (onDesktop) {
-    foot = '<p class="approval-state">电脑端也已弹出这条审批；在任意一端作答，另一端会自动收起（实验）</p>'
   }
+  // onDesktop 只保留卡片样式（is-on-desktop），不再显示绿色实验提示：
+  // 双端可答已经是稳定行为，手机端不需要这行解释。
   const actions = `<div class="approval-actions">
       <button class="btn btn-primary approval-allow" type="button" data-action="approval-reply" data-approval-id="${escapeHtml(
         approval.approvalId,
