@@ -726,12 +726,98 @@ export class DshBridge {
   }
 
   /**
-   * 一个 agent 的 setup：声音段落 + autoApproveTools 或手机审批转发。
+   * 一个 agent 的 setup 工厂：声音段落 + 审批/提问转发 + agent preset 工具集。
    * @param {string} sessionId
    */
   #setupFor(sessionId) {
-    /** @type {(agentCtx: any, agent: any) => void} */
+    /** @type {(agentCtx: any, agent: any) => Promise<void>} */
     return (agentCtx, agent) => this.#setupAgent(agentCtx, agent, sessionId)
+  }
+
+  /**
+   * 读 `ctx.agentPresets`（DSH 的 agent preset 注册表，宿主可选服务）。
+   *
+   * 与 `#sessionQuery` 同一套兼容策略：Cordis 里必须用 `ctx.get()`（直接读属性会
+   * 因未 inject 而抛），测试用的假 ctx 则可以直接挂属性。
+   * @returns {any}
+   */
+  #agentPresetService() {
+    const ctx = this.ctx
+    if (typeof ctx?.get === 'function') {
+      try {
+        const service = ctx.get('agentPresets')
+        if (service) return service
+      } catch { /* 服务未提供 */ }
+    }
+    try {
+      return ctx?.agentPresets
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 把会话的 agent preset 挂到 setup 的 agent 作用域上。
+   *
+   * 根因（真机会话 `01d47803…` 日志）：DSH 的 Web 会话控制器在 create/resume 时
+   * 会用 `agentPresets.mount(agentCtx, presetId)` 绑定 preset
+   * （`@deepseek-ai/dsh-api-session-controller` 的 `composeAgent`）；read_image /
+   * read / write / edit / grep / glob / web_* / todo 这些工具是 preset 行
+   * （`@deepseek-ai/dsh-tool-fs` 等的 `apply()`）在**该 agent 作用域**里注册的，
+   * 不是宿主全局工具。插件自己走 `ctx.agents.create/resume` 不经过那条路径，
+   * 只在 SessionHeader 里写了 `agentPreset` 字段，所以手机 agent 只有宿主工具
+   * （实测 23~30 个）而不是桌面 GUI 的 57 个。
+   *
+   * `mount()` 的入参就是 setup 回调里的 `agentCtx`（DSH 文档：绑定"未发布的
+   * agent"要用 setup 的 ctx），所以这里复用同一个公开 API：新建会话当场生效，
+   * 旧会话（header 里没记录 preset 的）在下次 resume 时也会补上。
+   *
+   * 任何失败都只记日志、绝不阻断 agent 创建：preset 服务不可用/定义缺失时，
+   * 手机端退化为宿主默认工具集（当前行为），不会让发消息整个失败。
+   * @param {any} agentCtx setup 回调给的 agent 作用域
+   * @param {any} agent 该 agent（用来读会话里已记录的 preset）
+   * @returns {Promise<boolean>} 是否成功绑定
+   */
+  async #mountAgentPreset(agentCtx, agent) {
+    const presets = this.#agentPresetService()
+    if (!presets || typeof presets.mount !== 'function' || !agentCtx) {
+      // 真机排查用：出现这行说明宿主没暴露 preset 服务（或当前 profile 没装
+      // agent-preset 注册表），此时手机 agent 只能拿到宿主全局工具。
+      this.log('bridge: agentPresets 服务不可用，跳过 agent preset 挂载（工具集退化为宿主全局）')
+      return false
+    }
+    let wanted = this.agentPreset
+    try {
+      const recorded = typeof presets.presetForSession === 'function' && agent?.session
+        ? presets.presetForSession(agent.session)
+        : undefined
+      if (typeof recorded === 'string' && recorded !== '') wanted = recorded
+    } catch { /* 投影读取失败时退回配置值 */ }
+    try {
+      const resolved = typeof presets.resolve === 'function'
+        ? await presets.resolve(wanted)
+        : { id: wanted }
+      const id = typeof resolved?.id === 'string' && resolved.id !== '' ? resolved.id : wanted
+      await presets.mount(agentCtx, id)
+      this.log(`bridge: mounted agent preset ${id} for ${agent?.id ?? 'new agent'}`)
+      return true
+    } catch (error) {
+      this.log(`bridge: 挂载 agent preset ${wanted} 失败：${/** @type {Error} */ (error)?.message ?? error}`)
+    }
+    // 会话里记录的 preset 可能已被删除（profile 改过）：退回本插件配置的 preset 再试一次。
+    if (wanted !== this.agentPreset) {
+      try {
+        const fallback = typeof presets.resolve === 'function'
+          ? await presets.resolve(undefined)
+          : { id: undefined }
+        await presets.mount(agentCtx, typeof fallback?.id === 'string' ? fallback.id : undefined)
+        this.log(`bridge: mounted fallback agent preset ${fallback?.id ?? '(default)'}`)
+        return true
+      } catch (fallbackError) {
+        this.log(`bridge: 兜底 preset 也挂载失败：${/** @type {Error} */ (fallbackError)?.message ?? fallbackError}`)
+      }
+    }
+    return false
   }
 
   /**
@@ -780,11 +866,12 @@ export class DshBridge {
   }
 
   /**
+   * 一个 agent 的 setup：声音段落 + 审批/提问转发 + agent preset 工具集。
    * @param {any} agentCtx
    * @param {any} _agent
    * @param {string} sessionId
    */
-  #setupAgent(agentCtx, _agent, sessionId) {
+  async #setupAgent(agentCtx, _agent, sessionId) {
     // 标记「本插件创建/恢复」的 agent：`agent/created` 监听器据此跳过补注册。
     if (_agent) this.ownedAgents.add(_agent)
     // The voice is registered in the agent's own scope: it applies to this
@@ -798,6 +885,10 @@ export class DshBridge {
       })
     }
     this.#registerForwarders(agentCtx, sessionId)
+    // DSH 的 Web 会话在 composeAgent 里把 preset 绑到 setup 的 agentCtx 上；
+    // 插件自己 create/resume 不经过那条路径，必须在这里补一次，否则 preset 里的
+    // tool-fs/tool-web/... 工具（含 read_image）不会注册到这个 agent。
+    await this.#mountAgentPreset(agentCtx, _agent)
   }
 
   /**

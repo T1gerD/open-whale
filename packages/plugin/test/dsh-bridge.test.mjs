@@ -29,8 +29,9 @@ const WORKDIR = process.platform === 'win32' ? 'C:\\work' : '/work'
  * A fake DSH context that records what the bridge asks of it and lets tests
  * drive the session event feed. This is the smallest surface the bridge uses, so
  * a change in the bridge's expectations shows up as a failing test here.
+ * @param {{ agentPresets?: any, getThrows?: boolean }} [options]
  */
-function fakeContext() {
+function fakeContext({ agentPresets, getThrows = false } = {}) {
   const listeners = []
   /** Agent 生命周期监听器：`agent/created` / `agent/disposed`。 */
   const lifecycle = []
@@ -62,6 +63,12 @@ function fakeContext() {
       }
     },
     ctx: {
+      /** Optional-service lookup, mirroring `ctx.get()` in Cordis. */
+      get(name) {
+        if (getThrows) throw new Error(`service "${name}" unavailable`)
+        if (name === 'agentPresets') return agentPresets
+        return undefined
+      },
       on(event, listener) {
         if (event === 'session/event') {
           listeners.push(listener)
@@ -90,6 +97,8 @@ function fakeContext() {
         create: async options => {
           created.push(options)
           const agent = {
+            id: options.sessionId,
+            session: { id: options.sessionId },
             cancelled: [],
             messages: [],
             followup(message) {
@@ -101,7 +110,7 @@ function fakeContext() {
           }
           live.set(options.sessionId, agent)
           // mimic the real contract by handing it a scoped ctx and the agent.
-          options.setup?.({
+          await options.setup?.({
             systemPrompt: {
               section(section) {
                 sections.push(section)
@@ -128,8 +137,8 @@ function fakeContext() {
   }
 }
 
-function makeBridge({ config = {}, fire, ...options } = {}) {
-  const fake = fakeContext()
+function makeBridge({ config = {}, fire, presets, getThrows, ...options } = {}) {
+  const fake = fakeContext({ agentPresets: presets, getThrows })
   const events = []
   let idCounter = 0
   const bridge = new DshBridge({
@@ -192,6 +201,93 @@ test('a new phone conversation requests the standard agent preset (full tool set
   assert.equal(fake.created.length, 1)
   assert.equal(fake.created[0].meta.agentPreset, 'standard')
   assert.equal(fake.created[0].meta.cwd, WORKDIR)
+})
+
+test('setup mounts the agent preset so phone agents get the native tool set', async () => {
+  // 根因回归（真机会话 01d47803 日志）：DSH 的 Web 会话控制器在 composeAgent 里用
+  // `agentPresets.mount(agentCtx, presetId)` 绑定预设；read_image/read/write/edit/
+  // grep/glob/web_* 这些工具由 preset 行在 setup 的 agentCtx 上注册。插件自己
+  // create/resume 不经过那条路径，只在 header 写了 agentPreset 字段，所以手机
+  // agent 只有宿主工具（23~30 个），桌面 agent 57 个。setup 必须补 mount。
+  const resolves = []
+  const mounts = []
+  const presets = {
+    presetForSession: () => undefined,
+    async resolve(id) {
+      resolves.push(id)
+      return { id: id ?? 'standard' }
+    },
+    async mount(agentCtx, id) {
+      mounts.push({ agentCtx, id })
+      return { id }
+    },
+  }
+  const { bridge, fake } = makeBridge({ presets })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: '你好', attachments: [] })
+  assert.equal(fake.created.length, 1)
+  assert.deepEqual(resolves, ['standard'], 'the configured preset id must be resolved first')
+  assert.equal(mounts.length, 1, 'setup must bind exactly one preset to the agent scope')
+  assert.equal(mounts[0].id, 'standard')
+  assert.ok(mounts[0].agentCtx.systemPrompt, 'mount must receive the setup agent ctx')
+})
+
+test('setup prefers the preset recorded on the session over the configured one', async () => {
+  const mounts = []
+  const presets = {
+    presetForSession: session => (session ? 'minimal' : undefined),
+    async resolve(id) {
+      return { id }
+    },
+    async mount(agentCtx, id) {
+      mounts.push(id)
+      return { id }
+    },
+  }
+  const { bridge } = makeBridge({ presets })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.deepEqual(mounts, ['minimal'])
+})
+
+test('a missing agent preset service still creates the conversation', async () => {
+  const { bridge, fake } = makeBridge({ getThrows: true })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.equal(fake.created.length, 1)
+  assert.equal(fake.live.get('ow-dev_a').messages.length, 1)
+})
+
+test('a failing preset mount never breaks message delivery', async () => {
+  const logs = []
+  const presets = {
+    async resolve() {
+      return { id: 'standard' }
+    },
+    async mount() {
+      throw new Error('preset exploded')
+    },
+  }
+  const { bridge, fake } = makeBridge({ presets, log: message => logs.push(message) })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.equal(fake.created.length, 1)
+  assert.equal(fake.live.get('ow-dev_a').messages.length, 1)
+  assert.ok(logs.some(line => /挂载 agent preset/.test(line)), 'the failure must be logged, not thrown')
+})
+
+test('a stale recorded preset falls back to the configured preset', async () => {
+  const mounts = []
+  const presets = {
+    presetForSession: () => 'removed-preset',
+    async resolve(id) {
+      if (id === 'removed-preset') throw new Error('unknown agent preset')
+      return { id: id ?? 'standard' }
+    },
+    async mount(agentCtx, id) {
+      mounts.push(id)
+      return { id }
+    },
+  }
+  const { bridge } = makeBridge({ presets })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.deepEqual(mounts, ['standard'], 'a deleted preset must not kill the phone conversation')
 })
 test('two phones never share a conversation', async () => {
   const { bridge, fake } = makeBridge()

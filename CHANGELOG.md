@@ -39,6 +39,8 @@
 - **切后台后不再立刻显示离线**：移动浏览器切后台会冻结并杀掉 WebSocket，网关原先“没有 socket 就离线”会显示成“离线”。现在记录设备最后状态，**后台断开后 10 分钟宽限期内仍显示「在线（后台）」**（health 计入 online/background 但 `connections` 仍只统计真实 socket），回前台重连立刻恢复「在线（前台）」，超时才真离线。
 - **提问摘要卡自动收起 + 附件提示残留清理**（真机反馈）：已回答的「提问 · 已回答」摘要卡原先永久钉在聊天流下方，现在只做 12 秒即时反馈后自动收起（题目/答案仍在会话历史里）；手机聊天流里任何路径出现的「用户通过手机发来了…」附件提示都会被剥掉，回显消息按「同文本+时间接近」合并回本地气泡，旧缓存里的纯提示残留直接丢弃。
 - **已关闭的会话刷新后不再复活**（真机：手机端删不掉已连接的会话，每回重启网页都会复现）：`closedSessions` 墓碑此前只存在内存里，刷新即丢；电脑端仍绑着旧会话，重连时推 `session/state` 全量快照，客户端就自动开标签把它弹回来。现在墓碑随标签一起落盘（localStorage，最多 16 个），恢复后已关闭会话的快照不再自动开标签，只有用户主动打开才解除。
+- **跨标签单连接（重连风暴根治）**：网页版同一浏览器多开页面/标签时，每个页面各建一条 WS 互相顶掉（服务端日志全是「未收到 CLOSE 帧」，23:33 峰值 26 次/分）。新增 `webchat/lib/leader.mjs`：Web Locks（首选）→ BroadcastChannel 心跳 → solo 三级选主，follower 零连接待命，leader 关闭/隐藏后自动接管（bye 150ms、失联 4.5s、双 leader 按资历收敛）；所有重连入口加 leader guard；新增 10 项测试。
+- **手机会话恢复桌面同款工具集（read_image 等）**：DSH Web 会话控制器在 `composeAgent` 里用 `agentPresets.mount(agentCtx, id)` 把 preset 绑到 agent 作用域；插件自己 `ctx.agents.create/resume` 绕过了这一步，所以手机会话只有 19~30 个宿主工具（报 `unknown tool "read_image"`），桌面 GUI 是 57 个。现在插件在 agent setup 里补调 `agentPresets.mount`（按会话已记录 preset，缺省 `standard`），新建与 **旧会话 resume** 都生效，无需桌面打开；失败只记日志不阻断发消息。新增 5 项测试。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
@@ -48,7 +50,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 907 项全绿**（v3.0.0 基线 855 项，新增 52 项）。
+- 测试：**54 个测试文件 / 922 项全绿**（v3.0.0 基线 855 项，新增 67 项）。
 
 ## [3.0.0] - 2026-10-30
 
