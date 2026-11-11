@@ -130,6 +130,20 @@ export function normalizeOutbox(value) {
     }))
 }
 
+export function normalizeQueue(value) {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter(item => item && typeof item.id === 'string' && typeof item.text === 'string')
+    .slice(0, 20)
+    .map(item => ({
+      id: item.id,
+      text: item.text.slice(0, 4000),
+      at: typeof item.at === 'string' ? item.at : new Date().toISOString(),
+      ...(typeof item.sessionId === 'string' && item.sessionId !== '' ? { sessionId: item.sessionId } : {}),
+      ...(Array.isArray(item.fileNames) ? { fileNames: item.fileNames.filter(name => typeof name === 'string').slice(0, 10) } : {}),
+    }))
+}
+
 /**
  * 给 localStorage 套一层「永不抛异常」的包装。隐私模式 / 配额满 / 被禁用都降级成内存。
  * @param {Storage | undefined} storage
@@ -234,6 +248,18 @@ export function createStorage(storage, prefix = STORAGE_PREFIX) {
     /** @param {string} deviceId @param {any} outbox */
     saveOutbox(deviceId, outbox) {
       return setRaw(`outbox.${deviceId}`, JSON.stringify(normalizeOutbox(outbox)))
+    },
+    /** @param {string} deviceId */
+    loadQueue(deviceId) {
+      return normalizeQueue(parseStored(getRaw(`queue.${deviceId}`)))
+    },
+    /** @param {string} deviceId @param {any} queue */
+    saveQueue(deviceId, queue) {
+      return setRaw(`queue.${deviceId}`, JSON.stringify(normalizeQueue(queue)))
+    },
+    /** @param {string} deviceId */
+    clearQueue(deviceId) {
+      removeRaw(`queue.${deviceId}`)
     },
     /** @param {string} deviceId */
     clearOutbox(deviceId) {

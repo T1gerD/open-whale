@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { createStorage, normalizeBinding, normalizeOutbox, normalizeSettings, parseStored } from '../lib/storage.mjs'
+import { createStorage, normalizeBinding, normalizeOutbox, normalizeQueue, normalizeSettings, parseStored } from '../lib/storage.mjs'
 
 /** 内存版 Storage。 */
 function createMemoryStorage() {
@@ -164,4 +164,30 @@ test('createStorage：没有 localStorage 时也能工作（SSR / 隐私模式�
   assert.equal(storage.loadSettings().mode, 'auto')
   assert.equal(storage.setRaw('x', '1'), false)
   assert.equal(storage.getRaw('x'), '1')
+})
+
+test('排队消息：normalizeQueue 过滤坏数据并保留附件文件名', () => {
+  const queue = normalizeQueue([
+    { id: 'q1', text: '待发', sessionId: 's1', fileNames: ['a.jpg'] },
+    { id: 'q2', text: 42 },
+    null,
+    { id: 'q3', text: 'x'.repeat(5000) },
+  ])
+  assert.equal(queue.length, 2)
+  assert.equal(queue[0].text, '待发')
+  assert.deepEqual(queue[0].fileNames, ['a.jpg'])
+  assert.equal(queue[0].sessionId, 's1')
+  assert.ok(queue[1].text.length <= 4000)
+})
+
+test('排队消息：loadQueue/saveQueue 按设备持久化', () => {
+  const storage = createStorage(createMemoryStorage())
+  assert.deepEqual(storage.loadQueue('web_1'), [])
+  storage.saveQueue('web_1', [{ id: 'q1', text: '排队1', sessionId: 's1' }])
+  const restored = storage.loadQueue('web_1')
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].text, '排队1')
+  assert.deepEqual(storage.loadQueue('web_2'), [])
+  storage.clearQueue('web_1')
+  assert.deepEqual(storage.loadQueue('web_1'), [])
 })

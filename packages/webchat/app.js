@@ -433,6 +433,24 @@ function persistTabsNow() {
   }
 }
 
+/** 排队消息落盘（刷新/切后台回来还能继续发）。附件本身无法序列化，只存文件名做提示。 */
+function persistQueue() {
+  if (!state.identity) return
+  try {
+    storage.saveQueue(state.identity.deviceId, state.queue.map(entry => ({
+      id: entry.id,
+      text: entry.text,
+      at: entry.at,
+      ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+      ...(entry.attachments?.length
+        ? { fileNames: entry.attachments.map(attachment => attachment.name) }
+        : {}),
+    })))
+  } catch {
+    /* 存储满/隐私模式：不阻塞聊天 */
+  }
+}
+
 function persistNow() {
   if (!state.identity || !state.model) return
   try {
@@ -742,6 +760,15 @@ function startSession(options = {}) {
   const savedConversation = storage.loadConversation(state.identity.deviceId)
   if (savedConversation) state.model.restoreActiveChat(savedConversation)
 
+  state.queue = storage.loadQueue(state.identity.deviceId).map(entry => ({
+    id: entry.id,
+    text: entry.text,
+    at: entry.at,
+    sessionId: entry.sessionId ?? '',
+    attachments: [],
+    needsFiles: Array.isArray(entry.fileNames) && entry.fileNames.length > 0,
+    fileNames: entry.fileNames ?? [],
+  }))
   state.outbox = storage.loadOutbox(state.identity.deviceId).map(entry => ({
     msgId: entry.msgId,
     text: entry.text,
@@ -997,6 +1024,8 @@ function handleOnline(ack, context) {
   flushApprovalReplies()
   syncApprovalReplyRetry()
   scheduleSessionSync()
+  // 重连后立即尝试把排队消息发出去（若会话还在跑，flushQueue 会自己等待）。
+  flushQueue()
   renderTabs()
   renderHeader()
   renderStatusBanner()
@@ -2055,6 +2084,9 @@ function handleFrame(frame) {
     persistSoon()
   }
   if (frame.t === SERVER_FRAME.SESSION_SELECTED || result.opened) persistTabsNow()
+  // 快照到达（重连/切回标签）且这一轮已经结束时，把排队消息发出去：
+  // 页面在后台错过的 chat/done 不会重放，只能靠快照兜底。
+  if (frame.t === SERVER_FRAME.SESSION_STATE) flushQueue()
 }
 
 /**
@@ -2386,7 +2418,14 @@ async function sendComposer() {
   // 用户可以编辑 / 删除 / 插队发送；本轮结束后自动按序发出。
   const busy = Boolean(state.model.activeCallId) || state.model.isTyping === true
   if (busy || state.flushing) {
-    state.queue.push({ id: uid('q'), text, attachments })
+    state.queue.push({
+      id: uid('q'),
+      text,
+      attachments,
+      at: new Date().toISOString(),
+      sessionId: state.model.activeSessionId,
+    })
+    persistQueue()
     dom.composerInput.value = ''
     autosizeInput()
     state.attachments = []
@@ -2508,7 +2547,9 @@ function renderQueue() {
   }
   host.innerHTML = list
     .map(entry => {
-      const preview = entry.text !== '' ? entry.text : '（仅附件）'
+      const preview = entry.needsFiles
+        ? `${entry.text !== '' ? entry.text : '（附件消息）'}（附件需重选）`
+        : entry.text !== '' ? entry.text : '（仅附件）'
       const meta = entry.attachments.length > 0 ? `${entry.attachments.length} 个附件` : ''
       return `<div class="queue-item" data-queue-id="${escapeHtml(entry.id)}">
         <span class="queue-text" title="${escapeHtml(preview)}">${escapeHtml(preview)}</span>
@@ -2527,18 +2568,26 @@ function renderQueue() {
 function flushQueue() {
   if (state.flushing) return
   if (state.queue.length === 0) return
-  if (state.model?.activeCallId) return
+  if (state.model?.activeCallId || state.model?.isTyping) return
   if (!state.connection?.online) return
-  const entry = state.queue.shift()
+  const active = state.model?.activeSessionId ?? ''
+  // 只发当前会话的排队消息；附件在刷新后丢失的条目不自动发（避免发成没有图的消息）。
+  const index = state.queue.findIndex(entry => !entry.needsFiles
+    && (entry.sessionId === undefined || entry.sessionId === '' || entry.sessionId === active))
+  if (index < 0) return
+  const [entry] = state.queue.splice(index, 1)
+  persistQueue()
   state.flushing = true
   renderQueue()
   deliverMessage(entry.text, entry.attachments)
     .catch(() => {
       // 发送失败：放回队首，等下一次机会（网络恢复/下一轮结束）。
       state.queue.unshift(entry)
+      persistQueue()
     })
     .finally(() => {
       state.flushing = false
+      renderQueue()
       renderComposerState()
     })
 }
@@ -2552,7 +2601,12 @@ function queueEntryById(id) {
 function sendQueuedNow(id) {
   const index = state.queue.findIndex(entry => entry.id === id)
   if (index < 0) return
+  if (state.queue[index].needsFiles) {
+    showToast('这条消息的附件在刷新后丢失了，请编辑后重新选择附件', 'error', 4200)
+    return
+  }
   const [entry] = state.queue.splice(index, 1)
+  persistQueue()
   deliverMessage(entry.text, entry.attachments).catch(error => {
     state.queue.splice(index, 0, entry)
     renderQueue()
@@ -2565,6 +2619,7 @@ function editQueued(id) {
   const index = state.queue.findIndex(entry => entry.id === id)
   if (index < 0) return
   const [entry] = state.queue.splice(index, 1)
+  persistQueue()
   const existing = dom.composerInput.value.trim()
   dom.composerInput.value = existing !== '' && entry.text !== '' ? `${existing}\n${entry.text}` : existing || entry.text
   if (entry.attachments.length > 0) state.attachments.push(...entry.attachments)
@@ -2579,6 +2634,7 @@ function deleteQueued(id) {
   const index = state.queue.findIndex(entry => entry.id === id)
   if (index < 0) return
   state.queue.splice(index, 1)
+  persistQueue()
   renderComposerState()
 }
 
@@ -3552,6 +3608,7 @@ function setupLifecycleEvents() {
     if (state.connection && !state.connection.online && state.status?.state !== CONNECTION_STATE.REJECTED) {
       state.connection.reconnect()
     }
+    flushQueue()
   })
   window.addEventListener('hashchange', async () => {
     const result = await payloadFromLocation()
@@ -3579,6 +3636,7 @@ function setupLifecycleEvents() {
     state.connection?.setVisible?.(document.visibilityState === 'visible')
     // pagehide 里释放了选主：恢复聊天页时重新选举（待命标签仍是 follower）。
     if (state.view === 'chat') ensureLeader()
+    flushQueue()
   })
   window.addEventListener('error', event => {
     const message = event?.message ?? ''
