@@ -47,6 +47,7 @@ import {
 } from './lib/keys.mjs'
 import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs'
 import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs'
 import { createStorage } from './lib/storage.mjs'
 import {
   AttachmentUploader,
@@ -183,6 +184,10 @@ const state = {
   lastTabsSignature: '',
   lastActiveTabId: '',
   connectionWarned: false,
+  /** 跨标签选主器（一个页面一个；只在聊天会话期间存在）。 */
+  leader: undefined,
+  /** 当前标签在选主中的角色；follower 绝不建立 WebSocket。 */
+  leaderRole: LEADER_ROLE.IDLE,
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +780,14 @@ function startSession(options = {}) {
     },
   })
   state.connection.raceSize = pairing ? 1 : 2
-  state.connection.start()
+  // 跨标签选主：只有成为 leader 的标签才真正建立 WebSocket。follower 保留完整的
+  // 本地界面（缓存的消息/标签仍可看），但一条 socket 都不开。
+  ensureLeader()
+  if (!applyLeaderConnection()) {
+    state.status = { state: CONNECTION_STATE.IDLE, reason: 'standby' }
+    renderHeader()
+    renderStatusBanner()
+  }
 }
 
 function teardownConnection() {
@@ -783,6 +795,81 @@ function teardownConnection() {
     state.connection.stop('页面切换')
     state.connection = undefined
   }
+}
+
+// ---------------------------------------------------------------------------
+// 跨标签单连接选主
+// ---------------------------------------------------------------------------
+//
+// 背景：同一浏览器多开页面时，每个页面都会为同一 deviceId 建一条 WS，互相顶掉，
+// 服务端日志里出现大量「未收到 CLOSE 帧」。这里用 lib/leader.mjs 选出唯一 leader，
+// follower 只待命；leader 关闭/页面隐藏后，follower 由 Web Locks 授权或
+// BroadcastChannel 心跳超时自动接管。
+
+/** 本标签是否应持有 WebSocket（leader 或无法协调时的 solo）。 */
+function isConnectionLeader() {
+  return state.leader?.isLeader === true
+}
+
+/** 本标签是否是待命 follower。 */
+function isStandbyFollower() {
+  return state.leaderRole === LEADER_ROLE.FOLLOWER
+}
+
+/** 懒创建选举器：一个页面只创建一次（pagehide 释放后 pageshow 会重建）。 */
+function ensureLeader() {
+  if (state.leader) return state.leader
+  state.leader = new LeaderElector({
+    locks: globalThis.navigator?.locks,
+    channel: globalThis.BroadcastChannel,
+    onChange: role => {
+      state.leaderRole = role
+      applyLeaderConnection()
+      renderHeader()
+      renderStatusBanner()
+    },
+    onError: error => {
+      if (error?.name === 'AbortError') return
+      console.warn('[openwhale] 跨标签选主降级：', error)
+    },
+  })
+  state.leader.start()
+  state.leaderRole = state.leader.role
+  return state.leader
+}
+
+/** 释放选主（页面隐藏/卸载、解除绑定时调用）；follower 立刻可以接管。 */
+function disposeLeader(reason = '页面卸载') {
+  const leader = state.leader
+  state.leader = undefined
+  state.leaderRole = LEADER_ROLE.IDLE
+  if (!leader) return
+  try {
+    leader.dispose({ reason })
+  } catch (error) {
+    console.warn('[openwhale] 释放跨标签选主失败：', error)
+  }
+}
+
+/**
+ * 按选主结果开/关连接。
+ * 成为 leader：之前待命时停掉的连接重新 start()；掉成 follower：立刻 stop()，
+ * 绝不让两个标签同时持有 WebSocket。
+ * @returns {boolean} 本标签当前是否持有连接
+ */
+function applyLeaderConnection() {
+  const connection = state.connection
+  const leader = isConnectionLeader()
+  if (!connection) return leader
+  if (leader) {
+    if (connection.stopped) connection.start()
+    return true
+  }
+  if (!connection.stopped) {
+    connection.stop('已由其它标签连接')
+    state.status = { state: CONNECTION_STATE.IDLE, reason: 'standby' }
+  }
+  return false
 }
 
 /** 每次 socket open 都构造新的 hello（nonce 必须每次不同）。 */
@@ -2398,7 +2485,14 @@ function renderHeader() {
   const status = state.status ?? { state: CONNECTION_STATE.IDLE }
   dom.statusDot.className = 'status-dot'
   let detail = '未连接'
-  if (status.state === CONNECTION_STATE.ONLINE) {
+  if (isStandbyFollower()) {
+    // 同一浏览器只允许一个标签连接：其它标签明确显示待命，而不是让人以为它坏了。
+    dom.statusDot.classList.add('is-warn')
+    detail = '待命（由其它标签连接）'
+  } else if (state.leaderRole === LEADER_ROLE.ELECTING) {
+    dom.statusDot.classList.add('is-connecting')
+    detail = '正在确认连接标签…'
+  } else if (status.state === CONNECTION_STATE.ONLINE) {
     dom.statusDot.classList.add('is-online')
     const kind = ENDPOINT_KIND_LABEL[state.connection?.connectedKind] ?? ''
     detail = [kind, connectionOrigin()].filter(Boolean).join(' · ')
@@ -2422,6 +2516,23 @@ function renderHeader() {
 function renderStatusBanner() {
   const status = state.status ?? { state: CONNECTION_STATE.IDLE }
   const candidates = computeCandidates()
+  // 跨标签选主：待命标签显示的是一条「说明」而不是故障；不提供「重试」，
+  // 因为主动重连会变成第二个连接，正是要消灭的多页面互相顶。
+  if (isStandbyFollower()) {
+    dom.statusBanner.hidden = false
+    dom.statusBanner.classList.remove('is-error')
+    dom.statusBannerText.textContent =
+      '已在其它标签连接，本标签待命：同一浏览器只保留一条连接；关闭那个标签后本标签会自动接管。'
+    dom.statusBannerActions.innerHTML = '<button class="banner-btn" type="button" data-action="open-settings">设置</button>'
+    return
+  }
+  if (state.leaderRole === LEADER_ROLE.ELECTING) {
+    dom.statusBanner.hidden = false
+    dom.statusBanner.classList.remove('is-error')
+    dom.statusBannerText.textContent = '正在确认是否已有其它标签在连接…'
+    dom.statusBannerActions.innerHTML = ''
+    return
+  }
   const offline = status.state !== CONNECTION_STATE.ONLINE
   if (!offline) {
     dom.statusBanner.hidden = true
@@ -2882,7 +2993,7 @@ function changeConnectionMode(mode, { reconnect = true } = {}) {
   if (state.connection) state.connection.setCandidates(computeCandidates())
   renderSettings()
   renderStatusBanner()
-  if (reconnect && state.connection) {
+  if (reconnect && state.connection && isConnectionLeader()) {
     const candidates = computeCandidates()
     if (candidates.length === 0) {
       showToast(emptyModeHint(), 'error', 5000)
@@ -2903,7 +3014,7 @@ async function addManualEndpoint(input, { reconnect = true } = {}) {
   state.settings = storage.saveSettings({ manualEndpoints: manual })
   settingsFeedback(`已添加 ${normalized.url}`, 'ok')
   renderSettings()
-  if (reconnect && state.connection) {
+  if (reconnect && state.connection && isConnectionLeader()) {
     state.connection.setCandidates(computeCandidates())
     state.connection.reconnect()
   }
@@ -2963,6 +3074,8 @@ async function unbindDevice() {
     /* 电脑端没收到也没关系，本地照样清 */
   }
   teardownConnection()
+  // 解绑后这个页面不再持有连接：释放选主，让其它标签（如果还有绑定）接管。
+  disposeLeader('解除绑定')
   if (state.identity) {
     storage.clearConversation(state.identity.deviceId)
     storage.clearOutbox(state.identity.deviceId)
@@ -3141,6 +3254,10 @@ function setupChatEvents() {
         openSessionSheet()
         break
       case 'reconnect':
+        if (!isConnectionLeader()) {
+          settingsFeedback('本标签待命：关闭其它标签后会自动接管连接', 'ok')
+          break
+        }
         if (state.connection) state.connection.reconnect()
         settingsFeedback('正在重新连接…')
         break
@@ -3198,7 +3315,13 @@ function setupChatEvents() {
   dom.statusBanner.addEventListener('click', event => {
     const button = event.target.closest('[data-action]')
     if (!button) return
-    if (button.dataset.action === 'reconnect') state.connection?.reconnect()
+    if (button.dataset.action === 'reconnect') {
+      if (!isConnectionLeader()) {
+        showToast('本标签正在待命：关掉其它标签后会自动接管连接', '', 3200)
+        return
+      }
+      state.connection?.reconnect()
+    }
     if (button.dataset.action === 'open-settings') openSettings()
     if (button.dataset.action === 'rebind') {
       showView('bind')
@@ -3272,6 +3395,8 @@ async function copyText(text, button) {
 
 function setupLifecycleEvents() {
   window.addEventListener('online', () => {
+    // 待命标签不持有连接，网络恢复时不能在这里重新建 WS（那正是多页面互相顶）。
+    if (!isConnectionLeader()) return
     if (!state.connection?.online) {
       state.connection?.reconnect()
       showToast('网络恢复，正在重连…', '', 2200)
@@ -3283,6 +3408,13 @@ function setupLifecycleEvents() {
     // 在线（后台），审批/提问仍会推送），回到前台立刻恢复前台状态。
     state.connection?.setVisible?.(document.visibilityState === 'visible')
     if (document.visibilityState !== 'visible') return
+    // pagehide 释放过选主但没等到 pageshow（部分 WebView 会这样）时补建一次，
+    // 否则回到前台会既没有 leader 也没有连接。
+    if (state.view === 'chat' && !state.leader) ensureLeader()
+    // 手机浏览器会节流/暂停后台标签的定时器：回到前台先主动检查一次「leader 还在
+    // 不在」，在的话保持待命，不在的话立刻接管，不等下一个定时器。
+    state.leader?.recheck?.()
+    if (!isConnectionLeader()) return
     if (state.connection && !state.connection.online && state.status?.state !== CONNECTION_STATE.REJECTED) {
       state.connection.reconnect()
     }
@@ -3303,11 +3435,16 @@ function setupLifecycleEvents() {
   window.addEventListener('pagehide', () => {
     // 页面被关掉/进 bfcache：尽可能告诉电脑端已不在前台（不等于断线）。
     state.connection?.setVisible?.(false)
+    // 释放选主：Web Locks 立刻交给排队中的 follower，BroadcastChannel 广播 bye，
+    // 让其它标签马上接管；进 bfcache 时也由 pageshow 重新选举。
+    disposeLeader('页面隐藏')
     persistNow()
   })
   window.addEventListener('pageshow', () => {
     // 从 bfcache 恢复时不一定触发 visibilitychange，这里补一次前后台同步。
     state.connection?.setVisible?.(document.visibilityState === 'visible')
+    // pagehide 里释放了选主：恢复聊天页时重新选举（待命标签仍是 follower）。
+    if (state.view === 'chat') ensureLeader()
   })
   window.addEventListener('error', event => {
     const message = event?.message ?? ''

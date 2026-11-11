@@ -40,6 +40,7 @@ const SHELL = [
   './lib/endpoints.mjs',
   './lib/pairing.mjs',
   './lib/keys.mjs',
+  './lib/leader.mjs',
   './lib/messages.mjs',
   './lib/upload.mjs',
   './lib/connection.mjs',
