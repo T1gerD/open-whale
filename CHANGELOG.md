@@ -44,6 +44,7 @@
 - **preset 服务查找更稳**：`agentPresets` 优先从 setup 的 `agentCtx` 取（DSH 文档：agent.ctx 的普通 lookup 走 Host realm），插件根 ctx 兜底；新增 1 项测试。
 - **会话列表隐藏空会话 + 按最近聊天排序**：手机「全部会话」里会出现「打开过但从未使用过」的新开会话（空会话，标题按 cwd 兜底）；现在 bridge 用 sessionQuery.listEvents 折叠每个会话的最近消息时间与 blank 状态，隐藏空会话，并按最近一次聊天时间倒序（summary 新增 updatedAt，30s 缓存 + 会话事件即时失效，读失败不隐藏）。
 - **新建会话改为本地草稿**：手机点「新建会话」不再立刻 session/create，只在本地开一个 draft: 标签（发第一条消息时才创建），草稿不落盘、不参与 session/select/watch/snapshot，刷新即消失；发消息前创建成功后把标签换成真实 id 再发送。
+- **会话状态指示（标签条 + 全部会话列表）**：会话名右侧统一显示状态——在线=绿点、正在回复=转圈（黄/蓝旋转）、等待审批或结构化提问=黄点（优先级最高）；未发送的本地草稿不显示状态。状态由 `ChatTabsModel.statusFor()` 统一计算，标签条签名随之刷新；原来的「在线」文字徽标与「!」审批角标移除。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
@@ -53,7 +54,7 @@
 - 版本号统一为 **3.0.1**（6 个 manifest / `PLUGIN_VERSION` / `WEBCHAT_VERSION` / `app.json`）；
   `PROTOCOL_VERSION` 保持 **3.0.0**（wire 未变）。`WEBCHAT_VERSION` bump 同时改变
   `sw.js?v=` 与 Service Worker 缓存名，https/PWA 用户刷新后自动换新壳。
-- 测试：**54 个测试文件 / 930 项全绿**（v3.0.0 基线 855 项，新增 67 项）。
+- 测试：**54 个测试文件 / 931 项全绿**（v3.0.0 基线 855 项，新增 67 项）。
 
 ## [3.0.0] - 2026-10-30
 

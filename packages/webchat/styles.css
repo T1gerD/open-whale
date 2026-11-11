@@ -770,12 +770,27 @@ pre {
 }
 
 .tab-dot.is-live {
-  background: var(--song);
+  /* 在线（live 但空闲）：绿点 */
+  background: #4ade80;
 }
 
-.tab-dot.is-running {
-  background: var(--accent);
-  animation: dot-pulse 1.4s ease-in-out infinite;
+/* 等待用户处理（审批/提问）：黄点 */
+.tab-dot.is-waiting {
+  background: #fbbf24;
+}
+
+/* 正在回复：转圈 */
+.tab-dot.is-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-top-color: var(--accent);
+  background: transparent;
+  animation: tab-spin 0.8s linear infinite;
+}
+
+@keyframes tab-spin {
+  to { transform: rotate(360deg); }
 }
 
 .tab-unread {
@@ -2190,6 +2205,13 @@ pre {
   min-width: 0;
 }
 
+.session-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .session-row-title {
   color: var(--text);
   font-size: 14px;
@@ -2197,6 +2219,7 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 
 .session-row-meta {

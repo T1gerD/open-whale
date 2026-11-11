@@ -1917,6 +1917,29 @@ export class ChatTabsModel {
     return this.sessions.find(item => item.id === id)?.live === true
   }
 
+  /**
+   * 会话的展示状态（标签条 / 会话列表右侧指示器）。
+   * - `approval`：有等待用户处理的审批或结构化提问（黄点）——优先级最高；
+   * - `running`：agent 正在这个会话里回复（转圈）；
+   * - `online`：会话在电脑端 live、当前空闲（绿点）；
+   * - `idle`：其余（没有指示器，例如尚未发送的本地草稿）。
+   * @param {string} sessionId
+   * @returns {'approval'|'running'|'online'|'idle'}
+   */
+  statusFor(sessionId) {
+    const id = String(sessionId ?? '')
+    if (id === '') return 'idle'
+    const chat = this.chats.get(id)
+    if (chat) {
+      const approval = (chat.approvals ?? []).some(item => item.replied !== true && item.expired !== true)
+      const question = (chat.questions ?? []).some(item => item.replied !== true)
+      if (approval || question) return 'approval'
+    }
+    if (this.#activityFor(id).typing === true) return 'running'
+    if (this.sessions.find(item => item.id === id)?.live === true) return 'online'
+    return 'idle'
+  }
+
   /** @param {string} sessionId */
   unreadFor(sessionId) {
     return this.#activityFor(String(sessionId ?? '')).unread

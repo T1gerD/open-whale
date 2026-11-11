@@ -1316,9 +1316,7 @@ function tabSignature() {
   const parts = [tabsSupported() ? 'multi' : 'single', model.activeSessionId]
   for (const id of model.tabs) {
     parts.push(
-      `${id}\u0001${model.titleFor(id)}\u0001${model.unreadFor(id)}\u0001${model.typingFor(id) ? 1 : 0}\u0001${
-        model.liveFor(id) ? 1 : 0
-      }\u0001${model.hasApprovalIn(id) ? 1 : 0}`,
+      `${id}\u0001${model.titleFor(id)}\u0001${model.unreadFor(id)}\u0001${model.statusFor(id)}`,
     )
   }
   return parts.join('\u0002')
@@ -1346,20 +1344,19 @@ function renderTabs() {
         const active = id === model.activeSessionId
         const title = displayTitles.get(id) ?? model.titleFor(id)
         const unread = model.unreadFor(id)
-        const typing = model.typingFor(id)
-        const live = model.liveFor(id)
-        // 当前标签的审批卡片就在眼前，不需要再挂角标；只提醒「其它标签」有待办。
-        const approval = !active && model.hasApprovalIn(id)
+        const status = model.statusFor(id)
         const classes = ['session-tab']
         if (active) classes.push('is-active')
-        if (typing) classes.push('is-running')
+        if (status === 'running') classes.push('is-running')
+        // 右侧指示器：黄点（等待审批/提问）> 转圈（正在回复）> 绿点（在线空闲）。
         const indicators = [
-          typing
-            ? '<span class="tab-dot is-running" title="正在回复"></span>'
-            : live
-              ? '<span class="tab-dot is-live" title="运行中"></span>'
-              : '',
-          approval ? '<span class="tab-approval" title="有权限请求">!</span>' : '',
+          status === 'approval'
+            ? '<span class="tab-dot is-waiting" title="等待你处理"></span>'
+            : status === 'running'
+              ? '<span class="tab-dot is-spinner" title="正在回复"></span>'
+              : status === 'online'
+                ? '<span class="tab-dot is-live" title="在线"></span>'
+                : '',
           unread > 0 ? `<span class="tab-unread">${unread > 99 ? '99+' : unread}</span>` : '',
         ]
           .filter(Boolean)
@@ -1404,15 +1401,26 @@ function renderSessionSheet() {
   const rows = sessions
     .map(session => {
       const badges = []
-      if (session.live) badges.push('<span class="badge is-live">在线</span>')
       if (session.id === activeId) badges.push('<span class="badge is-current">当前</span>')
       else if (openTabs.has(session.id)) badges.push('<span class="badge is-open">已打开</span>')
+      const status = model.statusFor(session.id)
+      // 会话名右侧的状态：黄点（等待处理）> 转圈（回复中）> 绿点（在线）。
+      const statusHtml = status === 'approval'
+        ? '<span class="tab-dot is-waiting" title="等待你处理"></span>'
+        : status === 'running'
+          ? '<span class="tab-dot is-spinner" title="正在回复"></span>'
+          : status === 'online'
+            ? '<span class="tab-dot is-live" title="在线"></span>'
+            : ''
       const time = relativeTime(session.updatedAt ?? session.createdAt)
       const meta = [time, session.cwd ? session.cwd : ''].filter(Boolean).map(escapeHtml).join(' · ')
       const action = multi ? 'open-session' : 'select-session'
       return `<button class="session-row" type="button" data-action="${action}" data-session-id="${escapeHtml(session.id)}">
         <span class="session-row-main">
-          <span class="session-row-title">${escapeHtml(session.title)}</span>
+          <span class="session-row-head">
+            <span class="session-row-title">${escapeHtml(session.title)}</span>
+            ${statusHtml}
+          </span>
           <span class="session-row-meta">${meta}</span>
         </span>
         <span class="session-badges">${badges.join('')}</span>

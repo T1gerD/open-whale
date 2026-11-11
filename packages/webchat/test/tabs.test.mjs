@@ -421,3 +421,41 @@ test('草稿换成真实 id：真实标签已存在时合并，不留两个标�
   assert.deepEqual(store.tabs, ['sess_real'])
   assert.equal(store.activeSessionId, 'sess_real')
 })
+
+test('会话状态：在线绿点 / 运行中转圈 / 等待审批黄点（优先级）', () => {
+  const store = makeStore()
+  store.openTab('sess_a')
+  store.openTab('sess_b')
+  store.applyFrame({
+    t: 'sessions',
+    sessions: [
+      { id: 'sess_a', title: 'A', live: true },
+      { id: 'sess_b', title: 'B', live: true },
+    ],
+  }, { now: NOW })
+  assert.equal(store.statusFor('sess_a'), 'online', 'live 且空闲 = 绿点')
+
+  // 运行中：本地 typing（优先于在线）
+  store.applyFrame({ t: 'chat/typing', sessionId: 'sess_b', callId: 'c1', active: true }, { now: NOW })
+  assert.equal(store.statusFor('sess_b'), 'running')
+
+  // 等待审批：优先于运行中/在线
+  store.applyFrame({ t: 'approval/ask', sessionId: 'sess_a', approvalId: 'ap_a', toolName: 'bash' }, { now: NOW })
+  assert.equal(store.statusFor('sess_a'), 'approval')
+  store.applyFrame({ t: 'approval/resolved', sessionId: 'sess_a', approvalId: 'ap_a', outcome: 'allowed-once', source: 'phone' }, { now: NOW })
+  assert.equal(store.statusFor('sess_a'), 'online', '审批处理完回到在线')
+
+  // 结构化提问同样算等待用户处理
+  store.applyFrame({
+    t: 'question/ask',
+    sessionId: 'sess_b',
+    questionId: 'q1',
+    items: [{ id: 'i1', question: '选哪个？', options: [{ label: 'A' }] }],
+    expiresAt: NOW + 60_000,
+  }, { now: NOW })
+  assert.equal(store.statusFor('sess_b'), 'approval')
+
+  // 没有 live、也没有在跑的会话：不显示指示器
+  store.closeTab('sess_a')
+  assert.equal(store.statusFor('sess_missing'), 'idle')
+})
