@@ -43,10 +43,10 @@ function loadBundle({ react = true } = {}) {
   return mod
 }
 
-test('the client bundle exports apply and an empty inject list', () => {
+test('the client bundle exports apply and declares the slots service', () => {
   const mod = loadBundle()
   assert.equal(typeof mod.apply, 'function')
-  assert.deepEqual(mod.inject, [])
+  assert.deepEqual(mod.inject, ['slots'], 'inject 必须声明 slots，加载器才会等服务就绪后再 apply')
 })
 
 test('apply registers only the settings section, with the official contract', () => {
@@ -102,6 +102,6 @@ test('apply survives a missing slots service, old ctx.slots, and throwing slot A
 test('a broken react require degrades to a no-op plugin instead of failing boot', () => {
   const mod = loadBundle({ react: false })
   assert.equal(typeof mod.apply, 'function')
-  assert.deepEqual(mod.inject, [])
+  assert.deepEqual(mod.inject, ['slots'], '即使 react 缺失，插件的服务依赖声明仍保留')
   assert.doesNotThrow(() => mod.apply({}))
 })

@@ -18,8 +18,13 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    /** 客户端加载器要求导出 apply；inject 置空数组避免被当成 pending。 */
-    exports.inject = []
+    /**
+     * 客户端加载器要求导出 apply。inject 必须声明依赖的服务：官方设置插件都写
+     * `['slots', 'locale']`，加载器会等这些服务就绪后再 apply。之前写空数组让 apply
+     * 在 boot 早期执行，`ctx.get('slots')` 取不到服务 → 设置区块静默跳过，于是每次
+     * 重启 DSH 后设置里都没有 Open Whale，重启一次插件才出现。
+     */
+    exports.inject = ['slots']
 
     try {
       var React = require('react')

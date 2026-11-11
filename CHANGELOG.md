@@ -48,6 +48,7 @@
 - **工具流在切会话/熄屏后消失**：切标签、锁屏重连会收到 `session/state` 全量快照，而历史快照的助手消息 id 是 `hist_<seq>`、且不带 `tools` 字段，快照重建就把实时帧积累的工具流整段丢了。现在快照合并会按 `seq` → `callId` → 同文本找到本地旧消息，沿用它的 id 并保留 `tools`/`durationMs`/`truncated`；只有 `activeCall`、没有历史行的快照也会把工具流接回来。新增 1 项回归测试。
 - **想排队的消息直接发出去了**：桌面/手机回合刚开始、还在跑工具（没有 assistant 正文）时，网关只在 message/delta 事件登记 activeCall，导致切标签/熄屏重连后的 session/state 快照里没有进行中回合；手机端误判空闲，消息直接投递。现在 typing 和 tool 事件也登记 activeCall（done/error 时清除），快照会带出「只有工具还没正文」的进行中回合并置 typing，手机重新显示忙碌态，发送会进入本地排队。新增 1 项网关回归测试。
 - **移除审批卡片的绿色实验提示**：审批同时推到电脑端时，手机卡片里那行「电脑端也已弹出这条审批；在任意一端作答，另一端会自动收起（实验）」不再显示（双端可答已是稳定行为），卡片只保留工具名、原因和操作按钮。
+- **设置页 Open Whale 区块重启后缺失**：客户端插件原先 `exports.inject = []`，DSH 客户端加载器不会等 `slots` 服务就绪，`apply` 在 boot 早期跑时 `ctx.get("slots")` 取不到服务、设置区块被静默跳过；重启一次插件后才注册成功。现在按官方设置插件契约声明 `inject = ["slots"]`，加载器会等 slots 就绪后再 apply，每次启动设置里都有 Open Whale。
 - **协议清理**：`APPROVAL_TIMEOUT_MS` 标注 `@deprecated` / legacy（3.0.0 双端审批后已无
   「等手机 N 秒再转桌面」阶段，仅保留导出兼容）；`QuestionItem`/`QuestionDisplay` typedef
   补上 `intent.display` 与题干可能为空时的回退约定；`ping` 帧文档化可选 `visible`。
