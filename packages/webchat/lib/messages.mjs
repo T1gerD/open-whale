@@ -1337,6 +1337,19 @@ export class ChatModel {
         return true
       })
       : []
+    const hadMessages = this.messages.length > 0
+    // 第一次收到快照时 this.sessionId 还是 null，也算「同一会话」：不能因为会话号
+    // 尚未落库就把已有消息当成别的会话清掉。
+    const sameSessionNow = this.sessionId == null || sessionId === this.sessionId
+    if (sameSessionNow && hadMessages && nextMessages.length === 0 && pendingLocal.length === 0) {
+      // 空快照不能把已有聊天记录清空：这通常是重连瞬间历史还没读到/读到空，
+      // 真机上表现为「发送后消息整条消失，刷新才回来」。保留原列表，等下次快照对账。
+      if (this.sessionId == null) {
+        this.sessionId = sessionId
+        this.sessionEpoch = epoch
+      }
+      return { handled: true, changed: false, sessionChanged, frame }
+    }
     this.messages = [...nextMessages.slice(-this.limit), ...pendingLocal]
     // 快照消息按 seq（历史 id 是 `hist_<seq>`）排，乐观消息永远排最后：
     // 手机会话「我的提问排在回复后面」就是这里按墙钟排错的。
