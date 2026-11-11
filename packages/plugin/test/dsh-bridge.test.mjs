@@ -31,7 +31,7 @@ const WORKDIR = process.platform === 'win32' ? 'C:\\work' : '/work'
  * a change in the bridge's expectations shows up as a failing test here.
  * @param {{ agentPresets?: any, getThrows?: boolean }} [options]
  */
-function fakeContext({ agentPresets, getThrows = false } = {}) {
+function fakeContext({ agentPresets, getThrows = false, agentCtxGet } = {}) {
   const listeners = []
   /** Agent 生命周期监听器：`agent/created` / `agent/disposed`。 */
   const lifecycle = []
@@ -111,6 +111,8 @@ function fakeContext({ agentPresets, getThrows = false } = {}) {
           live.set(options.sessionId, agent)
           // mimic the real contract by handing it a scoped ctx and the agent.
           await options.setup?.({
+            /** Optional-service lookup in the agent scope (mirrors Cordis ctx.get). */
+            get: agentCtxGet,
             systemPrompt: {
               section(section) {
                 sections.push(section)
@@ -137,8 +139,8 @@ function fakeContext({ agentPresets, getThrows = false } = {}) {
   }
 }
 
-function makeBridge({ config = {}, fire, presets, getThrows, ...options } = {}) {
-  const fake = fakeContext({ agentPresets: presets, getThrows })
+function makeBridge({ config = {}, fire, presets, getThrows, agentCtxGet, ...options } = {}) {
+  const fake = fakeContext({ agentPresets: presets, getThrows, agentCtxGet })
   const events = []
   let idCounter = 0
   const bridge = new DshBridge({
@@ -246,6 +248,30 @@ test('setup prefers the preset recorded on the session over the configured one',
   const { bridge } = makeBridge({ presets })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   assert.deepEqual(mounts, ['minimal'])
+})
+
+test('the preset service is found through the setup agent scope when the root ctx cannot see it', async () => {
+  // 真机排查用：Cordis 里 agentPresets 在 Host realm，插件根 ctx 理论上可见，但若
+  // loader 层级/隔离组导致不可见，setup 的 agentCtx 仍能拿到（agent.ctx 的普通
+  // lookup 走 Host realm）。这里把根 ctx 的 get 置为抛错，只在 agentCtx 上暴露服务。
+  const mounts = []
+  const presets = {
+    async resolve(id) {
+      return { id: id ?? 'standard' }
+    },
+    async mount(agentCtx, id) {
+      mounts.push(id)
+      return { id }
+    },
+  }
+  const { bridge, fake } = makeBridge({
+    presets,
+    getThrows: true,
+    agentCtxGet: name => (name === 'agentPresets' ? presets : undefined),
+  })
+  await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
+  assert.equal(fake.created.length, 1)
+  assert.deepEqual(mounts, ['standard'], 'agentCtx lookup must find the service')
 })
 
 test('a missing agent preset service still creates the conversation', async () => {

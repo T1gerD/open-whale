@@ -741,19 +741,21 @@ export class DshBridge {
    * 因未 inject 而抛），测试用的假 ctx 则可以直接挂属性。
    * @returns {any}
    */
-  #agentPresetService() {
-    const ctx = this.ctx
-    if (typeof ctx?.get === 'function') {
+  #agentPresetService(...contexts) {
+    for (const ctx of contexts) {
+      if (!ctx) continue
+      if (typeof ctx.get === 'function') {
+        try {
+          const service = ctx.get('agentPresets')
+          if (service) return service
+        } catch { /* 当前作用域看不到这个服务，换下一个 ctx */ }
+      }
       try {
-        const service = ctx.get('agentPresets')
+        const service = ctx.agentPresets
         if (service) return service
-      } catch { /* 服务未提供 */ }
+      } catch { /* 未 inject 的属性访问会抛，忽略 */ }
     }
-    try {
-      return ctx?.agentPresets
-    } catch {
-      return undefined
-    }
+    return undefined
   }
 
   /**
@@ -779,7 +781,9 @@ export class DshBridge {
    * @returns {Promise<boolean>} 是否成功绑定
    */
   async #mountAgentPreset(agentCtx, agent) {
-    const presets = this.#agentPresetService()
+    // agentCtx（setup 回调给的 agent 作用域）优先：它一定属于该 agent 的 realm，
+    // 也是 mount() 要求的入参；插件根 ctx 作为兜底。
+    const presets = this.#agentPresetService(agentCtx, this.ctx)
     if (!presets || typeof presets.mount !== 'function' || !agentCtx) {
       // 真机排查用：出现这行说明宿主没暴露 preset 服务（或当前 profile 没装
       // agent-preset 注册表），此时手机 agent 只能拿到宿主全局工具。
