@@ -29,9 +29,12 @@ const WORKDIR = process.platform === 'win32' ? 'C:\\work' : '/work'
  * A fake DSH context that records what the bridge asks of it and lets tests
  * drive the session event feed. This is the smallest surface the bridge uses, so
  * a change in the bridge's expectations shows up as a failing test here.
- * @param {{ agentPresets?: any, getThrows?: boolean }} [options]
+ * `sessionQuery` mirrors the host's optional `sessionQuery` service
+ * (`listSessions` / `listEvents` / `readTitleSnapshots`); tests may pass one in
+ * or assign `fake.ctx.sessionQuery` later.
+ * @param {{ agentPresets?: any, getThrows?: boolean, agentCtxGet?: any, sessionQuery?: any }} [options]
  */
-function fakeContext({ agentPresets, getThrows = false, agentCtxGet } = {}) {
+function fakeContext({ agentPresets, getThrows = false, agentCtxGet, sessionQuery } = {}) {
   const listeners = []
   /** Agent 生命周期监听器：`agent/created` / `agent/disposed`。 */
   const lifecycle = []
@@ -42,6 +45,8 @@ function fakeContext({ agentPresets, getThrows = false, agentCtxGet } = {}) {
   const answeredQuestions = []
   /** @type {Map<string, any>} */
   const live = new Map()
+  /** 可替换的 optional services：`fake.ctx.sessionQuery = ...` 会写回这里。 */
+  const services = { sessionQuery }
 
   return {
     created,
@@ -63,10 +68,18 @@ function fakeContext({ agentPresets, getThrows = false, agentCtxGet } = {}) {
       }
     },
     ctx: {
+      /** 会话查询服务：既支持构造时注入，也支持测试中途替换（缓存类用例）。 */
+      get sessionQuery() {
+        return services.sessionQuery
+      },
+      set sessionQuery(value) {
+        services.sessionQuery = value
+      },
       /** Optional-service lookup, mirroring `ctx.get()` in Cordis. */
       get(name) {
         if (getThrows) throw new Error(`service "${name}" unavailable`)
         if (name === 'agentPresets') return agentPresets
+        if (name === 'sessionQuery') return services.sessionQuery
         return undefined
       },
       on(event, listener) {
@@ -139,8 +152,8 @@ function fakeContext({ agentPresets, getThrows = false, agentCtxGet } = {}) {
   }
 }
 
-function makeBridge({ config = {}, fire, presets, getThrows, agentCtxGet, ...options } = {}) {
-  const fake = fakeContext({ agentPresets: presets, getThrows, agentCtxGet })
+function makeBridge({ config = {}, fire, presets, getThrows, agentCtxGet, sessionQuery, ...options } = {}) {
+  const fake = fakeContext({ agentPresets: presets, getThrows, agentCtxGet, sessionQuery })
   const events = []
   let idCounter = 0
   const bridge = new DshBridge({
@@ -1721,6 +1734,115 @@ test('会话标题：真实标题同名时确定性追加 #2/#3，非同名标�
 })
 
 
+// ---------------------------------------------------------------------------
+// 会话列表：按最近聊天排序 + 隐藏未使用空会话（listEvents 折叠 / 缓存 / 降级）
+// ---------------------------------------------------------------------------
+
+/**
+ * 带事件日志的 sessionQuery 假实现：`listEvents` 按 id 返回给定记录，并把
+ * 调用顺序记在 `calls` 里（缓存用例据此断言「第二次不再读日志」）。
+ * @param {Array<any>} records listSessions() 的返回值
+ * @param {Record<string, Array<any>>} eventsById sessionId → listEvents() 记录
+ * @param {{ failIds?: string[], readTitles?: (ids: string[]) => Array<any> }} [options]
+ */
+function sessionMetaQuery(records, eventsById, options = {}) {
+  const calls = []
+  const failIds = new Set(options.failIds ?? [])
+  const readTitles = options.readTitles
+    ?? (ids => ids.map(id => ({ sessionId: id, status: 'rejected', reason: 'no title' })))
+  return {
+    calls,
+    listSessions: async () => records,
+    listEvents: async sessionId => {
+      calls.push(sessionId)
+      if (failIds.has(sessionId)) throw new Error(`读不到 ${sessionId} 的会话日志`)
+      return eventsById[sessionId] ?? []
+    },
+    readTitleSnapshots: async ids => readTitles(ids),
+  }
+}
+
+/** 一条 DSH 事件（折叠只看 type/time；time 用毫秒时间戳）。 */
+function chatEvent(type, time, seq = 1) {
+  return { sessionId: 'ignored', seq, type, time, surface: 'test' }
+}
+
+test('会话列表：按最近一次聊天时间倒序，而不是创建时间', async () => {
+  const records = [
+    { header: { id: 'sess-new', createdAt: 3, cwd: '/work/a' } },
+    { header: { id: 'sess-mid', createdAt: 2, cwd: '/work/b' } },
+    { header: { id: 'sess-old', createdAt: 1, cwd: '/work/c' } },
+  ]
+  const { bridge } = makeBridge({
+    sessionQuery: sessionMetaQuery(records, {
+      'sess-new': [chatEvent('turn/start', 3, 1), chatEvent('assistant/message', 9, 2)],
+      'sess-mid': [chatEvent('turn/start', 2, 1), chatEvent('assistant/message', 20, 2)],
+      'sess-old': [chatEvent('turn/start', 1, 1), chatEvent('user/message', 4, 2)],
+    }),
+  })
+  const { sessions } = await bridge.listSessions()
+  // createdAt 顺序是 new → mid → old，最近聊天时间把顺序整个翻过来。
+  assert.deepEqual(sessions.map(session => session.id), ['sess-mid', 'sess-new', 'sess-old'])
+  assert.deepEqual(sessions.map(session => session.updatedAt), [20, 9, 4])
+})
+
+test('会话列表：没有 turn/start 也没有 user/message 的空会话被隐藏', async () => {
+  const logs = []
+  const records = [
+    { header: { id: 'sess-used', createdAt: 2, cwd: '/work/a' } },
+    { header: { id: 'sess-blank', createdAt: 9, cwd: '/work/b' } },
+  ]
+  const { bridge } = makeBridge({
+    log: line => logs.push(line),
+    sessionQuery: sessionMetaQuery(records, {
+      'sess-used': [chatEvent('turn/start', 2, 1), chatEvent('assistant/message', 2, 2)],
+      // 打开过（有事件），但没有任何回合：正是用户要藏掉的空会话。
+      'sess-blank': [chatEvent('session/created', 9, 1)],
+    }),
+  })
+  const { sessions } = await bridge.listSessions()
+  assert.deepEqual(sessions.map(session => session.id), ['sess-used'])
+  // 只打一行汇总日志，不逐会话打。
+  assert.deepEqual(logs.filter(line => /会话列表/.test(line)), [
+    'bridge: 会话列表 2→1（隐藏 1 个未使用会话）',
+  ])
+})
+
+test('会话列表：listEvents 读失败时该会话仍显示，按 createdAt 兜底排序', async () => {
+  const records = [
+    { header: { id: 'sess-a', createdAt: 2, cwd: '/work/a' } },
+    { header: { id: 'sess-b', createdAt: 9, cwd: '/work/b' } },
+  ]
+  const { bridge } = makeBridge({
+    sessionQuery: sessionMetaQuery(
+      records,
+      { 'sess-a': [chatEvent('turn/start', 2, 1), chatEvent('assistant/message', 20, 2)] },
+      { failIds: ['sess-b'] },
+    ),
+  })
+  const { sessions } = await bridge.listSessions() // 读日志失败不许抛
+  // 读失败的 sess-b 不能被当成空会话藏掉，排序退回它自己的 createdAt。
+  assert.deepEqual(sessions.map(session => session.id), ['sess-a', 'sess-b'])
+  assert.deepEqual(sessions.map(session => session.updatedAt), [20, 9])
+})
+
+test('会话列表：30 秒内重复调用命中缓存，不再读事件日志', async () => {
+  const records = [
+    { header: { id: 'sess-a', createdAt: 2, cwd: '/work/a' } },
+    { header: { id: 'sess-b', createdAt: 1, cwd: '/work/b' } },
+  ]
+  const query = sessionMetaQuery(records, {
+    'sess-a': [chatEvent('turn/start', 2, 1), chatEvent('assistant/message', 5, 2)],
+    'sess-b': [chatEvent('turn/start', 1, 1)],
+  })
+  const { bridge } = makeBridge({ sessionQuery: query })
+  const first = await bridge.listSessions()
+  assert.deepEqual(query.calls, ['sess-a', 'sess-b'])
+  const second = await bridge.listSessions()
+  assert.deepEqual(query.calls, ['sess-a', 'sess-b'], '第二次必须全部命中缓存')
+  assert.deepEqual(second.sessions.map(session => session.id), first.sessions.map(session => session.id))
+})
+
 test('历史快照把手机消息映射回本地 msgId，并剥掉附件提示', async () => {
   const { bridge, fake } = makeBridge()
   bridge.phoneMessageIds.set('m_phone', 'pm-1')
@@ -1755,4 +1877,25 @@ test('stripPhoneAttachmentNotice：纯文本不变 / 剥离注入段 / 只有附
   assert.equal(stripPhoneAttachmentNotice('你好'), '你好')
   assert.equal(stripPhoneAttachmentNotice('看这个\n\n用户通过手机发来了 1 个附件，已保存到电脑上：…'), '看这个')
   assert.equal(stripPhoneAttachmentNotice('用户通过手机发来了 1 个附件，已保存到电脑上：…'), '（来自手机的附件）')
+})
+
+test('会话有新事件会立刻让 meta 缓存失效（列表排序不滞后）', async () => {
+  const records = [{ header: { id: 'sess_a', createdAt: 1, cwd: '/work/a' } }]
+  let calls = 0
+  const query = sessionMetaQuery(records, {})
+  query.listEvents = async () => {
+    calls += 1
+    return [chatEvent('user/message', Date.parse('2026-11-11T10:00:00Z'), 1)]
+  }
+  const { bridge, fake } = makeBridge({ sessionQuery: query })
+  const first = await bridge.listSessions()
+  assert.equal(first.sessions.length, 1)
+  assert.equal(calls, 1)
+  // 没有新事件：命中 30s 缓存，不重复读日志。
+  await bridge.listSessions()
+  assert.equal(calls, 1, '无事件时命中缓存')
+  // 该会话来了任意事件（桌面发消息 / 手机发消息 / turn 开始）：缓存立刻失效。
+  fake.fire({ id: 'sess_a' }, { type: 'turn/start', seq: 2 })
+  await bridge.listSessions()
+  assert.equal(calls, 2, '会话事件必须让该会话的 meta 缓存失效')
 })

@@ -52,6 +52,24 @@ const RECENT_RESOLUTION_LIMIT = 20
 const SESSION_TITLE_MAX_LENGTH = 80
 
 /**
+ * 会话列表附加元信息（最近聊天时间 / 是否空会话）的缓存时长。
+ *
+ * DSH 的 `listSessions()` 只给 `createdAt`，手机「全部会话」却要按最近聊天排序、
+ * 并隐藏从未用过的空会话；这两项只能读事件日志折叠。手机每次刷新列表都会问一次，
+ * 13 个会话 ≈ 13 次日志读取，所以折叠结果缓存 30 秒。
+ */
+const SESSION_META_TTL_MS = 30_000
+
+/** 折叠会话元信息时的并发上限（每个会话一次日志读取，别把宿主的 IO 打满）。 */
+const SESSION_META_CONCURRENCY = 4
+
+/** 最多为多少个会话折叠元信息：大目录时不为几百个历史会话各读一次日志。 */
+const SESSION_META_FOLD_LIMIT = 60
+
+/** 元信息缓存超过这个条目数时清理过期项（避免长时间运行后无限增长）。 */
+const SESSION_META_CACHE_MAX = 200
+
+/**
  * 已实测「signal 代理能关掉桌面弹窗」的 DSH 版本白名单。
  *
  * 手机作答后自动关闭桌面原生弹窗，靠的是把审批请求的 `req.signal` 换成我们自己的
@@ -307,6 +325,12 @@ export class DshBridge {
     this.ownedAgents = new WeakSet()
     /** fileId → { name, size, mime, path, deviceId } */
     this.files = new Map()
+    /**
+     * sessionId → {updatedAt, blank, fetchedAt}：手机会话列表用的「最近聊天时间」
+     * 与「空会话」折叠结果（DSH 的 listSessions() 不提供这两项）。
+     * @type {Map<string, {updatedAt: number, blank: boolean, fetchedAt: number}>}
+     */
+    this.sessionMetaCache = new Map()
     /** `${deviceId}\u0000${callId}` → 进行中的回合 */
     this.calls = new Map()
     /** 已受理过的 (deviceId, callId)：网关幂等表之后的第二道防线。 */
@@ -424,6 +448,7 @@ export class DshBridge {
     this.seenCalls.clear()
     this.pendingCalls.clear()
     this.turnCalls.clear()
+    this.sessionMetaCache.clear()
     await Promise.all(disposals)
   }
 
@@ -440,8 +465,14 @@ export class DshBridge {
    * 手机端的会话选择器：列出电脑上的 DSH 会话。
    *
    * 只看根会话（`header.parentSession === undefined`），subagent 会话不给人选。
-   * 标题走 `readTitleSnapshots()`，拿不到时用 cwd 最后一段或「新会话」；按
-   * `createdAt` 倒序，截断到 `SESSION_LIST_LIMIT`。
+   * 标题走 `readTitleSnapshots()`，拿不到时用 cwd 最后一段或「新会话」。
+   *
+   * DSH 的 `listSessions()` 只按 `createdAt` 给记录、没有 `updatedAt`，而手机
+   * 「全部会话」要按最近一次聊天排序，并隐藏「打开过但从未用过」的空会话。所以
+   * 这里再折叠一层事件日志（`listEvents`）：`updatedAt` = 最后一条 user/assistant
+   * 消息的 time，`blank` = 没有 turn/start 也没有 user/message。折叠带 30 秒缓存，
+   * 只为前 `SESSION_META_FOLD_LIMIT` 个会话读日志（防大目录），单个会话读失败时
+   * 按 createdAt 显示、不隐藏。截断按过滤后的总数判断。
    * @returns {Promise<{sessions: Array<object>, truncated: boolean}>}
    */
   async listSessions() {
@@ -457,11 +488,25 @@ export class DshBridge {
       this.log(`bridge: 列出会话失败：${/** @type {Error} */ (error).message}`)
       return { sessions: [], truncated: false }
     }
+    // 仍先按 createdAt 初排：只折叠前 N 个会话的日志，顺序必须稳定可预期。
     const roots = (Array.isArray(records) ? records : [])
       .filter(record => record?.header && record.header.parentSession === undefined)
       .sort((a, b) => (Number(b.header.createdAt) || 0) - (Number(a.header.createdAt) || 0))
-    const truncated = roots.length > SESSION_LIST_LIMIT
-    const limited = roots.slice(0, SESSION_LIST_LIMIT)
+    const meta = await this.#sessionMeta(
+      roots.slice(0, SESSION_META_FOLD_LIMIT).map(record => record.header.id),
+    )
+    // 空会话（没有 turn/start 也没有 user/message）不展示：用户要隐藏「打开过但
+    // 从未用过」的新会话。读不到元信息的会话不算 blank——宁可多显示也别误藏。
+    const visible = roots.filter(record => meta.get(record.header.id)?.blank !== true)
+    const hidden = roots.length - visible.length
+    // 按最近一次聊天时间倒序；没有消息或读失败时退回 createdAt（updatedAt=0）。
+    const updatedAtOf = record => Number(meta.get(record.header.id)?.updatedAt)
+      || Number(record.header.createdAt)
+      || 0
+    visible.sort((a, b) => updatedAtOf(b) - updatedAtOf(a)
+      || (Number(b.header.createdAt) || 0) - (Number(a.header.createdAt) || 0))
+    const truncated = visible.length > SESSION_LIST_LIMIT
+    const limited = visible.slice(0, SESSION_LIST_LIMIT)
 
     const titles = await this.#titles(limited.map(record => record.header.id))
     // 没有真实标题的会话按 cwd 兜底：同一个 cwd 下有多个时全部补 id 后缀，
@@ -483,9 +528,15 @@ export class DshBridge {
           ?? this.#titleFallback(header, { distinct: (fallbackCounts.get(fallback) ?? 0) > 1 }),
         ...(typeof header.cwd === 'string' && header.cwd !== '' ? { cwd: header.cwd } : {}),
         createdAt: Number(header.createdAt) || 0,
+        // 手机端按这个时间显示「最近聊天」；读不到事件日志时退回创建时间。
+        updatedAt: updatedAtOf(record),
         live,
       }
     })
+    if (roots.length > 0) {
+      // 只打一行汇总，不逐会话打（手机每次刷新列表都会走到这里）。
+      this.log(`bridge: 会话列表 ${roots.length}→${visible.length}（隐藏 ${hidden} 个未使用会话）`)
+    }
     // 真实标题也可能撞名（DSH 自动标题是内容摘要）：确定性去重，后出现的加 #2/#3。
     return { sessions: this.#dedupeSessionTitles(sessions), truncated }
   }
@@ -1492,7 +1543,7 @@ export class DshBridge {
   /**
    * 会话标题确定性去重：完全同名的第 2、3 个追加 `#2`、`#3`。
    *
-   * 只用「打开顺序」（listSessions 已按 createdAt 倒序）决定序号，不依赖
+   * 只用「展示顺序」（listSessions 已按最近聊天时间倒序）决定序号，不依赖
    * 随机数或 Map/Set 遍历顺序；同一份输入多次调用结果一致。返回新数组、不改
    * 入参，避免调用方复用时被污染。
    * @param {Array<{id: string, title: string}>} sessions
@@ -1516,6 +1567,107 @@ export class DshBridge {
       used.add(title)
       return title === session.title ? session : { ...session, title }
     })
+  }
+
+  /**
+   * 折叠一组会话的事件日志，得到手机列表需要的 `updatedAt` / `blank`。
+   *
+   * 命中 `sessionMetaCache` 且未过期的直接复用；缺失的按
+   * `SESSION_META_CONCURRENCY` 并发补齐，单个会话失败时静默降级为
+   * `{updatedAt: 0, blank: false}`（列表按 createdAt 显示、绝不隐藏真实会话）。
+   * 缓存只为「最近可能刷新列表」的会话服务，超过上限时先清过期项。
+   * @param {string[]} sessionIds
+   * @returns {Promise<Map<string, {updatedAt: number, blank: boolean, fetchedAt: number}>>}
+   */
+  async #sessionMeta(sessionIds) {
+    const now = this.now()
+    /** @type {Map<string, {updatedAt: number, blank: boolean, fetchedAt: number}>} */
+    const metas = new Map()
+    /** @type {string[]} */
+    const pending = []
+    for (const sessionId of sessionIds) {
+      const cached = this.sessionMetaCache.get(sessionId)
+      if (cached && now - cached.fetchedAt < SESSION_META_TTL_MS) {
+        metas.set(sessionId, cached)
+      } else {
+        pending.push(sessionId)
+      }
+    }
+    // 简单 worker 池：cursor 在 await 之前自增，单线程下不会重复领取。
+    let cursor = 0
+    const workers = []
+    const workerCount = Math.min(SESSION_META_CONCURRENCY, pending.length)
+    for (let index = 0; index < workerCount; index += 1) {
+      workers.push((async () => {
+        while (cursor < pending.length) {
+          const sessionId = pending[cursor]
+          cursor += 1
+          const entry = await this.#foldSessionMeta(sessionId)
+          this.sessionMetaCache.set(sessionId, entry)
+          metas.set(sessionId, entry)
+        }
+      })())
+    }
+    await Promise.all(workers)
+    if (this.sessionMetaCache.size > SESSION_META_CACHE_MAX) {
+      for (const [sessionId, entry] of this.sessionMetaCache) {
+        if (now - entry.fetchedAt >= SESSION_META_TTL_MS) this.sessionMetaCache.delete(sessionId)
+      }
+    }
+    return metas
+  }
+
+  /**
+   * 读一个会话的事件日志并折叠成手机列表元信息。
+   *
+   * - `updatedAt` = 最后一条 `user/message` 或 `assistant/message` 的 time；
+   *   没有消息时退回最后一条事件的 time，都没有则 0（调用方用 createdAt 兜底）。
+   * - `blank` = 没有 `turn/start` 且没有 `user/message`（DSH「空会话」语义）。
+   * 宿主没有 `listEvents` 时退回 `readSession(id).events`；任何读取/形状异常都
+   * 返回「不隐藏、按 createdAt 排序」的兜底值，绝不抛。
+   * @param {string} sessionId
+   * @returns {Promise<{updatedAt: number, blank: boolean, fetchedAt: number}>}
+   */
+  async #foldSessionMeta(sessionId) {
+    const fetchedAt = this.now()
+    const fallback = { updatedAt: 0, blank: false, fetchedAt }
+    const query = this.#sessionQuery()
+    let events
+    try {
+      if (typeof query?.listEvents === 'function') {
+        events = await query.listEvents(sessionId)
+      } else if (typeof query?.readSession === 'function') {
+        const result = await query.readSession(sessionId)
+        events = result?.events
+      } else {
+        return fallback
+      }
+    } catch {
+      return fallback // 单个会话读失败：照常显示，按 createdAt 排序
+    }
+    if (!Array.isArray(events)) return fallback
+    let messageTime = 0
+    let lastEventTime = 0
+    let hasTurn = false
+    let hasUserMessage = false
+    for (const event of events) {
+      const type = typeof event?.type === 'string' ? event.type : ''
+      const time = Number(event?.time)
+      if (Number.isFinite(time) && time > lastEventTime) lastEventTime = time
+      if (type === 'turn/start') {
+        hasTurn = true
+      } else if (type === 'user/message') {
+        hasUserMessage = true
+        if (Number.isFinite(time) && time > messageTime) messageTime = time
+      } else if (type === 'assistant/message') {
+        if (Number.isFinite(time) && time > messageTime) messageTime = time
+      }
+    }
+    return {
+      updatedAt: messageTime > 0 ? messageTime : lastEventTime,
+      blank: !hasTurn && !hasUserMessage,
+      fetchedAt,
+    }
   }
 
   /**
@@ -1858,6 +2010,9 @@ export class DshBridge {
   #onSessionEvent(session, event) {
     const sessionId = this.#sessionIdOf(session)
     if (!sessionId) return
+    // 任何会话活动都让「最近聊天时间/空会话」缓存立即过期：否则用户在手机发完消息
+    // 马上打开「全部会话」，列表最多 30 秒还是旧的排序。
+    this.sessionMetaCache.delete(sessionId)
     // 只有本插件创建/接管的会话才处理：桌面上的其它会话不能把内容推给手机。
     if (!this.agents.has(sessionId)) return
 
