@@ -400,3 +400,24 @@ test('关掉的会话在刷新后也不再复活（墓碑随标签一起持久�
   restored.openTab('sess_a', { activate: false })
   assert.deepEqual(restored.tabs, ['sess_b', 'sess_a'])
 })
+
+test('草稿会话换成真实 id：原地替换并保留聊天缓存与当前标签', () => {
+  const store = makeStore()
+  store.openTab('draft:new1', { activate: true })
+  const chat = store.chatFor('draft:new1')
+  const result = store.replaceSessionId('draft:new1', 'sess_real')
+  assert.equal(result.ok, true)
+  assert.deepEqual(store.tabs, ['sess_real'])
+  assert.equal(store.activeSessionId, 'sess_real')
+  assert.equal(store.chatFor('sess_real'), chat, '聊天缓存要搬到真实 id')
+})
+
+test('草稿换成真实 id：真实标签已存在时合并，不留两个标签', () => {
+  const store = makeStore()
+  store.openTab('sess_real', { activate: false })
+  store.openTab('draft:new1', { activate: true })
+  const result = store.replaceSessionId('draft:new1', 'sess_real')
+  assert.equal(result.ok, true)
+  assert.deepEqual(store.tabs, ['sess_real'])
+  assert.equal(store.activeSessionId, 'sess_real')
+})

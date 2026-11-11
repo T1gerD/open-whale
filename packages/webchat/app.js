@@ -172,6 +172,8 @@ const state = {
   sessionListLoading: false,
   /** 正在等电脑端确认的会话操作：{reason:'switch'|'create', sessionId?}。 */
   pendingSelect: null,
+  /** 草稿会话等 session/create 的结果（真正确认后才发送第一条消息）。 */
+  pendingDraftCreate: null,
   /** 已发出但还没回的 session/snapshot（rid → sessionId）。 */
   pendingSnapshots: new Map(),
   /** 审批倒计时定时器（有带 expiresAt 的待办审批时才跑）。 */
@@ -389,6 +391,35 @@ function persistSoon(delay = 700) {
   }, delay)
 }
 
+/** 本地草稿会话 id 前缀：只活在页面里，发第一条消息时才变成电脑端会话。 */
+const DRAFT_SESSION_PREFIX = 'draft:'
+
+/** @param {string} sessionId */
+function isDraftSessionId(sessionId) {
+  return String(sessionId ?? '').startsWith(DRAFT_SESSION_PREFIX)
+}
+
+/** 生成一个草稿会话 id。 */
+function newDraftSessionId() {
+  return `${DRAFT_SESSION_PREFIX}${uid("new")}`
+}
+
+/**
+ * 可落盘的标签快照：草稿会话从未在电脑端创建，刷新后应该直接消失（用户反馈：
+ * 打开过但没使用的新开会话一直被保留）。关闭墓碑也一并过滤。
+ */
+function persistableTabsSnapshot() {
+  const snapshot = state.model.snapshotTabs()
+  const tabs = snapshot.tabs.filter(id => !isDraftSessionId(id))
+  const closedSessions = (snapshot.closedSessions ?? []).filter(id => !isDraftSessionId(id))
+  return {
+    ...snapshot,
+    tabs,
+    activeSessionId: tabs.includes(snapshot.activeSessionId) ? snapshot.activeSessionId : tabs[0] ?? '',
+    closedSessions,
+  }
+}
+
 /**
  * 标签 / 当前会话变了就立刻落盘：刷新后要能回到同一组标签，不能等 700ms
  * （手机上切后台可能立刻冻结 JS）。
@@ -396,7 +427,7 @@ function persistSoon(delay = 700) {
 function persistTabsNow() {
   if (!state.identity || !state.model) return
   try {
-    storage.saveTabs(state.identity.deviceId, state.model.snapshotTabs())
+    storage.saveTabs(state.identity.deviceId, persistableTabsSnapshot())
   } catch {
     /* 存储满/隐私模式：不阻塞聊天 */
   }
@@ -407,7 +438,7 @@ function persistNow() {
   try {
     const snapshot = state.model.snapshotActiveChat({ limit: 200 })
     if (snapshot) storage.saveConversation(state.identity.deviceId, snapshot)
-    storage.saveTabs(state.identity.deviceId, state.model.snapshotTabs())
+    storage.saveTabs(state.identity.deviceId, persistableTabsSnapshot())
     storage.saveOutbox(
       state.identity.deviceId,
       state.outbox.map(entry => ({
@@ -702,7 +733,12 @@ function startSession(options = {}) {
   // 先恢复标签列表与当前标签，再把上次缓存的当前会话内容塞回去：
   // 刷新后立刻有内容，随后由 hello/ack 与 session/state 对账。
   const savedTabs = storage.loadTabs(state.identity.deviceId)
-  if (savedTabs.tabs.length > 0) state.model.restoreTabs(savedTabs)
+  const restoredTabs = {
+    ...savedTabs,
+    tabs: savedTabs.tabs.filter(id => !isDraftSessionId(id)),
+    closedSessions: (savedTabs.closedSessions ?? []).filter(id => !isDraftSessionId(id)),
+  }
+  if (restoredTabs.tabs.length > 0) state.model.restoreTabs(restoredTabs)
   const savedConversation = storage.loadConversation(state.identity.deviceId)
   if (savedConversation) state.model.restoreActiveChat(savedConversation)
 
@@ -1062,7 +1098,9 @@ function schedulePendingSelectTimeout(pending) {
 /** 订阅后台标签（当前标签电脑端本来就会推，不用列进去）。 */
 function sendTabWatch() {
   if (!tabsSupported() || !state.connection?.online) return
-  const frame = buildWatchFrame(state.model?.watchList() ?? [])
+  // 草稿会话在电脑端不存在，不能出现在 watch 列表里。
+  const ids = (state.model?.watchList() ?? []).filter(id => !isDraftSessionId(id))
+  const frame = buildWatchFrame(ids)
   state.connection.send(frame)
 }
 
@@ -1073,7 +1111,7 @@ function sendTabWatch() {
 function requestTabSnapshot(sessionId) {
   if (!tabsSupported() || !state.connection?.online) return false
   const id = String(sessionId ?? '')
-  if (id === '') return false
+  if (id === '' || isDraftSessionId(id)) return false
   const rid = uid('snap')
   state.pendingSnapshots.set(rid, id)
   // 防止长时间收不到回复时 Map 无限增长。
@@ -1087,7 +1125,9 @@ function requestTabSnapshot(sessionId) {
 /** 重连 / 打开后给每个标签各要一份快照。 */
 function requestTabSnapshots() {
   if (!tabsSupported()) return
-  for (const id of state.model?.tabs ?? []) requestTabSnapshot(id)
+  for (const id of state.model?.tabs ?? []) {
+    if (!isDraftSessionId(id)) requestTabSnapshot(id)
+  }
 }
 
 /** 打开会话面板时拉一次列表。 */
@@ -1125,6 +1165,11 @@ function afterTabChange(options = {}) {
   sendTabWatch()
   const activeId = state.model?.activeSessionId ?? ''
   if (activeId === '') return
+  // 草稿会话还没在电脑端创建：不要 select / 取快照，等第一条消息时再创建。
+  if (isDraftSessionId(activeId)) {
+    flushOutbox()
+    return
+  }
   if (select && sessionsSupported()) sendSelect(activeId)
   // 点标签先渲染本地缓存，再让电脑端补一份快照对账：缓存可能来自上一次会话
   // （页面在后台被冻结、socket 半死），快照是权威的。后台标签已经订阅过，允许取。
@@ -1177,7 +1222,10 @@ function closeTab(sessionId) {
   afterTabChange({ select: result.activeSessionId !== before })
 }
 
-/** 新建会话：电脑端返回新 id 后再开标签并激活。 */
+/**
+ * 新建会话：只在本地开一个草稿标签，**不**立刻让电脑端建会话。
+ * 用户真发了第一条消息才 session/create（避免“打开过没用过”的空会话留在列表里）。
+ */
 function createSession() {
   if (!sessionsSupported()) {
     showToast('电脑端版本较旧，不支持新建会话；请升级电脑端插件', 'error', 4600)
@@ -1187,12 +1235,53 @@ function createSession() {
     showToast('还没连上电脑，暂时不能新建会话', 'error')
     return
   }
-  const rid = uid('sess')
-  const pending = { reason: 'create', rid }
-  state.pendingSelect = pending
-  schedulePendingSelectTimeout(pending)
-  state.connection.send({ t: CLIENT_FRAME.SESSION_CREATE, rid })
+  // 已经有一个空草稿：直接切过去，避免连点堆出多个。
+  const existingDraft = state.model?.tabs.find(id => isDraftSessionId(id))
+  if (existingDraft) {
+    switchTab(existingDraft)
+    closeSessionSheet()
+    return
+  }
+  const draft = newDraftSessionId()
+  const result = state.model?.openTab(draft, { activate: true })
+  if (!result?.ok) {
+    if (result?.reason === 'limit') showToast(`最多同时打开 ${TAB_LIMIT} 个会话，先关掉一个标签再试`, 'error', 4200)
+    return
+  }
+  const chat = state.model.chatFor(draft)
+  if (chat) chat.sessionTitle = '新会话'
+  closeSessionSheet()
+  afterTabChange({ select: false })
   if (state.sessionSheetOpen) renderSessionSheet()
+}
+
+/**
+ * 草稿标签第一次发消息前，先让电脑端创建会话并换回真实 id。
+ * @param {string} draftId
+ * @returns {Promise<string>} 真实 sessionId；失败/超时返回空串
+ */
+function createSessionForDraft(draftId) {
+  return new Promise(resolve => {
+    if (!state.connection?.online) {
+      resolve('')
+      return
+    }
+    const rid = uid('sess')
+    const pending = { draftId, rid, resolve, timer: null }
+    state.pendingDraftCreate = pending
+    pending.timer = setTimeout(() => {
+      if (state.pendingDraftCreate !== pending) return
+      state.pendingDraftCreate = null
+      showToast('新建会话超时，请重试', 'error', 3600)
+      resolve('')
+    }, 15000)
+    const sent = state.connection.send({ t: CLIENT_FRAME.SESSION_CREATE, rid })
+    if (!sent) {
+      clearTimeout(pending.timer)
+      state.pendingDraftCreate = null
+      resolve('')
+    }
+  })
 }
 
 function openSessionSheet() {
@@ -1366,6 +1455,26 @@ function handleSessionSelected(frame) {
   const selection = state.model?.lastSessionSelection
   const pending = state.pendingSelect
   const frameRid = typeof frame?.rid === 'string' ? frame.rid : ''
+  // 草稿会话的创建结果：把本地 draft: 标签换成真实 id，再让等待中的消息发出去。
+  const draftPending = state.pendingDraftCreate
+  if (draftPending && frameRid === draftPending.rid) {
+    state.pendingDraftCreate = null
+    if (draftPending.timer) clearTimeout(draftPending.timer)
+    if (selection?.ok && selection.sessionId) {
+      state.model.replaceSessionId(draftPending.draftId, selection.sessionId)
+      if (!state.model.tabs.includes(selection.sessionId)) state.model.openTab(selection.sessionId, { activate: true })
+      if (state.model.activeSessionId !== selection.sessionId) state.model.activateTab(selection.sessionId)
+      afterTabChange({ select: false })
+      requestSessionList({ force: true, quiet: true })
+      draftPending.resolve(selection.sessionId)
+      flushOutbox()
+      persistTabsNow()
+    } else {
+      showToast(selection?.message || selection?.error || '新建会话失败', 'error', 4600)
+      draftPending.resolve('')
+    }
+    return
+  }
   const stale = pending && pending.rid !== undefined && frameRid !== '' && pending.rid !== frameRid
   if (stale) {
     if (selection?.ok && selection.sessionId) state.model.openTab(selection.sessionId, { activate: false })
@@ -2232,6 +2341,10 @@ function flushOutbox() {
   // 会在刷新/重连后变成永远「发送中」的孤儿消息。
   // 只发当前标签的消息：别的标签的排队消息等切回去再发，绝不能投到错的会话里。
   const active = state.model?.activeSessionId ?? ''
+  // 草稿会话从未创建成功：残留的队列项直接丢掉，不能往不存在的会话发。
+  if (state.outbox.some(entry => isDraftSessionId(entry.sessionId))) {
+    state.outbox = state.outbox.filter(entry => !isDraftSessionId(entry.sessionId))
+  }
   for (const entry of state.outbox) {
     const target = entry.sessionId || active
     if (!canSendTo(target)) continue
@@ -2286,6 +2399,10 @@ async function deliverMessage(text, attachments) {
   state.sending = true
   renderComposerState()
   try {
+    if (isDraftSessionId(state.model.activeSessionId) && !state.connection?.online) {
+      showToast('还没连上电脑，暂时不能新建会话', 'error', 3600)
+      return
+    }
     /** @type {any[]} */
     const files = []
     for (const attachment of attachments) {
@@ -2310,7 +2427,16 @@ async function deliverMessage(text, attachments) {
     }
 
     const msgId = uid('m')
-    const targetSessionId = state.model.activeSessionId
+    let targetSessionId = state.model.activeSessionId
+    if (isDraftSessionId(targetSessionId)) {
+      // 草稿标签：先把会话真正建出来，再把标签换成真实 id，消息必须发到真实会话里。
+      const created = await createSessionForDraft(targetSessionId)
+      if (created === '') {
+        showToast('新建会话失败，消息还没发出去', 'error', 4200)
+        return
+      }
+      targetSessionId = created
+    }
     state.model.addLocalUserMessage(
       {
         msgId,

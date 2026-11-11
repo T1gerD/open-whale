@@ -1980,6 +1980,50 @@ export class ChatTabsModel {
   }
 
   /**
+   * 把本地草稿标签（draft:…）换成电脑端刚创建出来的真实会话 id。
+   * `session/selected` 到达时模型可能已经把真实 id 自动开成了标签，所以这里要合并：
+   * 真实 id 已存在就丢掉草稿标签，否则原地替换（聊天缓存、活动状态、当前标签一起搬）。
+   * @param {string} fromSessionId 本地草稿 id
+   * @param {string} toSessionId 电脑端真实 id
+   * @returns {{ok: boolean, changed: boolean, activeSessionId: string}}
+   */
+  replaceSessionId(fromSessionId, toSessionId) {
+    const from = String(fromSessionId ?? '')
+    const to = String(toSessionId ?? '')
+    if (from === '' || to === '' || from === to) {
+      return { ok: false, changed: false, activeSessionId: this.activeSessionId }
+    }
+    const index = this.tabs.indexOf(from)
+    if (index < 0) return { ok: false, changed: false, activeSessionId: this.activeSessionId }
+    if (this.tabs.includes(to)) {
+      // 真实标签已经开出来了：丢掉草稿，把焦点交给真实标签。
+      this.tabs.splice(index, 1)
+      this.#forgetChat(from)
+      if (this.activeSessionId === from) {
+        this.activeSessionId = to
+        this.#activityFor(to).unread = 0
+      }
+    } else {
+      this.tabs[index] = to
+      const chat = this.chats.get(from)
+      if (chat) {
+        this.chats.delete(from)
+        chat.sessionId = to
+        this.chats.set(to, chat)
+      }
+      const activity = this.activity.get(from)
+      if (activity) {
+        this.activity.delete(from)
+        this.activity.set(to, activity)
+      }
+      if (this.activeSessionId === from) this.activeSessionId = to
+    }
+    this.closedSessions.delete(to)
+    this.#touch()
+    return { ok: true, changed: true, activeSessionId: this.activeSessionId }
+  }
+
+  /**
    * 关闭本地标签。关掉当前标签时切到相邻标签（并告诉调用方需要 select 它）。
    * 不会通知电脑端，也不会停止那个会话里的 agent。
    * @param {string} sessionId
