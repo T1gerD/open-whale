@@ -1534,6 +1534,27 @@ test('a late joiner sees the in-flight assistant turn in the snapshot', async t 
   two.client.close()
 })
 
+test('a late joiner sees an in-flight turn that has only typing/tools (no text yet)', async t => {
+  const { gateway, port } = await makeGateway()
+  t.after(() => gateway.close())
+  const device = freshDevice()
+  const sync = [CAPABILITIES.SESSION_SYNC]
+  const one = await pairDevice(port, device, { capabilities: sync })
+  const sessionId = one.ack.sessionId
+  assert.ok(await one.client.waitFor(f => f.t === 'session/state'))
+
+  // 桌面回合刚开始、还在跑工具：只有 typing/tool，没有任何 assistant 正文。
+  gateway.pushEvent({ kind: 'typing', sessionId, deviceId: '', callId: 'desk_1', active: true })
+  gateway.pushEvent({ kind: 'tool', sessionId, deviceId: '', callId: 'desk_1', phase: 'tool-start', toolCallId: 't1', tool: 'ops_bash', summary: '跑命令' })
+  const two = await reconnectWith(port, device, { capabilities: sync, deviceName: '后来者2' })
+  const state = await two.client.waitFor(f => f.t === 'session/state')
+  assert.ok(state)
+  assert.equal(state.snapshot.activeCall?.callId, 'desk_1', '只有 typing/tool 的回合也必须出现在快照里')
+  assert.equal(state.snapshot.activeCall.typing, true)
+  one.client.close()
+  two.client.close()
+})
+
 test('typing and tool activity reach every socket of the device', async t => {
   const { gateway, port } = await makeGateway()
   t.after(() => gateway.close())

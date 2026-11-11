@@ -1853,6 +1853,12 @@ export class Gateway {
 
     switch (event.kind) {
       case 'typing': {
+        // 回合一开始就要登记 activeCall：桌面回合常常先跑一长串工具、还没有正文，
+        // 如果只靠 message/delta 登记，切标签/熄屏重连的快照里就没有 activeCall，
+        // 手机端会误判空闲，用户想排队发送的消息会被直接发进会话。
+        if (event.active !== false && String(event.callId ?? '') !== '') {
+          this.#trackActiveCall(conversationId, String(event.callId), '', 'inline')
+        }
         const frame = { t: SERVER_FRAME.TYPING, callId: event.callId, active: event.active !== false }
         return this.#broadcastToConversation(conversationId, frame) > 0
       }
@@ -1909,7 +1915,11 @@ export class Gateway {
         this.activeCalls.delete(conversationId)
         return this.#broadcastToConversation(conversationId, recorded) > 0
       }
-      case 'tool':
+      case 'tool': {
+        // 只有工具、没有正文的回合也要让后来者看到 activeCall（同 typing）。
+        if (String(event.callId ?? '') !== '') {
+          this.#trackActiveCall(conversationId, String(event.callId), '', 'inline')
+        }
         return this.#broadcastToConversation(conversationId, {
           t: SERVER_FRAME.TOOL,
           callId: event.callId,
@@ -1919,6 +1929,7 @@ export class Gateway {
           summary: event.summary,
           ok: event.ok,
         }) > 0
+      }
       case 'error': {
         const frame = {
           t: SERVER_FRAME.CHAT_ERROR,
