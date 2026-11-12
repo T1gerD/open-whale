@@ -18,8 +18,8 @@ import {
   UPLOAD_CHUNK_BYTES,
   WEBCHAT_VERSION,
   formatFingerprint,
-} from './lib/protocol.mjs?v=306'
-import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=306'
+} from './lib/protocol.mjs?v=307'
+import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=307'
 import {
   ENDPOINT_KIND_LABEL,
   baseOrigin,
@@ -27,14 +27,14 @@ import {
   mergeEndpointSources,
   normalizeManualEndpoint,
   orderCandidates,
-} from './lib/endpoints.mjs?v=306'
+} from './lib/endpoints.mjs?v=307'
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
   bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
-} from './lib/pairing.mjs?v=306'
+} from './lib/pairing.mjs?v=307'
 import {
   buildHello,
   createIdentity,
@@ -44,19 +44,19 @@ import {
   serializeIdentity,
   signHello,
   verifyHelloAckProof,
-} from './lib/keys.mjs?v=306'
-import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=306'
-import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=306'
-import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=306'
-import { createStorage, STORAGE_PREFIX } from './lib/storage.mjs?v=306'
+} from './lib/keys.mjs?v=307'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=307'
+import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=307'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=307'
+import { createStorage, STORAGE_PREFIX } from './lib/storage.mjs?v=307'
 import {
   AttachmentUploader,
   UPLOAD_TRANSPORT,
   chooseTransport,
   createBlobSliceReader,
   readBlobAsBase64,
-} from './lib/upload.mjs?v=306'
-import { createBrowserQrReader } from './lib/qr.mjs?v=306'
+} from './lib/upload.mjs?v=307'
+import { createBrowserQrReader } from './lib/qr.mjs?v=307'
 
 // ---------------------------------------------------------------------------
 // 环境与 DOM
@@ -88,6 +88,7 @@ const dom = {
   bindInput: document.getElementById('bind-input'),
   bindConnect: document.getElementById('bind-connect'),
   bindScanImage: document.getElementById('bind-scan-image'),
+  bindScanCamera: document.getElementById('bind-scan-camera'),
   bindConfirm: document.getElementById('bind-confirm'),
   bindCancel: document.getElementById('bind-cancel'),
   bindStatus: document.getElementById('bind-status'),
@@ -136,6 +137,7 @@ const dom = {
   installHintClose: document.getElementById('install-hint-close'),
   toastStack: document.getElementById('toast-stack'),
   qrFile: document.getElementById('qr-file'),
+  qrCamera: document.getElementById('qr-camera'),
   attachFile: document.getElementById('attach-file'),
   imageFile: document.getElementById('image-file'),
 }
@@ -789,6 +791,22 @@ function cancelRecognizedPayload() {
 // 连接生命周期
 // ---------------------------------------------------------------------------
 
+/**
+ * 本页是从哪个地址打开的。
+ *
+ * 这一条不该被忽略：页面能加载出来，就证明这个 origin 此刻是通的。手机用 Tailscale
+ * 地址打开网页版、而二维码里只写了局域网地址（电脑端连接方式被设成「局域网」）时，
+ * 少这一条就会「页面打得开、却连不上」。
+ * @returns {{url: string, kind: string} | undefined}
+ */
+function currentPageEndpoint() {
+  if (typeof window === 'undefined') return undefined
+  const { protocol, host, origin } = window.location
+  if (protocol !== 'http:' && protocol !== 'https:') return undefined
+  if (!host) return undefined
+  return { url: origin, kind: classifyEndpoint(origin) }
+}
+
 function computeCandidates() {
   const pairs = state.endpoints.map(item => ({ url: item.url, kind: item.kind }))
   for (const raw of state.settings.manualEndpoints) {
@@ -796,10 +814,18 @@ function computeCandidates() {
     if (url === '' || pairs.some(item => item.url === url)) continue
     pairs.push({ url, kind: classifyEndpoint(url) })
   }
-  return orderCandidates(pairs, {
+  const ordered = orderCandidates(pairs, {
     mode: state.settings.mode,
     preferred: state.settings.preferredEndpoint,
   })
+  const here = currentPageEndpoint()
+  if (!here || ordered.some(item => item.url === here.url)) return ordered
+  // `orderCandidates` 会按连接方式偏好过滤：电脑端连接方式设成「局域网」时，用
+  // Tailscale 地址打开的页面会被自己的模式挡在门外——页面既然是从这个地址加载出来
+  // 的，它就是通的，补回来（排在「上次连成功」之后、其它候选之前）。
+  const preferredIndex = ordered.findIndex(item => item.url === state.settings.preferredEndpoint)
+  ordered.splice(preferredIndex >= 0 ? preferredIndex + 1 : 0, 0, here)
+  return ordered
 }
 
 function emptyModeHint() {
@@ -3764,6 +3790,44 @@ function setupComposerEvents() {
   })
 }
 
+/**
+ * 相册选图 / 拍照 两条入口共用：识别 → 兑换短码 → 走绑定流程。
+ *
+ * 失败时把照片本身的信息（尺寸/大小/类型）一并说出来：真机上「没有找到二维码」
+ * 和「照片根本没解码出来」是两种完全不同的故障，用户报问题时带上这行就能定位。
+ * @param {File | undefined} file
+ */
+async function scanQrFile(file) {
+  if (!file) return
+  setBindStatus('正在识别图片里的二维码…', 'busy')
+  try {
+    const reader = createBrowserQrReader()
+    // 官方短码里没有载荷，只有 `?s=…`：认不出来时回同源兑换一次。
+    const result = await reader.scanFile(file, { resolveText: text => payloadFromScannedText(text) })
+    if (!result.ok) {
+      const meta = describePhoto(result.image)
+      console.debug('[openwhale] 二维码识别失败', result, meta)
+      setBindStatus(`${result.error}${meta}`, 'error')
+      return
+    }
+    setBindStatus(`已识别「${result.payload.host}」的绑定信息`, 'ok')
+    beginFromPayload(result.payload)
+  } catch (error) {
+    const meta = describePhoto({ bytes: file.size, type: file.type })
+    setBindStatus(`图片识别失败：${/** @type {Error} */ (error).message}${meta}`, 'error')
+  }
+}
+
+/** @param {{width?: number, height?: number, bytes?: number, type?: string} | undefined} image */
+function describePhoto(image) {
+  if (!image) return ''
+  const parts = []
+  if (Number.isFinite(image.width) && Number.isFinite(image.height)) parts.push(`${image.width}×${image.height}`)
+  if (Number.isFinite(image.bytes) && image.bytes > 0) parts.push(`${(image.bytes / 1024 / 1024).toFixed(1)} MB`)
+  if (image.type) parts.push(String(image.type))
+  return parts.length > 0 ? `（照片 ${parts.join(' · ')}）` : ''
+}
+
 function setupBindEvents() {
   dom.bindConnect.addEventListener('click', connectFromInput)
   dom.bindConfirm.addEventListener('click', () => {
@@ -3773,24 +3837,16 @@ function setupBindEvents() {
   })
   dom.bindCancel.addEventListener('click', cancelRecognizedPayload)
   dom.bindScanImage.addEventListener('click', () => dom.qrFile.click())
-  dom.qrFile.addEventListener('change', async () => {
+  dom.bindScanCamera?.addEventListener('click', () => dom.qrCamera?.click())
+  dom.qrFile.addEventListener('change', () => {
     const file = dom.qrFile.files?.[0]
     dom.qrFile.value = ''
-    if (!file) return
-    setBindStatus('正在识别图片里的二维码…', 'busy')
-    try {
-      const reader = createBrowserQrReader()
-      // 官方短码里没有载荷，只有 `?s=…`：认不出来时回同源兑换一次。
-      const result = await reader.scanFile(file, { resolveText: text => payloadFromScannedText(text) })
-      if (!result.ok) {
-        setBindStatus(result.error, 'error')
-        return
-      }
-      setBindStatus(`已识别「${result.payload.host}」的绑定信息`, 'ok')
-      beginFromPayload(result.payload)
-    } catch (error) {
-      setBindStatus(`图片识别失败：${/** @type {Error} */ (error).message}`, 'error')
-    }
+    scanQrFile(file)
+  })
+  dom.qrCamera?.addEventListener('change', () => {
+    const file = dom.qrCamera.files?.[0]
+    dom.qrCamera.value = ''
+    scanQrFile(file)
   })
   dom.bindInput.addEventListener('keydown', event => {
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) connectFromInput()

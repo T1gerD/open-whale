@@ -101,3 +101,12 @@ test('启动失败不能只留一句红条', () => {
   assert.match(app, /boot\(\)\.catch\(/, 'boot 必须 catch：否则启动阶段抛错只剩「页面出错」')
   assert.match(app, /页面没能完成启动/, '启动失败要把原因和补救方式写在绑定页上')
 })
+
+test('候选地址必须补上「当前页面来源」：用 Tailscale 地址打开页面就能连回去', () => {
+  assert.match(app, /function currentPageEndpoint\(/, '页面来源要单独算一个候选')
+  assert.match(app, /ordered\.splice\(/, '模式过滤把页面来源 dropp 掉时要补回来')
+  assert.match(app, /页面既然是从这个地址加载/, '补回来的理由要写在代码里，别下次又删掉')
+  // 手机端把连接方式选成「局域网」、却用 Tailscale 地址打开网页版时，
+  // orderCandidates 会按模式把 Tailscale 候选整个过滤掉 —— 页面能打开却连不上。
+  assert.match(app, /classifyEndpoint\(origin\)/, '来源的类型要按地址判断，不能写死成局域网')
+})
