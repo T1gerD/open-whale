@@ -18,8 +18,8 @@ import {
   UPLOAD_CHUNK_BYTES,
   WEBCHAT_VERSION,
   formatFingerprint,
-} from './lib/protocol.mjs'
-import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs'
+} from './lib/protocol.mjs?v=303'
+import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=303'
 import {
   ENDPOINT_KIND_LABEL,
   baseOrigin,
@@ -27,14 +27,14 @@ import {
   mergeEndpointSources,
   normalizeManualEndpoint,
   orderCandidates,
-} from './lib/endpoints.mjs'
+} from './lib/endpoints.mjs?v=303'
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
   bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
-} from './lib/pairing.mjs'
+} from './lib/pairing.mjs?v=303'
 import {
   buildHello,
   createIdentity,
@@ -44,19 +44,19 @@ import {
   serializeIdentity,
   signHello,
   verifyHelloAckProof,
-} from './lib/keys.mjs'
-import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs'
-import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs'
-import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs'
-import { createStorage } from './lib/storage.mjs'
+} from './lib/keys.mjs?v=303'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=303'
+import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=303'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=303'
+import { createStorage } from './lib/storage.mjs?v=303'
 import {
   AttachmentUploader,
   UPLOAD_TRANSPORT,
   chooseTransport,
   createBlobSliceReader,
   readBlobAsBase64,
-} from './lib/upload.mjs'
-import { createBrowserQrReader } from './lib/qr.mjs'
+} from './lib/upload.mjs?v=303'
+import { createBrowserQrReader } from './lib/qr.mjs?v=303'
 
 // ---------------------------------------------------------------------------
 // 环境与 DOM
@@ -2887,17 +2887,15 @@ function messageHtml(message, isFirst) {
 /** @param {any[]} tools */
 function toolRowsHtml(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return ''
-  const rows = tools
-    .map(tool => {
-      const done = tool.phase === 'tool-end'
-      const failed = done && tool.ok === false
-      const classes = ['tool-row']
-      if (done) classes.push(failed ? 'is-fail' : 'is-done')
-      const summary = tool.summary ?? (done ? (failed ? '失败' : '完成') : '进行中')
-      return `<div class="${classes.join(' ')}"><span class="tool-dot"></span><span class="tool-name">${escapeHtml(tool.tool)}</span><span class="tool-summary">${escapeHtml(summary)}</span></div>`
-    })
-    .join('')
-  return `<div class="tool-rows">${rows}</div>`
+  // 用户要求：工具调用只在**一行**里依次播放，新的覆盖旧的，不再堆多行列表。
+  const latest = tools[tools.length - 1]
+  const done = latest.phase === 'tool-end'
+  const failed = done && latest.ok === false
+  const classes = ['tool-row']
+  if (done) classes.push(failed ? 'is-fail' : 'is-done')
+  const summary = latest.summary ?? (done ? (failed ? '失败' : '完成') : '进行中')
+  const count = tools.length > 1 ? `（第 ${tools.length} 条）` : ''
+  return `<div class="tool-rows tool-line"><div class="${classes.join(' ')}"><span class="tool-dot"></span><span class="tool-name">${escapeHtml(latest.tool)}</span><span class="tool-summary">${escapeHtml(summary)}</span><span class="tool-summary">${count}</span></div></div>`
 }
 
 /** @param {any[]} files */
