@@ -2,6 +2,41 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.6] - 2026-11-12
+
+真机反馈三条：协议版本仍显示 3.0.0、每次都弹「页面出错」、相册选二维码仍然不可用。
+
+### 修复
+
+- **相册选二维码真的能用了**：`scanBitmapForQr` 调用 `env.jsQR` 时**没有 await**。浏览器实现是
+  `async (...args) => (await loadJsQr())(...args)`（要先动态加载 250 KB 的 vendor 脚本），返回的是
+  Promise，于是 `code.data` 恒为 `undefined`，每一张图都被判成「这张图里没有找到二维码」——
+  电脑上（有 `BarcodeDetector`、走原生解码）能过，手机走 jsQR 就必失败，这就是「两边表现不一致」
+  的原因。测试里 jsQR 是同步的，所以一直没被发现；新增用例把「异步 jsQR」钉住。
+- **没有 `createImageBitmap` 的浏览器**（老 Safari / 部分 WebView）：`<img>` 兜底返回的是带
+  `width/height` 的包装对象，之前直接喂给 `drawImage` / `BarcodeDetector` 会抛错。现在统一取
+  `source`（真正的图片元素），并且不再在 `scanFile` 里重新包一层把它丢掉。
+- **jsQR 的 vendor 路径改用模块自身地址解析**（`import.meta.url`）：页面是 `/openwhale/app`
+  （无尾斜杠）还是 `/openwhale/app/`，`document.baseURI` 会解析出两个不同路径，其中一个是 404。
+- **「页面出错：Script error.」不再打扰用户**：跨源脚本异常被浏览器脱敏成这一句，没有文件名、
+  没有行号——它来自手机浏览器注入的脚本（鸿蒙/UC/QQ 浏览器的工具栏、广告拦截等），不是本站代码。
+  现在识别到这种无位置的 `Script error.` 只写 console。真实错误仍然提示，并且**带上定位**
+  （`页面出错：xxx（app.js:1234）`），同时落进「最近错误」列表。
+- **启动失败不再只剩一句红条**：`boot()` 加了 catch，失败时把原因写进绑定页，并记进「最近错误」。
+- **`history.replaceState` 加保护**：部分手机 WebView 在外部唤醒的页面上会抛 SecurityError，
+  之前会在 boot 里抛断启动、页面停在绑定页。
+- **版本显示不再混淆**：设置 → 关于新增「电脑端插件」一行（来自 `hello/ack` 的 `serverVersion`），
+  协议一行标成「协议版本 3.0.0 · wire 格式，未变」；绑定页页脚写「协议 wire 3.0.0」。
+  协议版本是**帧格式契约**，3.0.4/3.0.5/3.0.6 都没有改帧形状（只加了可选字段），所以它不动；
+  产品和插件版本看「网页版版本」「电脑端插件」两行。
+- 绑定页/错误提示新增 `.about-hint` 与 `.error-log` 样式。
+
+### 测试
+
+- `qr.test.mjs` +2：异步 jsQR 必须被 await、`<img>` 兜底必须把图片元素本身交给 `drawImage`。
+- `renderer.test.mjs` +2：`Script error.` 过滤 + 错误定位、「boot 必须 catch」。
+- 全量 `files=57 tests=962 pass=920 failed=1`（`dsh-bridge` 仍是环境基线，HEAD 复跑同样失败）。
+
 ## [3.0.5] - 2026-11-12
 
 **扫码绑定的两个卡点：官方短码认不出来、设备上限打满还在发码。**（3.0.4 的同步层 / 渲染层 /

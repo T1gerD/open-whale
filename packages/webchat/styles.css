@@ -2180,6 +2180,37 @@ pre {
   margin-top: var(--space-2);
 }
 
+/* 关于面板里的补充说明与「最近错误」 ------------------------------------ */
+
+.about-hint {
+  color: var(--text-faint);
+  font-family: var(--font-body, inherit);
+  font-size: 11px;
+}
+
+.error-log {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.error-log-row {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: var(--space-2);
+  color: var(--text-dim);
+}
+
+.error-log-time {
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+.error-log-text {
+  color: var(--text);
+  word-break: break-word;
+}
+
 .sheet-hint {
   margin: 0;
   color: var(--text-faint);

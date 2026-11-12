@@ -18,8 +18,8 @@ import {
   UPLOAD_CHUNK_BYTES,
   WEBCHAT_VERSION,
   formatFingerprint,
-} from './lib/protocol.mjs?v=305'
-import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=305'
+} from './lib/protocol.mjs?v=306'
+import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=306'
 import {
   ENDPOINT_KIND_LABEL,
   baseOrigin,
@@ -27,14 +27,14 @@ import {
   mergeEndpointSources,
   normalizeManualEndpoint,
   orderCandidates,
-} from './lib/endpoints.mjs?v=305'
+} from './lib/endpoints.mjs?v=306'
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
   bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
-} from './lib/pairing.mjs?v=305'
+} from './lib/pairing.mjs?v=306'
 import {
   buildHello,
   createIdentity,
@@ -44,19 +44,19 @@ import {
   serializeIdentity,
   signHello,
   verifyHelloAckProof,
-} from './lib/keys.mjs?v=305'
-import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=305'
-import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=305'
-import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=305'
-import { createStorage } from './lib/storage.mjs?v=305'
+} from './lib/keys.mjs?v=306'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=306'
+import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=306'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=306'
+import { createStorage, STORAGE_PREFIX } from './lib/storage.mjs?v=306'
 import {
   AttachmentUploader,
   UPLOAD_TRANSPORT,
   chooseTransport,
   createBlobSliceReader,
   readBlobAsBase64,
-} from './lib/upload.mjs?v=305'
-import { createBrowserQrReader } from './lib/qr.mjs?v=305'
+} from './lib/upload.mjs?v=306'
+import { createBrowserQrReader } from './lib/qr.mjs?v=306'
 
 // ---------------------------------------------------------------------------
 // 环境与 DOM
@@ -154,6 +154,8 @@ const state = {
   model: undefined,
   status: { state: CONNECTION_STATE.IDLE },
   serverCaps: new Set(),
+  /** 电脑端插件版本（hello/ack 的 serverVersion），只用于「关于」显示。 */
+  serverVersion: '',
   verified: false,
   assistants: [],
   outbox: [],
@@ -345,15 +347,49 @@ function renderRichText(raw) {
 
 /** @param {string} message @param {'ok'|'error'|''} [kind] @param {number} [ms] */
 function showToast(message, kind = '', ms = 3400) {
+  const text = String(message ?? '')
+  // 同一句话在 2 秒内不重复弹：手机进了后台再回来、重连重试这类场景会连弹好几次。
+  const now = Date.now()
+  if (text === lastToast.text && now - lastToast.at < 2000) return
+  lastToast = { text, at: now }
   const toast = document.createElement('div')
   toast.className = `toast${kind ? ` is-${kind}` : ''}`
-  toast.textContent = message
+  toast.textContent = text
   dom.toastStack.appendChild(toast)
   setTimeout(() => {
     toast.style.opacity = '0'
     toast.style.transition = 'opacity 240ms ease'
     setTimeout(() => toast.remove(), 260)
   }, ms)
+}
+
+/** 上一条 toast（用于去重）。 */
+let lastToast = { text: '', at: 0 }
+
+/** 最近若干条运行时错误：设置页「关于」里能看到，方便照着截图报障。 */
+const errorLog = []
+const ERROR_LOG_LIMIT = 5
+
+/** @param {{message: string, where?: string}} entry */
+function recordError(entry) {
+  errorLog.push({ at: new Date().toISOString(), message: entry.message, where: entry.where ?? '' })
+  while (errorLog.length > ERROR_LOG_LIMIT) errorLog.shift()
+  try {
+    // 页面可能马上被系统回收（手机上切走）：顺手落盘，重进还能看到。
+    localStorage.setItem(`${STORAGE_PREFIX}.lastErrors`, JSON.stringify(errorLog))
+  } catch {
+    /* 存不了就算了，诊断信息不值得让页面再抛一次 */
+  }
+}
+
+/** 历史错误（启动时读一次，之后只看内存）。 */
+function loadErrorLog() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(`${STORAGE_PREFIX}.lastErrors`) ?? '[]')
+    if (Array.isArray(saved)) errorLog.push(...saved.slice(-ERROR_LOG_LIMIT))
+  } catch {
+    /* 旧数据坏了就忽略 */
+  }
 }
 
 /** 通用确认框；返回 Promise<boolean>。 */
@@ -619,6 +655,22 @@ function showRecognizedPayload(payload, options = {}) {
 }
 
 /**
+ * 把地址栏里的配对密钥抹掉。
+ *
+ * 部分手机浏览器（鸿蒙、微信内置、部分 WebView）在「由外部 App 唤起」的页面上
+ * 调 `history.replaceState` 会抛 SecurityError；不 catch 的话 boot 直接中断，
+ * 页面就永远停在绑定页，同时弹一个「页面出错」。抹地址失败不该影响任何功能。
+ * @param {string} url
+ */
+function replaceUrl(url) {
+  try {
+    history.replaceState(null, '', url)
+  } catch {
+    /* 地址栏里多留一个已用过的密钥而已，不值得中断启动 */
+  }
+}
+
+/**
  * 用一次性密钥向同源 `/openwhale/pairing.json` 兑换完整载荷。
  *
  * 短二维码（`/openwhale/app?s=…`，约 90 字符）在电脑、截图、相册、系统相机之间
@@ -658,7 +710,7 @@ async function payloadFromLocation() {
   if (!secret) return undefined
   const result = await redeemBindingSecret(secret)
   // 密钥只用于这一次兑换，立即从地址栏去掉，避免刷新时重复使用。
-  if (result.payload) history.replaceState(null, '', window.location.pathname)
+  if (result.payload) replaceUrl(window.location.pathname)
   return result
 }
 
@@ -716,7 +768,7 @@ async function connectFromInput() {
 function beginFromPayload(payload) {
   // 配对 secret 是一次性的：从地址栏去掉，避免刷新时重复使用导致「二维码已使用」。
   if (window.location.hash.includes('p=')) {
-    history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+    replaceUrl(`${window.location.pathname}${window.location.search}`)
   }
   const existing = state.binding
   if (existing && existing.computerId !== payload.id) {
@@ -1037,6 +1089,7 @@ function handleOnline(ack, context) {
   state.pairSecret = ''
   state.verified = context.verified === true
   state.serverCaps = new Set(Array.isArray(ack.capabilities) ? ack.capabilities : [])
+  state.serverVersion = typeof ack.serverVersion === 'string' ? ack.serverVersion : ''
   state.syncReceived = false
   state.sessionListLoading = false
   state.pendingSelect = null
@@ -3495,7 +3548,8 @@ function renderSettings() {
       <h3 class="sheet-section-title">关于</h3>
       <div class="about-grid">
         <div class="about-row"><span>网页版版本</span><span>${escapeHtml(APP_VERSION)}</span></div>
-        <div class="about-row"><span>协议版本</span><span>${escapeHtml(PROTOCOL_VERSION)}</span></div>
+        <div class="about-row"><span>电脑端插件</span><span>${escapeHtml(state.serverVersion || '未知（还没连上）')}</span></div>
+        <div class="about-row"><span>协议版本</span><span>${escapeHtml(PROTOCOL_VERSION)} <span class="about-hint">wire 格式，未变</span></span></div>
         <div class="about-row"><span>电脑</span><span>${escapeHtml(state.computerName || '未知')}</span></div>
         <div class="about-row"><span>电脑指纹</span><span>${escapeHtml(formatFingerprint(binding?.fingerprint ?? ''))}</span></div>
         <div class="about-row"><span>本机身份</span><span>${escapeHtml(state.identity?.deviceId ?? '')}</span></div>
@@ -3504,6 +3558,17 @@ function renderSettings() {
         <div class="about-row"><span>连接地址</span><span>${escapeHtml(state.connection?.connectedUrl ?? '未连接')}</span></div>
         <div class="about-row"><span>存储</span><span>${storage.available ? '本机浏览器' : '仅本页内存'}</span></div>
       </div>
+      ${errorLog.length > 0 ? `
+      <h3 class="sheet-section-title">最近错误</h3>
+      <div class="error-log">
+        ${errorLog.slice(-3).reverse().map(entry => `
+          <div class="error-log-row">
+            <span class="error-log-time">${escapeHtml((entry.at ?? '').slice(11, 19))}</span>
+            <span class="error-log-text">${escapeHtml(entry.message)}${entry.where ? ` <span class="about-hint">${escapeHtml(entry.where)}</span>` : ''}</span>
+          </div>
+        `).join('')}
+      </div>
+      <p class="sheet-hint">这些是浏览器里真实抛出的错误（含位置）。反馈问题时截这一段最有帮助。</p>` : ''}
       <div class="sheet-footer">
         <button class="btn btn-secondary btn-block" type="button" data-action="install">添加到主屏幕</button>
         <button class="btn btn-ghost btn-block" type="button" data-action="clear-conversation">清空本机聊天记录</button>
@@ -3987,13 +4052,52 @@ function setupLifecycleEvents() {
   })
   window.addEventListener('error', event => {
     const message = event?.message ?? ''
-    if (message && !message.includes('ResizeObserver')) showToast(`页面出错：${message}`, 'error', 5000)
+    // 资源加载失败（<script>/<img>）没有 message，交给网络层处理，别弹「页面出错」。
+    if (!message) return
+    // ResizeObserver 的循环告警是浏览器的噪音，不是功能故障。
+    if (message.includes('ResizeObserver')) return
+    // 跨源脚本的异常会被浏览器脱敏成一句 "Script error."：没有文件名、没有堆栈、
+    // 没有行号，我们根本无从判断——它来自手机浏览器注入的脚本（鸿蒙/UC/QQ 浏览器的
+    // 工具栏、广告拦截、安全键盘等），不是本站代码。真机上「每回进去都弹页面出错」
+    // 就是它。丢进 console 留个记录，不打扰用户。
+    if (/^Script error\.?$/i.test(message.trim()) && !event?.filename) {
+      console.debug('[openwhale] 忽略跨源脚本异常（浏览器注入）')
+      return
+    }
+    const where = describeErrorLocation(event)
+    recordError({ message, where })
+    // 只报一句人话 + 位置；完整堆栈进 console，方便远程定位是哪一行。
+    showToast(`页面出错：${message}${where ? `（${where}）` : ''}`, 'error', 5000)
+    console.error('[openwhale] 页面出错', message, where, event?.error)
   })
   window.addEventListener('unhandledrejection', event => {
     const reason = event?.reason
     const message = reason instanceof Error ? reason.message : String(reason ?? '')
-    if (message) showToast(`操作失败：${message}`, 'error', 5000)
+    if (!message) return
+    const where = reason instanceof Error && reason.stack ? firstStackFrame(reason.stack) : ''
+    recordError({ message, where })
+    showToast(`操作失败：${message}${where ? `（${where}）` : ''}`, 'error', 5000)
+    console.error('[openwhale] 未处理的 Promise 拒绝', reason)
   })
+}
+
+/** `app.js:1234:5` 这种短定位，够手机截图里认出来就行。 */
+function describeErrorLocation(event) {
+  const file = String(event?.filename ?? '')
+  const line = Number(event?.lineno ?? 0)
+  if (!file || !line) return ''
+  const name = file.split('/').pop() ?? file
+  return `${name}:${line}`
+}
+
+/** 从堆栈里挑第一个指向本项目的帧。 */
+function firstStackFrame(stack) {
+  const lines = String(stack).split('\n').slice(1)
+  for (const line of lines) {
+    const match = line.match(/([^/\s()]+\.(?:mjs|js)):(\d+):(\d+)/)
+    if (match) return `${match[1]}:${match[2]}`
+  }
+  return ''
 }
 
 // ---------------------------------------------------------------------------
@@ -4003,7 +4107,7 @@ function setupLifecycleEvents() {
 async function boot() {
   applyTheme(state.settings.theme)
   dom.bindVersion.textContent = `Open Whale 网页版 v${APP_VERSION}`
-  if (dom.bindProtocol) dom.bindProtocol.textContent = `协议 ${PROTOCOL_VERSION}`
+  if (dom.bindProtocol) dom.bindProtocol.textContent = `协议 wire ${PROTOCOL_VERSION}`
   setupBindEvents()
   setupComposerEvents()
   setupChatEvents()
@@ -4046,4 +4150,20 @@ async function boot() {
   showView('bind')
 }
 
-boot()
+// 历史错误先读回来（设置 → 关于里能看到），再启动。
+loadErrorLog()
+boot().catch(error => {
+  // 启动阶段抛错以前只会留一句「页面出错」然后卡在启动屏：把原因说清楚，
+  // 顺便落进「最近错误」，用户截图就能定位。
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  const where = error instanceof Error && error.stack ? firstStackFrame(error.stack) : ''
+  recordError({ message: `启动失败：${message}`, where })
+  console.error('[openwhale] 启动失败', error)
+  showToast(`页面出错：${message}${where ? `（${where}）` : ''}`, 'error', 6000)
+  try {
+    showView('bind')
+    setBindStatus(`页面没能完成启动：${message}。刷新一次通常就好了。`, 'error')
+  } catch {
+    /* 连绑定页都画不出来时，至少 toast 已经出去了 */
+  }
+})

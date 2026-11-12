@@ -86,3 +86,18 @@ test('相册识别把官方短码（?s=）交给同源兑换', () => {
   const qr = readFileSync(join(here, '..', 'lib', 'qr.mjs'), 'utf8')
   assert.match(qr, /options\.resolveText/, 'readPairingFromBitmap 要支持 resolveText 兜底')
 })
+
+test('跨源脚本的 "Script error." 不弹「页面出错」（鸿蒙浏览器注入的脚本不该打扰用户）', () => {
+  assert.match(
+    app,
+    /\/\^Script error\\\.\?\$\/i\.test\(message\.trim\(\)\)/,
+    '必须显式识别 "Script error."：它没有文件名/行号，来自手机浏览器注入的脚本',
+  )
+  assert.match(app, /recordError\(/, '真实错误要落到「最近错误」，设置 → 关于里能看到')
+  assert.match(app, /function describeErrorLocation/, '错误提示必须带 app.js:1234 这种定位')
+})
+
+test('启动失败不能只留一句红条', () => {
+  assert.match(app, /boot\(\)\.catch\(/, 'boot 必须 catch：否则启动阶段抛错只剩「页面出错」')
+  assert.match(app, /页面没能完成启动/, '启动失败要把原因和补救方式写在绑定页上')
+})

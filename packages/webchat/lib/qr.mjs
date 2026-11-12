@@ -75,7 +75,11 @@ export async function scanBitmapForQr(bitmap, env, options = {}) {
     try {
       const image = await env.readImageData(bitmap, size.width, size.height)
       if (!image?.data) continue
-      const code = env.jsQR(image.data, image.width ?? size.width, image.height ?? size.height, {
+      // jsQR 可能是同步的（测试 / 已经加载过），也可能是异步的（浏览器里要先 await
+      // 动态加载 250 KB 的 vendor 脚本）。这里必须 await：不 await 拿到的是 Promise，
+      // `code.data` 恒为 undefined，于是每一张图都报「没有找到二维码」——真机上
+      // 「选择二维码图片」一直不可用就是这个原因。
+      const code = await env.jsQR(image.data, image.width ?? size.width, image.height ?? size.height, {
         inversionAttempts: 'attemptBoth',
       })
       const text = typeof code?.data === 'string' ? code.data.trim() : ''
@@ -172,17 +176,23 @@ export function createBrowserQrReader(options = {}) {
      */
     async scanFile(file, options = {}) {
       const bitmap = await this.loadBitmap(file)
+      // 没有 `createImageBitmap` 的浏览器（老 Safari / 部分 WebView）走的是
+      // `<img>` 兜底，那时 bitmap 是一个带 width/height 的包装对象，**不能**直接
+      // 喂给 drawImage / BarcodeDetector —— 必须用里面的 `source`（真正的图片元素）。
+      const drawable = image => image?.source ?? image
       try {
         const env = {
           detectBarcodes: async image => {
             if (!detector) return []
-            const results = await detector.detect(image)
+            const results = await detector.detect(drawable(image))
             return (results ?? []).map(item => (typeof item?.rawValue === 'string' ? item.rawValue : '')).filter(Boolean)
           },
-          readImageData: (image, width, height) => readImageData(documentRef, image, width, height),
+          readImageData: (image, width, height) => readImageData(documentRef, drawable(image), width, height),
           jsQR: async (...args) => (await loadJsQr())(...args),
         }
-        const result = await readPairingFromBitmap({ width: bitmap.width, height: bitmap.height }, env, options)
+        // 直接把 bitmap 传下去：`<img>` 兜底时它是带 `source` 的包装对象，
+        // 重新包成 `{width, height}` 会把 `source` 丢掉。
+        const result = await readPairingFromBitmap(bitmap, env, options)
         return result
       } finally {
         if (typeof bitmap.close === 'function') bitmap.close()
@@ -223,6 +233,8 @@ function loadImageElement(file, documentRef) {
       resolve({
         width: image.naturalWidth,
         height: image.naturalHeight,
+        // `source` 是真正能 drawImage 的对象；`width/height` 只是给调度用的尺寸。
+        source: image,
         element: image,
         close() {
           URL.revokeObjectURL(url)
@@ -248,7 +260,16 @@ export function loadJsQrFromVendor(documentRef) {
   if (!documentRef) return Promise.reject(new Error('没有 DOM，无法加载 jsQR'))
   return new Promise((resolve, reject) => {
     const script = documentRef.createElement('script')
-    script.src = new URL('./vendor/jsqr.js', documentRef.baseURI).href
+    // 用**模块自己的地址**解析 vendor：页面是 `/openwhale/app`（没有尾斜杠）、
+    // 还是 `/openwhale/app/`，`document.baseURI` 会解析出两个不同的路径——其中一个
+    // 是 404。模块地址永远指向 `/openwhale/app/lib/`，跟页面 URL 怎么写无关。
+    script.src = (() => {
+      try {
+        return new URL('../vendor/jsqr.js', import.meta.url).href
+      } catch {
+        return new URL('./vendor/jsqr.js', documentRef.baseURI).href
+      }
+    })()
     script.async = true
     script.onload = () => {
       const jsQR = typeof globalThis !== 'undefined' ? globalThis.jsQR : undefined

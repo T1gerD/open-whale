@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  createBrowserQrReader,
   QR_NOT_FOUND_MESSAGE,
   planScanSizes,
   readPairingFromBitmap,
@@ -186,5 +187,39 @@ test('readPairingFromBitmap：没有 resolveText 时短码仍然报「内容无�
   }
   const result = await readPairingFromBitmap({ width: 600, height: 600 }, env, { now: NOW })
   assert.equal(result.ok, false)
+  assert.match(result.error, /二维码内容无效/)
+})
+
+test('scanBitmapForQr 必须 await 异步 jsQR（浏览器里要先动态加载 vendor）', async () => {
+  const env = {
+    detectBarcodes: async () => [],
+    readImageData: () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+    // 浏览器实现是 `async (...args) => (await loadJsQr())(...args)`：返回 Promise。
+    jsQR: async () => ({ data: 'http://192.168.43.222:8787/openwhale/app?s=SECRET_123' }),
+  }
+  const result = await scanBitmapForQr({ width: 800, height: 800 }, env)
+  assert.equal(result.ok, true, '异步 jsQR 被当成同步调用时恒为 undefined，整张图会被误判成「没有二维码」')
+  assert.equal(result.text, 'http://192.168.43.222:8787/openwhale/app?s=SECRET_123')
+  assert.equal(result.method, 'jsqr')
+})
+
+test('createBrowserQrReader：没有 createImageBitmap 时用 <img> 元素本身解码', async () => {
+  const image = { tagName: 'IMG', naturalWidth: 600, naturalHeight: 600 }
+  const seen = []
+  const reader = createBrowserQrReader({
+    documentRef: {
+      baseURI: 'http://host/openwhale/app',
+      createElement: () => ({ getContext: () => ({ drawImage: target => seen.push(target), getImageData: () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }) }) }),
+      head: { appendChild() {} },
+    },
+    isSecureContext: false,
+    loadJsQr: async () => () => ({ data: 'https://example.test/#p=x' }),
+    BarcodeDetectorImpl: undefined,
+  })
+  // 模拟 `loadBitmap` 走进 `<img>` 兜底：返回带 source 的包装对象。
+  reader.loadBitmap = async () => ({ width: image.naturalWidth, height: image.naturalHeight, source: image, close() {} })
+  const result = await reader.scanFile(new Blob([]), {})
+  assert.equal(seen[0], image, 'drawImage 必须拿到 <img> 本身，不能是包装对象')
+  // 解出了文本但只是个普通链接：说明解码路径通了，卡在载荷解析（预期）。
   assert.match(result.error, /二维码内容无效/)
 })
