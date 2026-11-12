@@ -370,3 +370,12 @@ test('网关的 bridge 适配层转发 approvalProxyStatus', () => {
     'index.mjs 的 bridge 适配层必须把 approvalProxyStatus 转发给网关',
   )
 })
+
+test('startTunnel 必须监听 error：否则隧道失败会升级成宿主 fatal uncaught', () => {
+  // 只做结构断言：真正的行为在 tunnel.test.mjs（无监听者时不抛）。
+  // 这里守住的是「插件入口别把这个监听删掉」——删了就会重现 v3.0.8 的
+  // 「应用无法启动或已意外停止」。
+  const source = readFileSync(new URL('../src/index.mjs', import.meta.url), 'utf8')
+  assert.match(source, /manager\.on\('error'/, 'startTunnel 要给 TunnelManager 挂 error 监听')
+  assert.match(source, /公网隧道失败/, '失败要写进日志，而不是只在界面上弹一个错误')
+})

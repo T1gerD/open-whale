@@ -700,6 +700,10 @@ async function startTunnel({ ctx, settings, gateway, log, onUrl }) {
     origin: `http://127.0.0.1:${port}`,
     log,
   })
+  // 隧道是可选能力，失败只能记日志。EventEmitter 的 'error' 事件在没有监听者时
+  // 会被直接抛出 —— v3.0.8 就是这样把「连不上 Cloudflare」升级成宿主 fatal
+  // uncaught（DSH 显示「应用无法启动或已意外停止」并拒绝再启动）。
+  manager.on('error', error => log(`公网隧道失败：${error?.message ?? error}`))
   manager.on('url', event => {
     const url = typeof event === 'string' ? event : event?.url
     log(`公网地址：${url}`)

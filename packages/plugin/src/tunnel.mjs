@@ -685,7 +685,7 @@ export class TunnelManager extends EventEmitter {
       this.lastError = `启动 cloudflared 失败：${/** @type {Error} */ (error).message}`
       this.reason = TUNNEL_REASON.SPAWN_FAILED
       this.#setState('failed', { message: this.lastError })
-      this.emit('error', new Error(this.lastError))
+      this.#reportFailure(this.lastError)
       return { ok: false, reason: this.reason, message: this.lastError }
     }
     this.child = child
@@ -697,7 +697,8 @@ export class TunnelManager extends EventEmitter {
 
     child.once('error', error => {
       this.lastError = `cloudflared 进程错误：${/** @type {Error} */ (error).message}`
-      this.emit('error', error)
+      this.log(`tunnel: ${this.lastError}`)
+      this.#reportFailure(this.lastError)
     })
     child.once('exit', (code, signal) => this.#onExit(code, signal))
 
@@ -709,7 +710,7 @@ export class TunnelManager extends EventEmitter {
       this.log(`tunnel: ${this.lastError}`)
       this.#killChild()
       this.#setState('failed', { message: this.lastError })
-      this.emit('error', new Error(this.lastError))
+      this.#reportFailure(this.lastError)
       // No automatic restart after our own timeout: a hard failure loop is what
       // triggers Cloudflare's per-IP creation limit.
     }, this.startTimeoutMs)
@@ -819,6 +820,23 @@ export class TunnelManager extends EventEmitter {
     this.#scheduleRestart({ rateLimited, code })
   }
 
+  /**
+   * 报告一次失败：有监听者就走事件，没有就只记日志。
+   *
+   * EventEmitter 的规矩是「`error` 事件没有监听者就抛出去」。隧道是可选能力，
+   * 它的失败绝不该升级成宿主的未捕获异常 —— v3.0.8 之前正是这样：cloudflared
+   * 连不上 Cloudflare，5 次重启失败后 `emit('error')` 无人监听，DSH 直接
+   * fatal uncaught 并拒绝再启动。这里把它降级成日志。
+   * @param {string} message
+   */
+  #reportFailure(message) {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', new Error(message))
+      return
+    }
+    this.log(`tunnel: ${message}`)
+  }
+
   /** @param {{rateLimited: boolean, code: number|null}} info */
   #scheduleRestart(info) {
     // `restartAttempt` stays 0 while ready, so this counts *consecutive* failures
@@ -829,7 +847,7 @@ export class TunnelManager extends EventEmitter {
       this.lastError = `连续 ${this.maxConsecutiveFailures} 次重启失败，已停止自动重启（避免触发 Cloudflare 的每 IP 创建限流）。最后一次退出码：${info.code ?? '未知'}${info.rateLimited ? '（被 Cloudflare 限流，请等待 25 分钟以上再试）' : ''}`
       this.url = null
       this.#setState('failed', { message: this.lastError })
-      this.emit('error', new Error(this.lastError))
+      this.#reportFailure(this.lastError)
       return
     }
     const delayMs = this.backoffDelayMs(this.restartAttempt, info.rateLimited)

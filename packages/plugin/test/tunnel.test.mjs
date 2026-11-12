@@ -717,3 +717,27 @@ test('a custom killTree seam is always used instead of touching the child direct
   assert.deepEqual(seen, [{ pid: spawned[0].child.pid, signal: 'SIGTERM' }])
   assert.equal(spawned[0].child.killed, false, 'the injected killer decides how to die')
 })
+
+test('没有 error 监听者时，隧道失败只记日志、绝不能抛未捕获异常', async t => {
+  // v3.0.8 的真实事故：cloudflared 连不上 Cloudflare → 5 次重启失败 →
+  // `emit('error')` 无人监听 → EventEmitter 把它抛出来 → DSH 判为 fatal
+  // uncaught，桌面端显示「应用无法启动或已意外停止」并拒绝再启动。
+  // 隧道是可选能力，最坏情况只能是「没有公网地址」，不能带走宿主。
+  const lines = []
+  const { manager } = makeManager(t, { startTimeoutMs: 20, log: line => lines.push(line) })
+  const started = await manager.start()
+  assert.equal(started.ok, true)
+  await waitFor(() => manager.state === 'failed', 500, 'failed state')
+  assert.match(String(manager.lastError), /启动超时/)
+  assert.ok(lines.some(line => line.startsWith('tunnel: ')), '失败必须留下日志，而不是静默')
+})
+
+test('有 error 监听者时，失败仍然照常发事件（不要为了不崩把事件吞掉）', async t => {
+  const { manager } = makeManager(t, { startTimeoutMs: 20 })
+  const errors = []
+  manager.on('error', error => errors.push(error.message))
+  await manager.start()
+  await waitFor(() => manager.state === 'failed', 500, 'failed state')
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /启动超时/)
+})

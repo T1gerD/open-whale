@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.9] - 2026-11-12
+
+真机事故：打开「公网隧道（quick）」后，DSH 直接弹出「应用无法启动或已意外停止」，
+栈顶是 `dsh-openwhale/src/tunnel.mjs` 的 `#scheduleRestart` → `#onExit`，并拒绝再启动。
+
+### 修复
+
+- **隧道失败不再升级成宿主崩溃**（`src/tunnel.mjs`）：`TunnelManager` 在「连续 5 次重启失败」
+  等路径里 `emit('error')`，而 `EventEmitter` 的 `error` 事件**没有监听者时会直接抛出**。
+  这个异常冒到 DSH 就是 fatal uncaught → 桌面端判定应用崩溃、拒绝自动重启。
+  现在统一走 `#reportFailure()`：有监听者才发事件，没有就只写日志。
+- **插件入口补上监听**（`src/index.mjs`）：`startTunnel()` 里给 manager 挂
+  `on('error')`，失败只记一行 `公网隧道失败：…`。隧道本来就是可选能力，
+  最坏结果只能是「没有公网地址」，绝不能带走宿主进程。
+- 顺带说明：cloudflared 的失败原因会完整写进 `~/.dsh/openwhale/openwhale.log`，
+  例如 `Post "https://api.trycloudflare.com/tunnel": context deadline exceeded`。
+
+### 测试
+
+- `tunnel.test.mjs` +2：没有 `error` 监听者时失败只记日志、不抛未捕获异常；
+  有监听者时事件照常发出（不能为了不崩把事件吞掉）。
+- `entry.test.mjs` +1：结构断言 —— `startTunnel` 必须保留 `manager.on('error')`。
+- 全量 `files=57 tests=978 pass=936 failed=1`（`dsh-bridge` 环境基线）。
+
 ## [3.0.8] - 2026-11-12
 
 真机反馈：配对页第二步里「局域网」和「公网隧道」都标着「（当前不可用）」，只有 Tailscale 能点。

@@ -18,8 +18,8 @@ import {
   UPLOAD_CHUNK_BYTES,
   WEBCHAT_VERSION,
   formatFingerprint,
-} from './lib/protocol.mjs?v=308'
-import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=308'
+} from './lib/protocol.mjs?v=309'
+import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=309'
 import {
   ENDPOINT_KIND_LABEL,
   baseOrigin,
@@ -27,14 +27,14 @@ import {
   mergeEndpointSources,
   normalizeManualEndpoint,
   orderCandidates,
-} from './lib/endpoints.mjs?v=308'
+} from './lib/endpoints.mjs?v=309'
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
   bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
-} from './lib/pairing.mjs?v=308'
+} from './lib/pairing.mjs?v=309'
 import {
   buildHello,
   createIdentity,
@@ -44,19 +44,19 @@ import {
   serializeIdentity,
   signHello,
   verifyHelloAckProof,
-} from './lib/keys.mjs?v=308'
-import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=308'
-import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=308'
-import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=308'
-import { createStorage, STORAGE_PREFIX } from './lib/storage.mjs?v=308'
+} from './lib/keys.mjs?v=309'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=309'
+import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=309'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=309'
+import { createStorage, STORAGE_PREFIX } from './lib/storage.mjs?v=309'
 import {
   AttachmentUploader,
   UPLOAD_TRANSPORT,
   chooseTransport,
   createBlobSliceReader,
   readBlobAsBase64,
-} from './lib/upload.mjs?v=308'
-import { createBrowserQrReader } from './lib/qr.mjs?v=308'
+} from './lib/upload.mjs?v=309'
+import { createBrowserQrReader } from './lib/qr.mjs?v=309'
 
 // ---------------------------------------------------------------------------
 // 环境与 DOM
