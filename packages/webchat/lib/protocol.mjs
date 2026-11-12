@@ -22,7 +22,7 @@
 export const PROTOCOL_VERSION = '3.0.0'
 
 /** 网页版客户端自身的版本号（与产品版本一致，显示在「关于」里）。 */
-export const WEBCHAT_VERSION = '3.0.10'
+export const WEBCHAT_VERSION = '3.0.11'
 
 /** 能力协商标记（hello / hello/ack 的 capabilities）。 */
 export const CAPABILITIES = Object.freeze({

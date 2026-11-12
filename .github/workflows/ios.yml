@@ -104,15 +104,17 @@ jobs:
           xcrun swift --version
 
       - name: Install workspace dependencies
-        # 与 .github/workflows/release.yml 一致：仓库没有提交 lockfile，
-        # 依赖装到仓库根，workspace link (@openwhale/protocol) 才能解析。
-        run: pnpm install --no-frozen-lockfile
+        # 与 .github/workflows/release.yml 一致：仓库提交了 pnpm-lock.yaml，依赖装到
+        # 仓库根（workspace link `@openwhale/protocol` 才能解析），并且**必须冻结**。
+        # 曾经这里用 `--no-frozen-lockfile`：CI 会当场现解析一棵树，同一个 commit 在
+        # 本机、`release` job（frozen）与本 job 上装出来的版本可以各不相同
+        # （v3.0.10 时本 job 解析到 expo 57.0.32，release job 却是 57.0.31）。
+        run: pnpm install --frozen-lockfile
 
-      - name: Align Expo package versions
-        working-directory: packages/mobile
-        # 若 package.json 里有 "*" 版本，先对齐到当前 Expo SDK；网络抖动失败不阻断，
-        # 后面 prebuild / pod install 会用解析器的结果。
-        run: npx expo install --fix || true
+      - name: Check the mobile dependency tree against the SDK manifest
+        # 不做 `npx expo install --fix`：它会改写 package.json 与依赖树，CI 里的树
+        # 因此既不可复现、也和发布产物不一致；而且它自己就会因线上清单漂移而失败。
+        run: node scripts/check-mobile-deps.mjs
 
       - name: Prebuild iOS project
         working-directory: packages/mobile

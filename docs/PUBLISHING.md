@@ -18,13 +18,14 @@
 ## 1. 发布前门禁（必须全绿才打 tag）
 
 ```bash
-node scripts/run-tests.mjs                 # 57 文件 / 978 项（3.0.10 基线）
+node scripts/run-tests.mjs                 # 58 文件 / 982 项（3.0.11 基线）
 node scripts/run-tests.mjs --self-test     # 运行器自检：摘要 + exit 1 必须判红（改过 run-tests.mjs 必跑）
 node scripts/check-docs.mjs                # 版本 / 产物名 / README 与本文的测试计数一致
 node packages/mobile/scripts/check-syntax.mjs
 node packages/plugin/scripts/sync-protocol.mjs --check
 node scripts/build-plugin-package.mjs --check
 node scripts/build-plugin-package.mjs --npm-dir && node scripts/check-npm-package.mjs release/npm-package
+pnpm install --frozen-lockfile && node scripts/check-mobile-deps.mjs   # 手机端依赖 ↔ SDK 版本表（离线）
 ```
 
 后两条分别校验插件 tarball 的文件清单，以及 `npm pack` 真正会发出去的文件清单
@@ -36,7 +37,7 @@ node scripts/build-plugin-package.mjs --npm-dir && node scripts/check-npm-packag
 
 ```bash
 set DSH_HOME=C:\temp\ow-e2e
-dsh plugin --profile e2e add .\release\dsh-openwhale-3.0.10.tgz
+dsh plugin --profile e2e add .\release\dsh-openwhale-3.0.11.tgz
 dsh --profile e2e --no-open --port 3987
 node scripts/verify-install.mjs http://127.0.0.1:3987
 ```
@@ -47,24 +48,24 @@ Ed25519 绑定与 hello/ack 签名 / 能力协商 / 会话快照 / 幂等重发�
 ## 2. 打 tag 与发布（GitHub Actions 完成构建）
 
 ```bash
-git tag v3.0.10
+git tag v3.0.11
 git push origin main
-git push origin v3.0.10
+git push origin v3.0.11
 ```
 
 - `tests` 工作流：三平台（ubuntu / windows / macos）× Node 22/24 跑全部测试、协议副本检查、
   运行器自检与版本/文档一致性检查。
 - `release` 工作流：在 tag 上构建
   - 先断言「tag == `v${version}`」（tag 推送与手动输入都校验，不一致直接失败），
-    依赖用 `pnpm install --frozen-lockfile` 安装，`expo install` 只做 `--check`、不改依赖树；
-  - `dsh-openwhale-3.0.10.tgz` + 固定名 `dsh-openwhale.tgz`（插件，含网页版）
-  - `open-whale-3.0.10.apk` + 固定名 `open-whale.apk`（debug keystore 签名的 arm64 包装配包）
+    依赖用 `pnpm install --frozen-lockfile` 安装，手机端依赖树与 SDK 的自洽性由 `scripts/check-mobile-deps.mjs` 离线校验（读 expo 包自带的 bundledNativeModules.json，不联网、不改依赖树）；
+  - `dsh-openwhale-3.0.11.tgz` + 固定名 `dsh-openwhale.tgz`（插件，含网页版）
+  - `open-whale-3.0.11.apk` + 固定名 `open-whale.apk`（debug keystore 签名的 arm64 包装配包）
   - `SHA256SUMS.txt`，并创建 GitHub Release（release body 取 `CHANGELOG.md`）
   - 发布前用 `npm pack --dry-run` 校验 npm 包文件清单（`scripts/check-npm-package.mjs`）
 - `ios` 工作流：手动触发或 tag 时构建**未签名模拟器 .app**（真机/TestFlight 需要 Apple 账号走 EAS）。
 
 > 本机没有 JDK / Android SDK，**不要**尝试本地出 APK；CI 是唯一构建通道。
-> 如果 tag 需要重打：`git tag -f v3.0.10 && git push -f origin v3.0.10`。
+> 如果 tag 需要重打：`git tag -f v3.0.11 && git push -f origin v3.0.11`。
 
 ## 3. npm 发布
 

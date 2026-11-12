@@ -44,7 +44,13 @@ const NETWORK_SECURITY_CONFIG = `<?xml version="1.0" encoding="utf-8"?>
 `
 
 function injectManifestAttributes(config) {
-  return withAndroidManifest(cfg => {
+  // 注意签名：withAndroidManifest(config, action)。少传 config 会把回调当成 config，
+  // 返回的对象里只剩 `{ mods }` —— `_internal.projectRoot` 与 `name` 都会丢，而
+  // `@expo/config-plugins` 在应用**后续**静态插件时会断言 `_internal.projectRoot`
+  // 存在，于是 `expo prebuild` 直接抛
+  //   AssertionError: Config `_internal.projectRoot` isn't defined by expo-cli
+  // 这类报错看起来像 Expo 的 bug，实则根因就在这里。见 test/plugin-contract.test.mjs。
+  return withAndroidManifest(config, cfg => {
     const manifest = cfg.modResults.manifest
     const application = manifest.application?.[0]
     if (!application) {

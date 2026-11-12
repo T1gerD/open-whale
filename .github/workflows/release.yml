@@ -93,12 +93,16 @@ jobs:
         # a commit that changes dependency versions has to update it too.
         run: pnpm install --frozen-lockfile
 
-      - name: Check Expo package versions
-        working-directory: packages/mobile
-        # 只校验、不改依赖树。老的 `expo install --check/--fix || true` 会在发布途中
-        # 改写 package.json 与依赖树，产物因此对不上任何一次提交；版本号现在钉在
-        # 仓库里，不匹配就让 job 红（不再 `|| true`）。
-        run: npx --yes expo install --check
+      - name: Check the mobile dependency tree against the SDK manifest
+        # 只校验、不改依赖树。老的 `expo install --check/--fix` 有两个问题：
+        #   1. 它拿**线上**的 SDK 清单做基准 —— Expo 每发一个 patch，已经打好的 tag
+        #      就会被判红（v3.0.10 的 release job 就是这么挂的：`expo@57.0.31
+        #      - expected version: ~57.0.32`，而仓库那一刻什么都没改）；
+        #   2. `--fix` 会在发布途中改写 package.json 与依赖树，产物因此对不上任何
+        #      一次提交。
+        # 现在改读仓库锁定的 expo 包自带的 bundledNativeModules.json：离线、
+        # 可复现，只回答「这棵树和这个 SDK 版本是否自洽」。
+        run: node scripts/check-mobile-deps.mjs
 
       - uses: actions/setup-java@v4
         with:

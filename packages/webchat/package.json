@@ -1,6 +1,6 @@
 {
   "name": "@openwhale/webchat",
-  "version": "3.0.10",
+  "version": "3.0.11",
   "private": true,
   "type": "module",
   "description": "Open Whale 网页版/PWA 客户端",

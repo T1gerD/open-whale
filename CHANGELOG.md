@@ -2,6 +2,50 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.11] - 2026-11-12
+
+v3.0.10 的 tag 推上去之后，`ios` 与 `release` 两个 job 都红了。两边都不是产品代码的问题，
+但都让「打出来的包」停在 v3.0.9 —— 这次把两个根因各修一处，并补上能让它们提前变红的检查。
+
+### 修复
+
+- **`expo prebuild` 崩在 `Config \`_internal.projectRoot\` isn't defined`**
+  （`packages/mobile/plugins/withCleartextTraffic.js`）：`withAndroidManifest` 的签名是
+  `(config, action)`，这里只传了回调，于是回调被当成 config，返回对象只剩 `{ mods }`，
+  `name` 与 `_internal.projectRoot` 一起丢掉。`@expo/config-plugins` 在应用**下一个**静态
+  插件（`withReleaseSize`）时会断言 `_internal.projectRoot` 存在，于是整条 prebuild 直接抛异常。
+  报错文本把锅甩给 expo-cli，实际根因在本仓库的插件里 —— 少一个参数。
+  现在补上 `config` 实参；`android/app/src/main/AndroidManifest.xml` 里的
+  `usesCleartextTraffic` / `networkSecurityConfig` 与 `res/xml/network_security_config.xml`
+  都确认重新生成。
+- **`release` 的 `expo install --check` 把「Expo 又发了 patch」当成失败**
+  （`.github/workflows/release.yml`）：它拿**线上**的 SDK 清单比对，于是
+  `expo@57.0.31 - expected version: ~57.0.32` 这种「上游刚发了新版」就能让一个已经打好的
+  tag 变红，而仓库那一刻什么都没改。换成 `scripts/check-mobile-deps.mjs`：读仓库锁定的
+  expo 包自带的 `bundledNativeModules.json`，离线、可复现，只回答「这棵树和这个 SDK 版本
+  是否自洽」。
+- **`ios` 工作流安装依赖时不冻结 lockfile**（`.github/workflows/ios.yml`）：`--no-frozen-lockfile`
+  会当场现解析一棵与本地/发布都不同的树，再叠加 `expo install --fix`（还会改写 package.json），
+  同一个 commit 在 CI 里跑出来的依赖树因此不可复现。改为 `--frozen-lockfile`，并把
+  `expo install --fix` 换成上面那个离线检查（只校验、不改树）。
+
+### 变更
+
+- `react-native-screens` 由 `^4.26.2` 收到 `~4.26.0`、`react-native-safe-area-context` 由
+  `^5.7.0` 收到 `~5.7.0`：`^` 会飘到 4.30.0 / 5.10.1，而 SDK 57 的版本表要求
+  `~4.26.0` / `~5.7.0`。这两个是带原生代码的包，版本对不上就是原生层不一致。
+
+### 测试
+
+- 新增 `packages/mobile/test/plugin-contract.test.mjs`（3 项）：把 `@expo/config-plugins`
+  替换成桩，断言每个本地插件：① 调 API 时第一个参数必须是 config 对象（不是回调）、
+  ② 处理完之后 `name` 与 `_internal.projectRoot` 仍在。不装依赖也能跑，CI 的 `tests`
+  矩阵直接覆盖这条回归。用 3.0.10 的代码跑这三项会红两项。
+- 新增 `scripts/check-mobile-deps.mjs`：手机端依赖 ↔ SDK 版本表的离线自洽性检查
+  （`~` / `^` / 精确 / `>=` 四种范围）。
+- 全量 `files=58 tests=982 pass=982 failed=0`；`check-docs`、`sync-protocol --check`、
+  `build-plugin-package --check` 均通过；本机 `expo prebuild --platform android` 真实跑通。
+
 ## [3.0.10] - 2026-11-12
 
 推送到 `main` 后 CI 只在 Node 22 上红：`test (ubuntu-latest, 22)`、`test (macos-latest, 22)`、
