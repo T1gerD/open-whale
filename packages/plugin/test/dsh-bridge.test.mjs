@@ -877,6 +877,30 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/**
+ * 等一个「只由 unref 定时器兑现」的 promise。
+ *
+ * 提问超时的定时器是 unref 的（不能因为手机没答就把宿主进程吊着），代价是：在一个
+ * 除这个定时器以外空无一物的进程里，事件循环会先清空 —— node:test 随即报
+ * `Promise resolution is still pending but the event loop has already resolved`，
+ * 把这个用例连同它后面所有用例一起取消。Node 22 上就是这样：42 个用例整片被取消，
+ * 文件以退出码 1 结束，而 Node 24 的 runner 会替你把循环撑住，所以 CI 只有 22 红。
+ *
+ * 所以等待期间挂一个被 ref 的 interval，目标 promise 一落定就清掉：生产代码的
+ * unref 语义不动，用例在哪个 Node 版本上都真的跑起来。
+ * @template T
+ * @param {Promise<T>} promise
+ * @returns {Promise<T>}
+ */
+async function settleWithKeepAlive(promise) {
+  const keep = setInterval(() => {}, 25)
+  try {
+    return await promise
+  } finally {
+    clearInterval(keep)
+  }
+}
+
 test('a question is forwarded to the phone and its answers go back to DSH', async () => {
   const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 2_000 })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
@@ -946,13 +970,16 @@ test('a timed-out question still accepts a late answer through userQuestions.ans
   const { bridge, fake, events } = makeBridge({
     devicesInSession: () => ['dev_a'],
     questionTimeoutMs: 20,
+    // 这个用例走的是 askTimed 的短窗口（`wait.timed`），必须改 timed 那个值：
+    // 只改 questionTimeoutMs 时它会老老实实等 30 秒的默认短窗口，用例虽然是对的，
+    // 但每个平台每次 CI 都白等半分钟。
+    questionTimedTimeoutMs: 20,
     questionLateWindowMs: 1_000,
   })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const handler = questionHandler(fake)
-  const result = await handler.listener(
-    questionRequest({ wait: { callId: 'call-9', timed: true } }),
-    async () => 'delegated',
+  const result = await settleWithKeepAlive(
+    handler.listener(questionRequest({ wait: { callId: 'call-9', timed: true } }), async () => 'delegated'),
   )
   assert.equal(result, 'delegated', 'a timeout always hands the question back to the desktop')
   const ask = events.find(event => event.kind === 'question-ask')
@@ -984,9 +1011,8 @@ test('an askTimed question uses the shorter forwarding window', async () => {
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const handler = questionHandler(fake)
   const startedAt = Date.now()
-  const result = await handler.listener(
-    questionRequest({ wait: { callId: 'call-9', timed: true } }),
-    async () => 'delegated',
+  const result = await settleWithKeepAlive(
+    handler.listener(questionRequest({ wait: { callId: 'call-9', timed: true } }), async () => 'delegated'),
   )
   const elapsed = Date.now() - startedAt
   assert.equal(result, 'delegated')
@@ -1000,7 +1026,7 @@ test('a blocking question that times out is not kept for late answers', async ()
   const { bridge, fake, events } = makeBridge({ devicesInSession: () => ['dev_a'], questionTimeoutMs: 10 })
   await bridge.send({ deviceId: 'dev_a', callId: 'c1', text: 'hi', attachments: [] })
   const handler = questionHandler(fake)
-  const result = await handler.listener(questionRequest(), async () => 'delegated')
+  const result = await settleWithKeepAlive(handler.listener(questionRequest(), async () => 'delegated'))
   assert.equal(result, 'delegated')
   const ask = events.find(event => event.kind === 'question-ask')
   assert.equal(ask.canAnswerLate, false)

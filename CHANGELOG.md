@@ -2,6 +2,36 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [3.0.10] - 2026-11-12
+
+推送到 `main` 后 CI 只在 Node 22 上红：`test (ubuntu-latest, 22)`、`test (macos-latest, 22)`、
+`test (windows-latest, 22)` 三个 job 失败，Node 24 全绿。产品代码没有 bug，红的是测试本身。
+
+### 修复
+
+- **`dsh-bridge.test.mjs`：等待「由 unref 定时器兑现」的 promise 时要撑住事件循环。**
+  提问超时的定时器是 `unref()` 的（不能因为手机没答就把宿主进程吊着），但那三个用例
+  所在的进程里除了这个定时器空无一物：循环先清空，node:test 报
+  `Promise resolution is still pending but the event loop has already resolved`，
+  于是**第 49 个用例连同它后面 41 个一起被取消**（`fail 0 / cancelled 42`），文件以退出码 1
+  结束。Node 24 的 runner 会替你把循环撑住，所以只有 22 红——这也是为什么本地一直「只差一条
+  环境基线」却没人发现：那 42 个用例在 Node 22 上根本没跑过。
+  现在用 `settleWithKeepAlive()` 在等待期间挂一个被 ref 的 interval，promise 落定即清掉，
+  生产代码的 unref 语义不动。
+- **同一个用例白等 30 秒**：它走的是 `wait.timed` 的短窗口，却只覆盖了 `questionTimeoutMs`，
+  真正的 `QUESTION_TIMED_TIMEOUT_MS` 还是默认 30s，于是每个平台每次 CI 都空转半分钟。
+  补上 `questionTimedTimeoutMs: 20`，这个文件从 30.8s 降到 0.85s。
+- **运行器把「取消」判成红**（`scripts/run-tests.mjs`）：`judge()` 以前只看 `fail` 计数，
+  `cancelled` 只体现在退出码上（报错还叫「summary reports 0 failures but the child exited
+  with code 1」，看不出真相）。现在解析 `cancelled` 并在原因里写清「N 个用例被取消 ——
+  事件循环在它们之前就清空了」；self-test 增加一条纯函数用例，锁住「cancelled 在 exit 0 时也得红」。
+
+### 测试
+
+- 全量 `files=57 tests=978 pass=978 failed=0`——第一次真正全绿（此前 `dsh-bridge` 那条
+  「环境基线」失败就是上面这个 bug，不是环境问题）。
+- `run-tests.mjs --self-test` 4/4；`sync-protocol --check`、`check-docs` 均通过。
+
 ## [3.0.9] - 2026-11-12
 
 真机事故：打开「公网隧道（quick）」后，DSH 直接弹出「应用无法启动或已意外停止」，

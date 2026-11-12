@@ -70,7 +70,10 @@ const logDir = join(root, '.test-logs', String(process.pid))
 rmSync(logDir, { recursive: true, force: true })
 mkdirSync(logDir, { recursive: true })
 
-const SUMMARY = /tests\s+(\d+)[\s\S]*?pass\s+(\d+)[\s\S]*?fail\s+(\d+)/
+// `tests / pass / fail` plus the optional `cancelled` counter. Cancellation is its
+// own verdict (see `judge`): a file whose event loop drains mid-suite reports
+// `fail 0` and still hands back most of its tests as never-run.
+const SUMMARY = /tests\s+(\d+)[\s\S]*?pass\s+(\d+)[\s\S]*?fail\s+(\d+)(?:[\s\S]*?cancelled\s+(\d+))?/
 const WAIT_MS = 25_000
 
 /** `exit 3`, or `killed (SIGTERM)` when the child never exited. */
@@ -117,9 +120,25 @@ function judge(label, run) {
   if (!summary) {
     return { ok: false, tests: 0, pass: 0, reason: `no test summary in output (${exitLabel(run)})` }
   }
-  const [, fileTests, filePass, fileFail] = summary.map(Number)
+  const fileTests = Number(summary[1])
+  const filePass = Number(summary[2])
+  const fileFail = Number(summary[3])
   if (fileFail > 0) {
     return { ok: false, tests: fileTests, pass: filePass, reason: `${fileFail} failing test(s) (${exitLabel(run)})` }
+  }
+  const fileCancelled = summary[4] === undefined ? 0 : Number(summary[4])
+  if (fileCancelled > 0) {
+    // The suite stopped halfway: node:test cancelled everything still queued
+    // because the event loop drained ("Promise resolution is still pending but
+    // the event loop has already resolved"). Those tests never ran, so `fail 0`
+    // says nothing about them — this is red, and the reason names the count so
+    // the next reader does not have to decode an exit code 1.
+    return {
+      ok: false,
+      tests: fileTests,
+      pass: filePass,
+      reason: `${fileCancelled} test(s) cancelled — the event loop drained before they ran (${exitLabel(run)})`,
+    }
   }
   if (run.status !== null && run.status !== 0) {
     // The summary lied (or the crash happened after it): the exit status is part
@@ -239,7 +258,22 @@ function runSelfTest() {
     `ok=${redVerdict.ok} status=${redRun.status} reason=${redVerdict.reason}`,
   )
 
-  // 2. End to end through the CLI: the aggregate run must exit 1 and say why.
+  // 2. A cancelled suite is red on its own, even when the child somehow exits 0:
+  //    `fail 0` only describes the tests that ran, and cancelled ones never did.
+  //    This is the shape that let `dsh-bridge.test.mjs` look like "0 failures"
+  //    while 42 of its 90 tests never executed on Node 22.
+  const cancelledVerdict = judge('cancelled/x.test.mjs', {
+    status: 0,
+    signal: null,
+    output: '\u2139 tests 3\n\u2139 pass 2\n\u2139 fail 0\n\u2139 cancelled 1\n',
+  })
+  check(
+    'verdict: cancelled tests are red even on exit 0',
+    cancelledVerdict.ok === false && cancelledVerdict.reason.includes('cancelled'),
+    `ok=${cancelledVerdict.ok} reason=${cancelledVerdict.reason}`,
+  )
+
+  // 3. End to end through the CLI: the aggregate run must exit 1 and say why.
   const redCli = runProcess([selfPath], join(logDir, 'self-test-cli-red.log'), { OPENWHALE_TEST_ROOT: redDir })
   check(
     'runner CLI: exits 1 on the red fixture',
@@ -250,7 +284,7 @@ function runSelfTest() {
     `status=${redCli.status}`,
   )
 
-  // 3. The same CLI on a genuinely passing fixture must stay green, so the
+  // 4. The same CLI on a genuinely passing fixture must stay green, so the
   //    self-test cannot pass just by always failing.
   const greenCli = runProcess([selfPath], join(logDir, 'self-test-cli-green.log'), { OPENWHALE_TEST_ROOT: greenDir })
   check(
