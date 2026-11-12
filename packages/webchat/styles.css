@@ -871,7 +871,9 @@ pre {
   overflow-x: hidden;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-y: contain;
-  scroll-behavior: smooth;
+  /* 程序滚动必须是瞬时：smooth 会让自动跟随持续发 scroll 事件，
+   * 被当成「用户上滑」而关掉跟随（气泡在列表里却在屏幕外）。 */
+  scroll-behavior: auto;
 }
 
 .message-list {
@@ -923,7 +925,10 @@ pre {
   font-size: 15.5px;
   line-height: 1.58;
   word-break: break-word;
-  white-space: pre-wrap;
+  /* 气泡本身不能 pre-wrap：模板里的缩进换行会被当成正文渲染出来，
+   * 气泡被撑到几百像素、文字被顶出屏幕（3.0.3 已知 bug）。
+   * 保留空白的是正文节点 `.bubble-text`。 */
+  white-space: normal;
   overflow-wrap: anywhere;
 }
 
@@ -966,6 +971,11 @@ pre {
 .bubble.is-error {
   border-color: color-mix(in srgb, var(--danger) 45%, transparent);
   background: color-mix(in srgb, var(--danger-soft) 70%, var(--bubble-ai));
+}
+
+.bubble-text {
+  /* 正文保留原始空白（代码、缩进），但空白只存在于这里，不来自模板缩进。 */
+  white-space: pre-wrap;
 }
 
 .bubble-text:empty {
@@ -1560,6 +1570,23 @@ pre {
   font-size: 11px;
   font-family: var(--font-mono);
   letter-spacing: 0.03em;
+}
+
+/* 长会话的分页按钮：只挂最近 30 条，往上滚再加载。 */
+.load-earlier {
+  align-self: center;
+  margin: 4px 0 2px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2, transparent);
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.load-earlier:active {
+  color: var(--text);
 }
 
 /* 输入中的指示器 ---------------------------------------------------- */

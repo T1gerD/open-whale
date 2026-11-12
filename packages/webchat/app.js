@@ -18,8 +18,8 @@ import {
   UPLOAD_CHUNK_BYTES,
   WEBCHAT_VERSION,
   formatFingerprint,
-} from './lib/protocol.mjs?v=303'
-import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=303'
+} from './lib/protocol.mjs?v=305'
+import { formatBytes, hexFromBytes, randomBytes } from './lib/bytes.mjs?v=305'
 import {
   ENDPOINT_KIND_LABEL,
   baseOrigin,
@@ -27,14 +27,14 @@ import {
   mergeEndpointSources,
   normalizeManualEndpoint,
   orderCandidates,
-} from './lib/endpoints.mjs?v=303'
+} from './lib/endpoints.mjs?v=305'
 import {
   bindingFromPayload,
   deviceNameFromUserAgent,
   bindingSecretFromSearch,
   healthUrl,
   parsePairingInput,
-} from './lib/pairing.mjs?v=303'
+} from './lib/pairing.mjs?v=305'
 import {
   buildHello,
   createIdentity,
@@ -44,19 +44,19 @@ import {
   serializeIdentity,
   signHello,
   verifyHelloAckProof,
-} from './lib/keys.mjs?v=303'
-import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=303'
-import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=303'
-import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=303'
-import { createStorage } from './lib/storage.mjs?v=303'
+} from './lib/keys.mjs?v=305'
+import { ChatTabsModel, MESSAGE_STATUS, QUESTION_FALLBACK_TEXT, TAB_LIMIT, buildQuestionReply, buildSnapshotFrame, buildWatchFrame, composerAction, normalizeAttachments } from './lib/messages.mjs?v=305'
+import { CONNECTION_STATE, ConnectionManager, describeStatus } from './lib/connection.mjs?v=305'
+import { LEADER_ROLE, LeaderElector } from './lib/leader.mjs?v=305'
+import { createStorage } from './lib/storage.mjs?v=305'
 import {
   AttachmentUploader,
   UPLOAD_TRANSPORT,
   chooseTransport,
   createBlobSliceReader,
   readBlobAsBase64,
-} from './lib/upload.mjs?v=303'
-import { createBrowserQrReader } from './lib/qr.mjs?v=303'
+} from './lib/upload.mjs?v=305'
+import { createBrowserQrReader } from './lib/qr.mjs?v=305'
 
 // ---------------------------------------------------------------------------
 // 环境与 DOM
@@ -159,6 +159,8 @@ const state = {
   outbox: [],
   attachments: [], // 待发送附件 {id, file, name, size, mime, transport}
   queue: [], // 排队待发的消息 {id, text, attachments}
+  /** 消息列表当前渲染多少条（向上「加载更早」每次 +30）。 */
+  messageWindow: 30,
   flushing: false,
   uploader: undefined,
   sending: false,
@@ -182,7 +184,6 @@ const state = {
   approvalReplies: new Map(),
   /** 答复重发定时器。 */
   approvalReplyTimer: null,
-  lastRenderSignature: '',
   lastTabsSignature: '',
   lastActiveTabId: '',
   connectionWarned: false,
@@ -617,6 +618,32 @@ function showRecognizedPayload(payload, options = {}) {
   setBindStatus('')
 }
 
+/**
+ * 用一次性密钥向同源 `/openwhale/pairing.json` 兑换完整载荷。
+ *
+ * 短二维码（`/openwhale/app?s=…`，约 90 字符）在电脑、截图、相册、系统相机之间
+ * 都能扫得动；整段载荷（`#p=…`，850 字符）只在旧码和手动粘贴里出现。两条路径
+ * 共用这一个兑换函数，避免「相机扫能绑、相册选图不能绑」这种分裂。
+ * @param {string} secret
+ * @returns {Promise<{payload?: any, error?: string}>}
+ */
+async function redeemBindingSecret(secret) {
+  try {
+    const response = await fetch('/openwhale/pairing.json', { cache: 'no-store' })
+    const body = await response.json().catch(() => undefined)
+    const payload = body?.payload ?? body
+    if (!response.ok || !payload) {
+      return { error: '这台电脑暂时没有可用的绑定信息：请在电脑上刷新配对页后重新扫码。' }
+    }
+    if (String(payload.secret) !== secret) {
+      return { error: '这个二维码已过期或已被使用：请在电脑上刷新配对页后重新扫码。' }
+    }
+    return { payload }
+  } catch {
+    return { error: '无法读取绑定信息（网络或本地网络权限问题）：请在电脑上刷新配对页后重试。' }
+  }
+}
+
 /** 从 URL fragment 取绑定载荷（插件页面二维码 → 扫码打开本页）。 */
 async function payloadFromLocation() {
   const hash = window.location.hash ?? ''
@@ -629,32 +656,60 @@ async function payloadFromLocation() {
   // 90 来个字符（iOS 相机一扫就中），又不需要把整段载荷塞进二维码。
   const secret = bindingSecretFromSearch(window.location.search)
   if (!secret) return undefined
+  const result = await redeemBindingSecret(secret)
+  // 密钥只用于这一次兑换，立即从地址栏去掉，避免刷新时重复使用。
+  if (result.payload) history.replaceState(null, '', window.location.pathname)
+  return result
+}
+
+/**
+ * 相册/截图识别出来的文本 → 载荷。
+ *
+ * 「从相册选二维码图片」这条路以前只认 `#p=`，而那正是电脑上那张官方短码**没有**
+ * 的东西，于是扫官方码会得到「链接里没有找到绑定参数（#p=…）」，页面停在扫码页
+ * 不动（真机反馈）。这里补上短码：认出 `?s=` 就回同源兑换一次。
+ * @param {string} text
+ * @returns {Promise<{ok: true, payload: any, source: string} | {ok: false, error: string}>}
+ */
+async function payloadFromScannedText(text) {
+  const raw = String(text ?? '').trim()
+  if (raw === '') return { ok: false, error: '这张图里没有内容。' }
+  if (!/^https?:\/\//i.test(raw)) return { ok: false, error: '这张图不是绑定链接，请扫电脑上 Open Whale 的二维码。' }
+  let url
   try {
-    const response = await fetch('/openwhale/pairing.json', { cache: 'no-store' })
-    const body = await response.json().catch(() => undefined)
-    const payload = body?.payload ?? body
-    if (!response.ok || !payload) {
-      return { error: '这台电脑暂时没有可用的绑定信息：请在电脑上刷新配对页后重新扫码。' }
-    }
-    if (String(payload.secret) !== secret) {
-      return { error: '这个二维码已过期或已被使用：请在电脑上刷新配对页后重新扫码。' }
-    }
-    // 密钥只用于这一次兑换，立即从地址栏去掉，避免刷新时重复使用。
-    history.replaceState(null, '', window.location.pathname)
-    return { payload }
+    url = new URL(raw)
   } catch {
-    return { error: '无法读取绑定信息（网络或本地网络权限问题）：请在电脑上刷新配对页后重试。' }
+    return { ok: false, error: '二维码里的地址无法解析。' }
   }
+  const secret = bindingSecretFromSearch(url.search)
+  if (!secret) {
+    return { ok: false, error: '链接里没有找到绑定参数（#p=… 或 ?s=…）。' }
+  }
+  const here = window.location
+  const sameHost = url.host === here.host
+  if (!sameHost) {
+    // 二维码指向另一台电脑/另一个端口：本页没法代它兑换密钥（同源限制），
+    // 只能提示用那张码里的地址直接打开。
+    return { ok: false, error: `这张二维码属于 ${url.host}，请用它直接打开：${url.origin}${url.pathname}?s=…` }
+  }
+  const result = await redeemBindingSecret(secret)
+  return result.payload ? { ok: true, payload: result.payload, source: 'secret' } : { ok: false, error: /** @type {string} */ (result.error) }
 }
 
 /** 用户输入 / 扫码 / URL 都汇聚到这里。 */
-function connectFromInput() {
+async function connectFromInput() {
   const parsed = parsePairingInput(dom.bindInput.value)
-  if (!parsed.ok) {
-    setBindStatus(parsed.error, 'error')
+  if (parsed.ok) {
+    beginFromPayload(parsed.payload)
     return
   }
-  beginFromPayload(parsed.payload)
+  // 粘的可能是短链接（`…/openwhale/app?s=…`）：这条路径同样要能兑。
+  const short = await payloadFromScannedText(dom.bindInput.value)
+  if (short.ok) {
+    beginFromPayload(short.payload)
+    return
+  }
+  setBindStatus(parsed.error, 'error')
 }
 
 /** @param {any} payload */
@@ -938,6 +993,9 @@ function applyLeaderConnection() {
 /** 每次 socket open 都构造新的 hello（nonce 必须每次不同）。 */
 function buildHelloFrame() {
   if (!state.identity) throw new Error('没有设备身份')
+  // 每次建连都会收到一份快照或一段回放：先进入 syncing，期间的实时帧进 buffer，
+  // 等快照落地后按顺序重放。这样「重连瞬间到达的一帧」不会被晚到的快照吞掉。
+  beginChatSync(state.model?.activeSessionId, { reason: 'hello' })
   const nonce = newNonce()
   const frame = buildHello({
     identity: state.identity,
@@ -1029,7 +1087,8 @@ function handleOnline(ack, context) {
   renderTabs()
   renderHeader()
   renderStatusBanner()
-  renderMessages({ forceScroll: true })
+  // 重连对账不强制吸底：用户可能正在看历史，跟随状态交给 followBottom。
+  renderMessages()
   renderComposerState()
   if (state.settingsOpen) renderSettings()
   if (ack.pairAccepted) {
@@ -1060,6 +1119,45 @@ function endpointKindCode(kind) {
   return { lan: 'l', tailscale: 't', tunnel: 'c', loopback: 'u', unknown: 'x' }[kind] ?? 'x'
 }
 
+/**
+ * 同步兜底：电脑端版本旧 / 快照帧被代理吞掉时，不能让实时帧永远躺在 buffer 里。
+ * 4 秒没有等到快照就强制回到 ready 并按到达顺序重放——宁可少等一次对账，
+ * 也不能让聊天看起来「卡住不显示」。
+ */
+const SYNC_FALLBACK_MS = 4000
+let syncFallbackTimer = null
+
+/**
+ * 开始一次会话同步（快照请求前调用）。
+ * @param {string} [sessionId]
+ * @param {{reason?: string, rid?: string}} [options]
+ * @returns {number | undefined} generation
+ */
+function beginChatSync(sessionId, options = {}) {
+  const id = String(sessionId ?? state.model?.activeSessionId ?? '')
+  if (!state.model || id === '' || isDraftSessionId(id)) return undefined
+  const generation = state.model.beginSync(id, options)
+  if (generation === undefined) return undefined
+  if (syncFallbackTimer) clearTimeout(syncFallbackTimer)
+  syncFallbackTimer = setTimeout(() => {
+    syncFallbackTimer = null
+    if (!state.model?.isSyncing(id)) return
+    if (state.model.endSync(id, generation)) scheduleRender()
+  }, SYNC_FALLBACK_MS)
+  return generation
+}
+
+/** 同步已经落地（快照/回放被 model 应用完）后清掉兜底定时器。 */
+function finishChatSync(sessionId) {
+  const id = String(sessionId ?? '')
+  if (!state.model || id === '') return
+  if (state.model.isSyncing(id)) return
+  if (syncFallbackTimer) {
+    clearTimeout(syncFallbackTimer)
+    syncFallbackTimer = null
+  }
+}
+
 function scheduleSessionSync() {
   if (state.syncTimer) {
     clearTimeout(state.syncTimer)
@@ -1078,7 +1176,9 @@ function scheduleSessionSync() {
 function requestSessionSync() {
   if (!state.connection?.online) return
   if (!state.serverCaps.has(CAPABILITIES.SESSION_SYNC)) return
-  state.connection.send({ t: CLIENT_FRAME.SESSION_SYNC, rid: uid('sync'), cursor: state.model.cursor })
+  const rid = uid('sync')
+  beginChatSync(state.model?.activeSessionId, { reason: 'sync', rid })
+  state.connection.send({ t: CLIENT_FRAME.SESSION_SYNC, rid, cursor: state.model.cursor })
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1248,8 @@ function requestTabSnapshot(sessionId) {
     const oldest = state.pendingSnapshots.keys().next().value
     if (oldest !== undefined) state.pendingSnapshots.delete(oldest)
   }
+  // 取快照期间这个会话的实时帧先入 buffer，快照落地后按序重放。
+  beginChatSync(id, { reason: 'snapshot', rid })
   return Boolean(state.connection.send(buildSnapshotFrame(rid, id)))
 }
 
@@ -1183,7 +1285,6 @@ function requestSessionList({ force = false, quiet = false } = {}) {
  */
 function afterTabChange(options = {}) {
   const select = options.select !== false
-  state.lastRenderSignature = ''
   renderTabs()
   renderHeader()
   renderMessages({ forceScroll: true })
@@ -2002,6 +2103,11 @@ function handleFrame(frame) {
   const target = result.targetSessionId ?? state.model?.activeSessionId ?? ''
   const isActiveTarget = target === (state.model?.activeSessionId ?? '')
 
+  // 快照 / 回放已经由 model 应用并重放了 buffer：清掉同步兜底定时器。
+  if (frame.t === SERVER_FRAME.SESSION_STATE || frame.t === SERVER_FRAME.SESSION_EVENTS) {
+    finishChatSync(target)
+  }
+
   if (frame.t === SERVER_FRAME.CHAT_ACK) {
     const msgId = String(frame.rid ?? frame.callId ?? '')
     if (msgId) {
@@ -2074,19 +2180,20 @@ function handleFrame(frame) {
 
   if (result.changed) {
     scheduleRender({
+      // 快照/回放不再强制吸底：用户可能正在往上读历史，一次后台对账不该把视口拽走。
       forceScroll:
         isActiveTarget &&
-        (frame.t === SERVER_FRAME.SESSION_STATE ||
-          frame.t === SERVER_FRAME.APPROVAL_ASK ||
+        (frame.t === SERVER_FRAME.APPROVAL_ASK ||
           frame.t === SERVER_FRAME.QUESTION_ASK ||
-          frame.t === SERVER_FRAME.SESSION_EVENTS),
+          result.sessionChanged === true),
     })
     persistSoon()
   }
   if (frame.t === SERVER_FRAME.SESSION_SELECTED || result.opened) persistTabsNow()
   // 快照到达（重连/切回标签）且这一轮已经结束时，把排队消息发出去：
   // 页面在后台错过的 chat/done 不会重放，只能靠快照兜底。
-  if (frame.t === SERVER_FRAME.SESSION_STATE) flushQueue()
+  // 事件回放同理：done 可能就在这次重放的 buffer 里。
+  if (frame.t === SERVER_FRAME.SESSION_STATE || frame.t === SERVER_FRAME.SESSION_EVENTS) flushQueue()
 }
 
 /**
@@ -2397,7 +2504,7 @@ function flushOutbox() {
     }
     if (state.connection.send(frame)) state.model.resetUserMessageForRetry(entry.msgId)
   }
-  renderMessages({ forceScroll: true })
+  scheduleRender()
 }
 
 async function sendComposer() {
@@ -2438,7 +2545,14 @@ async function sendComposer() {
 }
 
 /**
- * 真正把一条消息发出去（上传附件 → 本地乐观消息 → outbox → chat/send）。
+ * 真正把一条消息发出去。
+ *
+ * 顺序是「先上屏、再上传、最后发送」：
+ *  1. 立刻插入本地乐观气泡（带附件名/大小）并同步渲染一次——用户点发送后下一帧
+ *     就能看到自己的消息，不用等 3–5 秒的附件上传；
+ *  2. 草稿会话先让电脑端建会话（标签/消息一起搬过去）；
+ *  3. 上传附件，把 fileId 补回同一条气泡；
+ *  4. 入离线队列 → 发送。任何一步失败，气泡都还在，带「重试」按钮。
  * @param {string} text
  * @param {any[]} attachments
  */
@@ -2450,6 +2564,41 @@ async function deliverMessage(text, attachments) {
       showToast('还没连上电脑，暂时不能新建会话', 'error', 3600)
       return
     }
+    const msgId = uid('m')
+    let targetSessionId = state.model.activeSessionId
+    // 附件先只带「名字 / 大小 / 类型」上屏，上传完再补 fileId。
+    state.model.addLocalUserMessage(
+      {
+        msgId,
+        text,
+        files: attachments.map(attachment => ({
+          name: attachment.name,
+          size: attachment.size,
+          mime: attachment.mime,
+        })),
+      },
+      targetSessionId,
+    )
+    // 输入区立即清空，气泡立即出现（不用等任何 await）。
+    dom.composerInput.value = ''
+    autosizeInput()
+    state.attachments = []
+    renderAttachmentsTray()
+    renderMessages({ forceScroll: true })
+    renderComposerState()
+
+    if (isDraftSessionId(targetSessionId)) {
+      // 草稿标签：先把会话真正建出来，再把标签换成真实 id（消息跟着 ChatModel 搬过去）。
+      const created = await createSessionForDraft(targetSessionId)
+      if (created === '') {
+        state.model.markUserMessageFailed(msgId, '新建会话失败')
+        renderMessages({ forceScroll: true })
+        showToast('新建会话失败，消息还没发出去', 'error', 4200)
+        return
+      }
+      targetSessionId = created
+    }
+
     /** @type {any[]} */
     const files = []
     for (const attachment of attachments) {
@@ -2463,35 +2612,28 @@ async function deliverMessage(text, attachments) {
             dataBase64,
           })
         } catch {
+          state.model.markUserMessageFailed(msgId, `${attachment.name} 读取失败`)
+          renderMessages({ forceScroll: true })
           showToast(`${attachment.name} 读取失败`, 'error')
           return
         }
       } else {
         const uploaded = await uploadAttachment(attachment)
-        if (!uploaded) return
+        if (!uploaded) {
+          state.model.markUserMessageFailed(msgId, `${attachment.name} 上传失败`)
+          renderMessages({ forceScroll: true })
+          return
+        }
         files.push(uploaded)
       }
     }
-
-    const msgId = uid('m')
-    let targetSessionId = state.model.activeSessionId
-    if (isDraftSessionId(targetSessionId)) {
-      // 草稿标签：先把会话真正建出来，再把标签换成真实 id，消息必须发到真实会话里。
-      const created = await createSessionForDraft(targetSessionId)
-      if (created === '') {
-        showToast('新建会话失败，消息还没发出去', 'error', 4200)
-        return
-      }
-      targetSessionId = created
-    }
-    state.model.addLocalUserMessage(
-      {
+    if (files.length > 0) {
+      state.model.setUserMessageFiles(
         msgId,
-        text,
-        files: files.map(file => ({ name: file.name, size: file.size, mime: file.mime, uploadId: file.uploadId })),
-      },
-      targetSessionId,
-    )
+        files.map(file => ({ name: file.name, size: file.size, mime: file.mime, fileId: file.fileId, uploadId: file.uploadId })),
+      )
+    }
+
     /** @type {any} */
     const frame = {
       t: CLIENT_FRAME.CHAT,
@@ -2506,13 +2648,11 @@ async function deliverMessage(text, attachments) {
     // 电脑端按幂等键去重，不会出现第二条消息。消息绑定它所属的标签：切到别的标签后
     // 不会再被发到错的会话里。
     queueOutbox(frame, targetSessionId)
-    if (canSendTo(targetSessionId)) state.connection.send(frame)
-    else if (state.pendingSelect) showToast('正在切换会话，消息会在切换完成后发出', '', 2600)
-
-    dom.composerInput.value = ''
-    autosizeInput()
-    state.attachments = []
-    renderAttachmentsTray()
+    if (canSendTo(targetSessionId)) {
+      state.connection.send(frame)
+    } else if (state.pendingSelect) {
+      showToast('正在切换会话，消息会在切换完成后发出', '', 2600)
+    }
     renderMessages({ forceScroll: true })
     renderComposerState()
     persistSoon(300)
@@ -2744,35 +2884,90 @@ function renderStatusBanner() {
   dom.statusBannerActions.innerHTML = actions.join('')
 }
 
-function messageSignature() {
-  if (!state.model) return ''
-  // 换标签时必须整页换掉消息，所以 activeSessionId 进签名。
-  let hash = state.model.activeSessionId.length + 7
-  hash = (hash * 31 + state.model.messages.length) % 1_000_000_007
-  for (const message of state.model.messages) {
-    hash = (hash * 31 + message.id.length + (message.text?.length ?? 0) + (message.status?.length ?? 0)) % 1_000_000_007
-    if (message.tools?.length) hash = (hash * 31 + message.tools.length) % 1_000_000_007
+// ---------------------------------------------------------------------------
+// 消息渲染：一套 keyed 差分
+// ---------------------------------------------------------------------------
+//
+// 只有一条渲染路径：`renderMessages()` 把「有序消息 + 状态卡」翻译成 keyed 节点
+// 列表，再和上一次的结果做差分——新增追加、删除移除、变化只 patch 自己。
+//
+// 之前的两套路径（整页 `innerHTML` 重建 + `appendLocalUserBubble` 快速追加）与
+// `messageSignature` 哈希跳过已经删除：它们和实时帧抢同一个列表，长会话里整页
+// 重建要一两秒，首帧被拖住，看起来就是「发出去了没反应」。
+
+/** 当前已渲染的节点：key → {node, shell?, text?, html?}。 */
+const messageView = {
+  sessionId: null,
+  items: new Map(),
+}
+
+/** 32 位字符串哈希（只用于判断「这段文本变了没有」，不参与排序）。 */
+function hashText(value) {
+  const text = String(value ?? '')
+  let hash = 0x811c9dc5
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
   }
-  hash = (hash * 31 + state.model.typing.size) % 1_000_000_007
-  // 审批卡片与当前会话标题也在同一份 DOM 里，必须进入签名，否则状态变化不会重绘。
-  hash = (hash * 31 + state.model.approvals.length) % 1_000_000_007
-  for (const approval of state.model.approvals) {
-    hash = (hash * 31 + approval.approvalId.length + (approval.replied ? 7 : 3)) % 1_000_000_007
-    // 「已转到电脑端」是只读卡片形态，必须进签名，否则状态变化不重绘。
-    hash = (hash * 31 + (approval.onDesktop ? 11 : 5)) % 1_000_000_007
-  }
-  // 提问卡片同理：批次、题目数量、是否已提交都影响渲染。
-  hash = (hash * 31 + state.model.questions.length) % 1_000_000_007
-  for (const question of state.model.questions) {
-    hash = (hash * 31 + question.questionId.length + question.items.length + (question.replied ? 7 : 3)) % 1_000_000_007
-  }
-  // 已作答的只读摘要卡也在同一份 DOM 里：条数 / 结果变化都要重绘。
-  hash = (hash * 31 + (state.model.questionLog?.length ?? 0)) % 1_000_000_007
-  for (const entry of state.model.questionLog ?? []) {
-    hash = (hash * 31 + entry.questionId.length + entry.outcome.length + (entry.answered ? 7 : 3)) % 1_000_000_007
-  }
-  hash = (hash * 31 + state.model.sessionTitle.length) % 1_000_000_007
-  return String(hash)
+  return `${text.length}:${(hash >>> 0).toString(36)}`
+}
+
+/** 清空渲染缓存与列表（换会话 / 重连对账时用）。 */
+function resetMessageView() {
+  messageView.sessionId = null
+  messageView.items.clear()
+  if (dom.messageList) dom.messageList.textContent = ''
+}
+
+/** @param {string} html @returns {Element | null} */
+function nodeFromHtml(html) {
+  const template = document.createElement('template')
+  template.innerHTML = html
+  return template.content.firstElementChild
+}
+
+/**
+ * 气泡正文（含流式光标）。渲染与 patch 都走这里，保证两条路径产出完全一致。
+ * @param {any} message
+ * @returns {string}
+ */
+function bubbleTextHtml(message) {
+  const text = message.text ? renderRichText(message.text) : ''
+  const cursor =
+    message.kind === 'assistant' && message.status === MESSAGE_STATUS.STREAMING && message.text
+      ? '<span class="stream-cursor" aria-hidden="true"></span>'
+      : ''
+  return `${text}${cursor}`
+}
+
+/**
+ * 「结构」签名：除正文以外所有会影响 HTML 的东西。
+ *
+ * 结构没变、只有正文变 → 流式只需替换 `.bubble-text` 的 innerHTML（一个文本
+ * 节点），不再重建整颗气泡；与历史长度无关。
+ * @param {any} message
+ * @param {boolean} isFirst
+ * @returns {string}
+ */
+function messageShellSignature(message, isFirst) {
+  const tools = Array.isArray(message.tools)
+    ? message.tools.map(tool => `${tool.toolCallId}:${tool.phase}:${tool.ok === false ? 0 : 1}:${tool.summary ?? ''}`).join('\u0001')
+    : ''
+  const files = Array.isArray(message.files)
+    ? message.files.map(file => `${file.name}:${file.size}:${file.fileId ?? file.uploadId ?? ''}`).join('\u0001')
+    : ''
+  return [
+    message.kind,
+    message.status ?? '',
+    message.error ?? '',
+    message.truncated === true ? 1 : 0,
+    message.durationMs ?? '',
+    tools,
+    files,
+    isFirst ? 1 : 0,
+    message.msgId ?? '',
+    message.callId ?? '',
+  ].join('\u0002')
 }
 
 let renderQueued = false
@@ -2793,44 +2988,166 @@ function scheduleRender({ forceScroll = false } = {}) {
   })
 }
 
+/** 初始渲染的消息条数：长会话不再一次挂几百条（节点保留，向上滚再加载）。 */
+const MESSAGE_WINDOW_STEP = 30
+
+/**
+ * 向上「加载更早」：扩大渲染窗口，并把视口钉在原来的位置上（新内容加在顶部，
+ * 不应该让正在看的这段文字跳走）。
+ */
+function loadEarlierMessages() {
+  const area = dom.messageArea
+  const beforeHeight = area.scrollHeight
+  const beforeTop = area.scrollTop
+  state.messageWindow = (Number(state.messageWindow) || MESSAGE_WINDOW_STEP) + MESSAGE_WINDOW_STEP
+  setFollowBottom(false)
+  renderMessages()
+  programmaticUntil = performance.now() + 160
+  area.scrollTop = Math.max(0, area.scrollHeight - beforeHeight + beforeTop)
+}
+
+/**
+ * 把一条消息的节点更新到最新（创建 / 只 patch 正文 / 重建）。
+ * @param {string} key
+ * @param {any} message
+ * @param {boolean} isFirst
+ * @returns {{node: Element, shell: string, text: string}}
+ */
+function updateMessageNode(key, message, isFirst) {
+  const shell = messageShellSignature(message, isFirst)
+  const text = hashText(message.text ?? '')
+  const current = messageView.items.get(key)
+  if (current && current.shell === shell) {
+    if (current.text === text) return current
+    const target = current.node.querySelector('.bubble-text')
+    if (target) {
+      // 流式输出：只改这一个文本节点。
+      target.innerHTML = bubbleTextHtml(message)
+      current.text = text
+      return current
+    }
+  }
+  const html = messageHtml(message, isFirst)
+  const node = html ? nodeFromHtml(html) : null
+  if (!node) {
+    if (current) {
+      current.node.remove()
+      messageView.items.delete(key)
+    }
+    return null
+  }
+  node.dataset.key = key
+  if (current) {
+    if (current.node.parentNode) current.node.replaceWith(node)
+    current.node = node
+    current.shell = shell
+    current.text = text
+    return current
+  }
+  const item = { node, shell, text }
+  messageView.items.set(key, item)
+  return item
+}
+
+/**
+ * 渲染一次消息列表（同步；调用方自己决定要不要 rAF 合并）。
+ * @param {{forceScroll?: boolean}} [options]
+ */
 function renderMessages({ forceScroll = false } = {}) {
-  if (!state.model) return
-  const signature = messageSignature()
-  if (!forceScroll && signature === state.lastRenderSignature) {
-    maybeScrollToLatest(forceScroll)
-    return
+  const model = state.model
+  if (!model) return
+  const list = dom.messageList
+  if (!list) return
+  if (messageView.sessionId !== model.activeSessionId) {
+    messageView.sessionId = model.activeSessionId
+    messageView.items.clear()
+    list.textContent = ''
+    // 换会话回到默认窗口：新会话从最近 30 条开始挂载。
+    state.messageWindow = MESSAGE_WINDOW_STEP
   }
-  state.lastRenderSignature = signature
-  const messages = state.model.messages
-  const approvals = approvalCardsHtml()
-  const questions = questionCardsHtml()
-  if (messages.length === 0) {
-    dom.messageList.innerHTML = `${questions}${approvals}${emptyStateHtml()}`
-    updateApprovalCountdowns()
-    syncApprovalTicker()
-    maybeScrollToLatest(true)
-    return
+  /** @type {Array<{key: string, html?: string, message?: any, isFirst?: boolean}>} */
+  const entries = []
+  const total = model.messages.length
+  const windowSize = Math.max(MESSAGE_WINDOW_STEP, Number(state.messageWindow) || MESSAGE_WINDOW_STEP)
+  const start = Math.max(0, total - windowSize)
+  const messages = start > 0 ? model.messages.slice(start) : model.messages
+  if (start > 0) {
+    entries.push({
+      key: 'load-earlier',
+      html: `<button class="load-earlier" type="button" data-action="load-earlier">加载更早的 ${start} 条</button>`,
+    })
   }
-  const parts = []
-  let previous = undefined
+  // 第一条可见消息的分隔条要参照窗口外的那一条，否则会在窗口边界平白多一条时间线。
+  let previous = start > 0 ? model.messages[start - 1] : undefined
   for (const message of messages) {
-    const gap = previous ? new Date(message.at).getTime() - new Date(previous.at).getTime() : Number.POSITIVE_INFINITY
+    const at = Date.parse(String(message.at ?? '')) || 0
+    const previousAt = previous ? (Date.parse(String(previous.at ?? '')) || 0) : 0
+    const gap = previous ? at - previousAt : Number.POSITIVE_INFINITY
+    // 时间分隔条绑定在「开启新一天的那条消息」上：消息被裁掉时它的分隔条一起走。
     if (!previous || gap > 10 * 60 * 1000) {
-      parts.push(`<div class="time-sep">${escapeHtml(daySeparatorText(message.at))}</div>`)
+      entries.push({ key: `sep:${message.id}`, html: `<div class="time-sep">${escapeHtml(daySeparatorText(message.at))}</div>` })
     }
     const isFirst = !previous || previous.kind !== message.kind || gap > 5 * 60 * 1000
-    const html = messageHtml(message, isFirst)
-    if (html) parts.push(html)
+    entries.push({ key: `msg:${message.id}`, message, isFirst })
     previous = message
   }
-  if (state.model.isTyping) {
-    const active = state.model.activeCallId
-    const activeMessage = active ? state.model.byId.get(`msg_${active}`) : undefined
+  if (model.isTyping) {
+    const active = model.activeCallId
+    const activeMessage = active ? model.byId.get(`msg_${active}`) : undefined
     if (!activeMessage || !activeMessage.text) {
-      parts.push('<div class="typing-row" aria-label="助理正在输入"><span></span><span></span><span></span></div>')
+      entries.push({
+        key: 'typing',
+        html: '<div class="typing-row" aria-label="助理正在输入"><span></span><span></span><span></span></div>',
+      })
     }
   }
-  dom.messageList.innerHTML = `${parts.join('')}${questions}${approvals}`
+  // 状态卡：内容变化不频繁，整块比较一次 HTML 即可；没有变化就不碰 DOM。
+  const questions = questionCardsHtml()
+  if (questions) entries.push({ key: 'stack:questions', html: questions })
+  const approvals = approvalCardsHtml()
+  if (approvals) entries.push({ key: 'stack:approvals', html: approvals })
+  if (total === 0) entries.push({ key: 'empty', html: emptyStateHtml() })
+
+  /** @type {Set<string>} */
+  const seen = new Set()
+  for (const entry of entries) {
+    seen.add(entry.key)
+    if (entry.message) {
+      updateMessageNode(entry.key, entry.message, entry.isFirst === true)
+      continue
+    }
+    const html = entry.html ?? ''
+    const current = messageView.items.get(entry.key)
+    if (!current) {
+      const node = nodeFromHtml(html)
+      if (!node) continue
+      node.dataset.key = entry.key
+      messageView.items.set(entry.key, { node, html })
+      continue
+    }
+    if (current.html === html) continue
+    const next = nodeFromHtml(html)
+    if (!next) continue
+    current.node.innerHTML = next.innerHTML
+    current.node.className = next.className
+    current.html = html
+  }
+  // 移除本次不再需要的节点，然后按顺序摆位（只在位置不对时 insertBefore）。
+  for (const [key, item] of [...messageView.items]) {
+    if (seen.has(key)) continue
+    if (item.node.parentNode === list) list.removeChild(item.node)
+    messageView.items.delete(key)
+  }
+  let reference = list.firstElementChild
+  for (const entry of entries) {
+    const item = messageView.items.get(entry.key)
+    if (!item) continue
+    if (item.node === reference) {
+      reference = reference.nextElementSibling
+      continue
+    }
+    list.insertBefore(item.node, reference)
+  }
   updateApprovalCountdowns()
   syncApprovalTicker()
   maybeScrollToLatest(forceScroll)
@@ -2867,17 +3184,13 @@ function messageHtml(message, isFirst) {
   const tools = message.kind === 'assistant' ? toolRowsHtml(message.tools) : ''
   const bubbleClasses = ['bubble']
   if (message.status === MESSAGE_STATUS.ERROR) bubbleClasses.push('is-error')
-  const text = message.text ? renderRichText(message.text) : ''
-  const cursor =
-    message.kind === 'assistant' && message.status === MESSAGE_STATUS.STREAMING && message.text
-      ? '<span class="stream-cursor" aria-hidden="true"></span>'
-      : ''
+  const text = bubbleTextHtml(message)
   const attachments = attachmentChipsHtml(message.files)
   const foot = messageFootHtml(message)
   return `<div class="${classes.join(' ')}">
     <div class="${bubbleClasses.join(' ')}">
       ${tools}
-      <div class="bubble-text">${text}${cursor}</div>
+      <div class="bubble-text">${text}</div>
       ${attachments}
     </div>
     ${foot}
@@ -2960,34 +3273,67 @@ function shortMime(mime) {
 }
 
 // 滚动 -----------------------------------------------------------------
+//
+// 跟随底部是一个**显式状态**，不再靠 scroll 事件反推用户意图：
+//  · 只有用户的真实手势（触摸移动 / 滚轮）能让它变成 false；
+//  · 程序滚动（发送、追加、下一帧校正）带一个静默窗口，不产生「用户上滑」信号；
+//  · 用户自己滑回底部、或点「回到最新」时重新打开。
+// 旧实现里 `scroll-behavior: smooth` 让程序滚动持续发 scroll 事件，于是每次自动
+// 跟随都被误判成「用户上滑」→ 关掉跟随 → 气泡在列表里、却在屏幕外。
 
-let nearBottom = true
+let followBottom = true
+/** 程序滚动的静默窗口（毫秒时间戳）；这之前的 scroll 事件不算用户意图。 */
+let programmaticUntil = 0
+let scrollCorrectionFrame = 0
+
+function atBottom() {
+  const area = dom.messageArea
+  return area.scrollHeight - area.scrollTop - area.clientHeight < 48
+}
+
+function setFollowBottom(next) {
+  if (followBottom === next) return
+  followBottom = next
+  if (dom.jumpLatest) dom.jumpLatest.hidden = next
+}
+
+/** 程序滚动：instant，并在下一帧再校正一次（图片/字体可能刚把高度撑开）。 */
+function scrollToLatest() {
+  const area = dom.messageArea
+  programmaticUntil = performance.now() + 160
+  area.scrollTop = area.scrollHeight
+  if (scrollCorrectionFrame) cancelAnimationFrame(scrollCorrectionFrame)
+  scrollCorrectionFrame = requestAnimationFrame(() => {
+    scrollCorrectionFrame = 0
+    if (!followBottom) return
+    programmaticUntil = performance.now() + 160
+    area.scrollTop = area.scrollHeight
+  })
+}
 
 function maybeScrollToLatest(force) {
-  if (force) {
-    dom.messageArea.scrollTop = dom.messageArea.scrollHeight
-    nearBottom = true
-    dom.jumpLatest.hidden = true
-    return
-  }
-  if (nearBottom) dom.messageArea.scrollTop = dom.messageArea.scrollHeight
-  dom.jumpLatest.hidden = nearBottom
+  if (force) setFollowBottom(true)
+  if (!followBottom) return
+  scrollToLatest()
 }
 
 function setupScrollTracking() {
-  dom.messageArea.addEventListener(
+  const area = dom.messageArea
+  area.addEventListener(
     'scroll',
     () => {
-      const area = dom.messageArea
-      nearBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 90
-      dom.jumpLatest.hidden = nearBottom
+      if (performance.now() < programmaticUntil) return
+      setFollowBottom(atBottom())
     },
     { passive: true },
   )
+  // 手势一开始就把静默窗口关掉：用户在这一刻之后产生的滚动必须被当真。
+  for (const type of ['touchstart', 'touchmove', 'wheel']) {
+    area.addEventListener(type, () => { programmaticUntil = 0 }, { passive: true })
+  }
   dom.jumpLatest.addEventListener('click', () => {
-    dom.messageArea.scrollTo({ top: dom.messageArea.scrollHeight, behavior: 'smooth' })
-    nearBottom = true
-    dom.jumpLatest.hidden = true
+    setFollowBottom(true)
+    scrollToLatest()
   })
 }
 
@@ -3280,7 +3626,6 @@ async function unbindDevice() {
   state.sessionListLoading = false
   state.pendingSelect = null
   state.pendingSnapshots = new Map()
-  state.lastRenderSignature = ''
   state.lastTabsSignature = ''
   state.lastActiveTabId = ''
   stopApprovalTicker()
@@ -3370,7 +3715,8 @@ function setupBindEvents() {
     setBindStatus('正在识别图片里的二维码…', 'busy')
     try {
       const reader = createBrowserQrReader()
-      const result = await reader.scanFile(file)
+      // 官方短码里没有载荷，只有 `?s=…`：认不出来时回同源兑换一次。
+      const result = await reader.scanFile(file, { resolveText: text => payloadFromScannedText(text) })
       if (!result.ok) {
         setBindStatus(result.error, 'error')
         return
@@ -3483,7 +3829,6 @@ function setupChatEvents() {
         })
         if (ok) {
           state.model?.clearActiveConversation()
-          state.lastRenderSignature = ''
           stopApprovalTicker()
           if (state.identity) storage.clearConversation(state.identity.deviceId)
           renderMessages({ forceScroll: true })
@@ -3528,6 +3873,10 @@ function setupChatEvents() {
     }
     if (target.dataset.action === 'retry') {
       retryMessage(target.dataset.msgId ?? '')
+      return
+    }
+    if (target.dataset.action === 'load-earlier') {
+      loadEarlierMessages()
       return
     }
     if (target.dataset.action === 'download-file') {

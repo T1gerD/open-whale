@@ -89,19 +89,35 @@ export async function scanBitmapForQr(bitmap, env, options = {}) {
 
 /**
  * 扫图 → 解析绑定载荷（一条龙）。
+ *
+ * `resolveText` 是给**短二维码**留的：电脑上那张码只有
+ * `http://<ip>:8787/openwhale/app?s=<一次性密钥>` 九十来个字符，本身不含载荷，
+ * 必须回到同源的 `/openwhale/pairing.json` 兑换。只有 `parsePairingInput`
+ * 认不出来（也就是短码）时才调用它——整段 `#p=` 的旧码不受影响。
  * @param {{width: number, height: number}} bitmap
  * @param {object} env
- * @param {{now?: number}} [options]
+ * @param {{now?: number, resolveText?: (text: string, context: {now: number}) => Promise<{ok: true, payload: any, source?: string} | {ok: false, error: string}>}} [options]
  * @returns {Promise<{ok: true, payload: any, source: string, method: string} | {ok: false, error: string}>}
  */
 export async function readPairingFromBitmap(bitmap, env, options = {}) {
   const scanned = await scanBitmapForQr(bitmap, env, options)
   if (!scanned.ok) return scanned
-  const parsed = parsePairingInput(scanned.text, { now: options.now })
-  if (!parsed.ok) {
-    return { ok: false, error: `二维码内容无效：${parsed.error}` }
+  const now = options.now ?? Date.now()
+  const parsed = parsePairingInput(scanned.text, { now })
+  if (parsed.ok) return { ...parsed, method: scanned.method }
+  if (typeof options.resolveText === 'function') {
+    let resolved
+    try {
+      resolved = await options.resolveText(scanned.text, { now })
+    } catch (error) {
+      resolved = { ok: false, error: `无法兑换短二维码：${/** @type {Error} */ (error).message}` }
+    }
+    if (resolved?.ok && resolved.payload) {
+      return { ok: true, payload: resolved.payload, source: resolved.source ?? 'secret', method: scanned.method }
+    }
+    return { ok: false, error: `二维码内容无效：${resolved?.error ?? parsed.error}` }
   }
-  return { ...parsed, method: scanned.method }
+  return { ok: false, error: `二维码内容无效：${parsed.error}` }
 }
 
 /**
@@ -150,8 +166,11 @@ export function createBrowserQrReader(options = {}) {
       }
       return loadImageElement(file, documentRef)
     },
-    /** @param {Blob} file */
-    async scanFile(file) {
+    /**
+     * @param {Blob} file
+     * @param {{resolveText?: (text: string, context: {now: number}) => Promise<any>}} [options]
+     */
+    async scanFile(file, options = {}) {
       const bitmap = await this.loadBitmap(file)
       try {
         const env = {
@@ -163,7 +182,7 @@ export function createBrowserQrReader(options = {}) {
           readImageData: (image, width, height) => readImageData(documentRef, image, width, height),
           jsQR: async (...args) => (await loadJsQr())(...args),
         }
-        const result = await readPairingFromBitmap({ width: bitmap.width, height: bitmap.height }, env)
+        const result = await readPairingFromBitmap({ width: bitmap.width, height: bitmap.height }, env, options)
         return result
       } finally {
         if (typeof bitmap.close === 'function') bitmap.close()

@@ -76,7 +76,7 @@ import { acceptUpgrade, validateUpgrade } from './ws.mjs'
 export const WS_PATH = '/openwhale/ws'
 
 /** This build's plugin version (the wire protocol version lives in protocol.mjs). */
-export const PLUGIN_VERSION = '3.0.3'
+export const PLUGIN_VERSION = '3.0.5'
 
 /**
  * How many concurrent sessions one device may hold.
@@ -1424,8 +1424,10 @@ export class Gateway {
   #handleSessionSync(session, frame) {
     if (!session.hasCap(CAPABILITIES.SESSION_SYNC)) return undefined
     const cursor = Number.isFinite(frame.cursor) ? Math.max(0, Math.floor(Number(frame.cursor))) : undefined
-    if (cursor === undefined) void this.#deliverSessionState(session)
-    else this.#deliverSessionEvents(session, cursor)
+    // 回传 rid：客户端用它把「这次请求的快照」和它发起的 generation 对上，
+    // 旧代快照可以直接丢弃（多标签同时同步时不会互相覆盖）。
+    if (cursor === undefined) void this.#deliverSessionState(session, { rid: frame.rid })
+    else this.#deliverSessionEvents(session, cursor, frame.rid)
     return undefined
   }
 
@@ -2099,6 +2101,14 @@ export class Gateway {
     if (!conversationId) return
     const log = this.#log(conversationId)
     const active = this.activeCalls.get(conversationId)
+    // 先取水位、再读历史。
+    //
+    // 反过来（读完历史再取 head）会得到一个比快照内容更新的水位：客户端把
+    // cursor 设成这个 head，于是「读完历史之后、取 head 之前」落进事件日志的
+    // 那条 `chat/done` 永远不会被回放——手机上表现为「工具行出来了、正文空白 /
+    // 回复被吞」。水位必须 <= 快照覆盖到的事件，宁可让客户端多重放一小段
+    // （按 seq 幂等去重），也不能跳过任何一帧。
+    const head = log.head
     const messages = await this.#snapshotMessages(conversationId, log)
     session.send({
       t: SERVER_FRAME.SESSION_STATE,
@@ -2107,7 +2117,7 @@ export class Gateway {
       ...(options.title ? { title: options.title } : {}),
       ...(options.sessionId ? { active: options.sessionId === session.sessionId } : {}),
       sessionEpoch: this.sessionEpoch,
-      head: log.head,
+      head,
       snapshot: {
         messages,
         ...(active ? { activeCall: { callId: active.callId, text: active.text, typing: active.typing !== false } } : {}),
@@ -2175,8 +2185,9 @@ export class Gateway {
   /**
    * @param {Session} session
    * @param {number} cursor
+   * @param {string} [rid]
    */
-  #deliverSessionEvents(session, cursor) {
+  #deliverSessionEvents(session, cursor, rid) {
     const conversationId = session.sessionId
     if (!conversationId) return
     const log = this.#log(conversationId)
@@ -2184,11 +2195,12 @@ export class Gateway {
     if (!events) {
       // The cursor fell out of the retention window: a full snapshot is the only
       // correct answer (a partial replay would leave a hole in the chat).
-      void this.#deliverSessionState(session)
+      void this.#deliverSessionState(session, rid ? { rid } : {})
       return
     }
     session.send({
       t: SERVER_FRAME.SESSION_EVENTS,
+      ...(rid ? { rid } : {}),
       sessionId: conversationId,
       from: cursor,
       head: log.head,

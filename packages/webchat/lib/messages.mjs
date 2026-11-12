@@ -43,6 +43,24 @@ export const FILE_MESSAGE_PREFIX = 'file_'
 export const APPROVAL_QUEUE_LIMIT = 8
 
 /**
+ * 同步期间必须排进 buffer、等快照落地后再按序应用的帧。
+ *
+ * 这份名单就是「会改消息列表」的那部分协议：会话快照是这些帧的全序基准，
+ * 先应用帧再被快照整表覆盖，正是「回复被吞、我的消息先出现又消失」的根因。
+ * 其余帧（ack / session/* / 审批 / 提问）与列表顺序无关，直接应用更稳。
+ */
+const SYNC_BUFFERED_FRAMES = new Set([
+  SERVER_FRAME.CHAT_ECHO,
+  SERVER_FRAME.CHAT_MESSAGE,
+  SERVER_FRAME.CHAT_DELTA,
+  SERVER_FRAME.CHAT_DONE,
+  SERVER_FRAME.CHAT_ERROR,
+  SERVER_FRAME.TOOL,
+  SERVER_FRAME.TYPING,
+  SERVER_FRAME.FILE_OFFERED,
+])
+
+/**
  * 这条文本是不是 harness 内部注入（运行时上下文 / 系统提醒）？
  *
  * 服务端 bridge 已经过滤，但网页版会把聊天记录缓存在 localStorage：
@@ -223,6 +241,13 @@ function snapSeqOf(raw) {
  * 一条消息的排序键（纯函数版，导出给测试与调试用）。
  * 与 `ChatModel.#orderKey` 完全同构：`[层级, 次序, 时间]`。
  *
+ * 四层，每层的「次序」都是**同一套空间内的比较**，绝不跨空间比大小：
+ *  0. 有 seq 且整表都有 seq：按事件日志 seq（权威，与电脑端一致）；
+ *  1. 没有 seq 的历史/旧缓存消息：按墙钟 at；
+ *  2. `tail`（快照之后才到达的实时消息）：按**到达序号** arrival，不看 at——
+ *     助手帧不带上行时间，用 at 会把回答排到提问前面；
+ *  3. 本地乐观消息：永远最后，等 echo 落位。
+ *
  * `bySeq` 为 false 时整表退回墙钟：见 `ChatModel.#sortMessages` 的说明——只要有
  * 任何一条已确认消息没有 seq，就不能把「有 seq 的」和「没 seq 的」混在两个层级里，
  * 否则后拿到 seq 的那条会整条跳到最前面（历史快照 + 正在生成的气泡就会这样）。
@@ -233,7 +258,15 @@ function snapSeqOf(raw) {
 export function messageOrderKey(message, bySeq = true) {
   const at = Date.parse(String(message?.at ?? '')) || 0
   // 本地乐观消息永远在最后：它们的 seq 还不存在，位置只能等网关确认。
-  if (message?.optimistic === true) return [2, at, 0]
+  if (message?.optimistic === true) return [3, at, 0]
+  // 比快照水位更新、但还没进历史的实时消息：快照之后的所有内容，排在已确认消息之后。
+  // 不能用 seq 直接比：历史 id 是 `hist_<DSH 事件 seq>`，实时帧是插件事件日志序号，
+  // 两套序号没有大小关系，混着比会把刚到的消息排到最前面。
+  if (message?.tail === true) {
+    const arrival = Number(message?.arrival)
+    // 没有 arrival（旧缓存 / 从存档恢复时漏标）：退到 at，宁可排在这一段末尾也不跳到最前。
+    return [2, Number.isFinite(arrival) ? arrival : at, at]
+  }
   const seq = finiteSeq(message?.seq)
   if (bySeq && seq !== undefined) return [0, seq, at]
   return [1, at, 0]
@@ -552,6 +585,115 @@ export class ChatModel {
     this.lastError = null
     this.myDeviceId = options.myDeviceId ?? ''
     this.changedAt = 0
+    /**
+     * 同步状态机：`ready`（可直接接收实时帧）或 `syncing`（在等快照，实时帧先进
+     * buffer）。只有这两条路径能改消息列表，且快照永远在 buffer 之前应用——
+     * 晚到的旧快照因此**物理上**不可能覆盖已经到达的新帧。
+     * @type {'ready' | 'syncing'}
+     */
+    this.syncState = 'ready'
+    /** 每次开始同步自增；旧 generation 的快照一律丢弃。 */
+    this.syncGeneration = 0
+    /** 同步期间到达的实时帧，按到达顺序保存。 */
+    this.syncBuffer = []
+    /** 本次同步的原因（诊断用）。 */
+    this.syncReason = ''
+    /** 显式快照请求的 rid → generation（服务端会原样回传 rid）。 */
+    this.syncRids = new Map()
+    /** 同步过程计数（诊断用，不影响逻辑）。 */
+    this.syncStats = { snapshots: 0, staleSnapshots: 0, replayed: 0, droppedStale: 0, degraded: 0 }
+    /**
+     * 列表里有没有「快照底座」。有的话，之后实时插入的消息就是快照的**后缀**，
+     * 排序时钉在后面；没有的话（新会话、纯实时）整表按 seq 排。
+     * @type {boolean}
+     */
+    this.hasSnapshotBase = false
+    /**
+     * 到达序号（单调递增）：给「快照之后才到」的消息一个与墙钟无关的全序。
+     *
+     * 不能用 `at` 排这一段：助手帧（`chat/message` / `chat/delta`）根本不带 `at`，
+     * 本地填的是**接收时刻**；而用户消息的 `at` 是发送时刻。异步到达时两者会交叉，
+     * 于是「回答」被排到「提问」前面。到达顺序（插入/重放顺序）才是这一段唯一
+     * 可靠的次序，正好对应同步层「按到达顺序重放 buffer」的语义。
+     * @type {number}
+     */
+    this.arrivalCounter = 0
+  }
+
+  /**
+   * 分配下一个到达序号。
+   * @returns {number}
+   */
+  #nextArrival() {
+    this.arrivalCounter += 1
+    return this.arrivalCounter
+  }
+
+  /**
+   * 给一条消息补上到达序号（已有则保留：同一条消息被重复处理时不能改次序）。
+   * @param {any} message
+   * @returns {number}
+   */
+  #noteArrival(message) {
+    if (message && !Number.isFinite(Number(message.arrival))) message.arrival = this.#nextArrival()
+    return Number(message?.arrival) || 0
+  }
+
+  /**
+   * 开始一次同步：此后到达的实时帧先入 buffer，等 `endSync` 再按序应用。
+   * @param {{reason?: string, rid?: string}} [options]
+   * @returns {number} generation（调用方在快照到达时用它判断是否已被更新的同步取代）
+   */
+  beginSync(options = {}) {
+    this.syncGeneration += 1
+    this.syncState = 'syncing'
+    this.syncReason = String(options.reason ?? 'manual')
+    this.syncBuffer = []
+    const rid = String(options.rid ?? '')
+    if (rid !== '') {
+      this.syncRids.set(rid, this.syncGeneration)
+      // 只需要记住最近几次：慢请求被取代后，rid 不该无限堆积。
+      while (this.syncRids.size > 8) {
+        const oldest = this.syncRids.keys().next().value
+        if (oldest === undefined) break
+        this.syncRids.delete(oldest)
+      }
+    }
+    return this.syncGeneration
+  }
+
+  /** 是否正在等快照（渲染层据此决定要不要显示「正在同步」）。 */
+  get isSyncing() {
+    return this.syncState === 'syncing'
+  }
+
+  /**
+   * 结束一次同步（快照已应用 / 回放已到 / 超时兜底）：按到达顺序重放 buffer。
+   * 带着 seq 且 seq 已经落在 cursor 之内的帧说明快照里已经包含它，直接丢掉。
+   * @param {number} [generation] 传入时只有当前 generation 才生效
+   * @returns {boolean} 是否真的结束了
+   */
+  endSync(generation) {
+    if (generation !== undefined && generation !== this.syncGeneration) return false
+    if (this.syncState !== 'syncing') return false
+    this.syncState = 'ready'
+    const buffer = this.syncBuffer
+    this.syncBuffer = []
+    let changed = false
+    let replayed = 0
+    for (const entry of buffer) {
+      const seq = Number(entry?.frame?.seq)
+      if (Number.isFinite(seq) && seq > 0 && seq <= this.cursor) {
+        this.syncStats.droppedStale += 1
+        continue
+      }
+      const result = this.#dispatch(entry.frame, entry.now ?? Date.now())
+      changed = changed || result.changed === true
+      replayed += 1
+    }
+    this.syncStats.replayed += replayed
+    if (replayed > 0 && changed) this.#touch()
+    return true
   }
 
   /** @param {string} deviceId */
@@ -642,19 +784,47 @@ export class ChatModel {
    * 只保留最小值（它第一次被记录的位置），否则气泡会被迟到帧推着来回跳。
    * @param {any} message
    * @param {unknown} seq
+   * @param {'log'|'history'} [space] 序号空间（实时帧是事件日志序号）
    * @returns {boolean} 位置是否变了（调用方据此决定要不要重排）
    */
-  #noteSeq(message, seq) {
+  #noteSeq(message, seq, space = 'log') {
     const value = finiteSeq(seq)
     if (value === undefined || !message) return false
     const current = finiteSeq(message.seq)
     if (current !== undefined && current <= value) return false
     message.seq = value
+    message.seqSpace = space
+    return true
+  }
+
+  /**
+   * 把一条消息钉到「快照之后」那一段（tail）。
+   *
+   * 只有已经存在快照底座、且这条消息不是从快照来的，才需要钉：它的 seq 属于插件
+   * 事件日志，和快照历史里的 `hist_<DSH seq>` 没有大小关系，混在同一个层级里比
+   * 会把刚到的消息排到最前面（真机：新发的提问跳到昨天上面）。
+   *
+   * 后续快照把它收进历史时，消息会被 `fromSnapshot` 的新对象替换，tail 自然消失。
+   * @param {any} message
+   */
+  #markTail(message) {
+    if (!message) return false
+    if (this.hasSnapshotBase !== true) return false
+    if (message.fromSnapshot === true || message.optimistic === true) return false
+    message.tail = true
+    this.#noteArrival(message)
     return true
   }
 
   #insert(message) {
     if (!message?.id || this.byId.has(message.id)) return false
+    // 快照建立之后才到达的实时消息 = 快照的后缀：钉在列表尾部（见 messageOrderKey）。
+    // 历史消息的 seq 是 DSH 事件序号、实时帧是插件日志序号，两套序号没有大小关系，
+    // 混着比会把刚到的消息排到最前面。
+    this.#markTail(message)
+    // 到达序号：反正在这一段里只对 tail 生效，但给每条都记上，重放到一半被
+    // 标记成 tail 的消息（carryOver）也有确定的次序，不会退回墙钟。
+    this.#noteArrival(message)
     // 电脑端给手机附件消息注入的提示段（“用户通过手机发来了…”）只该给模型看。
     // 任何路径进入手机聊天流都先剥掉，否则会出现一张带路径原文的异常气泡。
     if (message.kind === 'user') message.text = stripInjectedAttachmentNotice(message.text)
@@ -699,6 +869,8 @@ export class ChatModel {
     this.files.clear()
     this.cursor = 0
     this.lastError = null
+    this.hasSnapshotBase = false
+    this.arrivalCounter = 0
     this.clearApprovals()
     this.clearQuestions()
     this.#touch()
@@ -918,6 +1090,25 @@ export class ChatModel {
   }
 
   /**
+   * 补上本地用户消息的附件信息。
+   *
+   * 发送路径改成「先上屏、后上传」：气泡先带着附件名/大小出现（用户立刻看到自己
+   * 发的消息），上传完成后再把 fileId/uploadId 补进来（点得动下载）。
+   * @param {string} msgId
+   * @param {any[]} files
+   * @returns {boolean} 是否有变化
+   */
+  setUserMessageFiles(msgId, files) {
+    const message = this.byId.get(userMessageId(msgId))
+    if (!message) return false
+    const next = normalizeAttachments(files)
+    if (JSON.stringify(next) === JSON.stringify(message.files ?? [])) return false
+    message.files = next
+    this.#touch()
+    return true
+  }
+
+  /**
    * 发送失败（断线 / 服务端拒绝），UI 显示重发按钮。
    * @param {string} msgId
    * @param {string} reason
@@ -952,6 +1143,23 @@ export class ChatModel {
   applyFrame(frame, options = {}) {
     if (!frame || typeof frame.t !== 'string') return { handled: false, changed: false }
     const now = options.now ?? Date.now()
+    // 同步中：实时帧只入 buffer，绝不直接改列表（否则晚到的快照会把它覆盖掉）。
+    // 只缓冲「会改消息列表」的帧：
+    //  · `chat/ack` 只改本地乐观消息的状态，与快照无关，压住会让气泡一直「发送中」；
+    //  · `session/*` 是同步响应本身；审批/提问是独立队列且幂等。
+    if (this.syncState === 'syncing' && SYNC_BUFFERED_FRAMES.has(frame.t)) {
+      this.syncBuffer.push({ frame, now })
+      return { handled: true, changed: false, buffered: true, frame }
+    }
+    return this.#dispatch(frame, now)
+  }
+
+  /**
+   * 真正的帧分发（不含同步缓冲判定；`endSync` 重放时直接走这里）。
+   * @param {any} frame
+   * @param {number} now
+   */
+  #dispatch(frame, now) {
     switch (frame.t) {
       case SERVER_FRAME.CHAT_ACK:
         return this.#onChatAck(frame, now)
@@ -1023,19 +1231,22 @@ export class ChatModel {
       })
       // seq 才是权威次序：一旦拿到就把它从「乐观」层级挪到日志里的真实位置。
       if (this.#noteSeq(existing, frame.seq)) existing.optimistic = false
+      // 确认后才可能进 tail 段：这条提问比底座新，位置在快照之后（按到达序号）。
+      this.#markTail(existing)
       this.#advanceCursor(frame.seq)
       this.#sortMessages()
       this.#touch(now)
       return { handled: true, changed: true, frame }
     }
     const text = stripInjectedAttachmentNotice(String(frame.text ?? ''))
-    // 电脑端把同一条手机消息回显回来（或旧缓存里带着附件提示原文）时，按“同文本+
-    // 时间接近”合并到已有本地气泡，绝不再插一条重复气泡（真机：一张带路径原文的卡）。
+    // 电脑端把同一条手机消息回显回来（或旧缓存里带着附件提示原文）时，按「同文本 +
+    // 本地还没被确认」合并到已有本地气泡，绝不再插一条重复气泡。这里只认
+    // `optimistic` 标记，不再用「两分钟内」这种时间窗——消息在离线队列里可能躺很久。
     if (text.trim() !== '') {
       const duplicate = this.messages.find(message => message.kind === 'user'
         && message.id !== id
         && message.text === text
-        && (message.optimistic === true || Math.abs(now - (Date.parse(message.at ?? '') || 0)) < 120_000))
+        && message.optimistic === true)
       if (duplicate) {
         if (Array.isArray(frame.files) && frame.files.length > 0
           && (!duplicate.files || duplicate.files.length === 0)) {
@@ -1043,6 +1254,7 @@ export class ChatModel {
         }
         duplicate.status = MESSAGE_STATUS.SENT
         if (this.#noteSeq(duplicate, frame.seq)) duplicate.optimistic = false
+        this.#markTail(duplicate)
         this.#advanceCursor(frame.seq)
         this.#sortMessages()
         this.#touch(now)
@@ -1059,6 +1271,7 @@ export class ChatModel {
       msgId,
       deviceId: frame.deviceId,
       seq: Number.isFinite(Number(frame.seq)) ? Number(frame.seq) : undefined,
+      ...(Number.isFinite(Number(frame.seq)) ? { seqSpace: 'log' } : {}),
       mine: this.myDeviceId !== '' && frame.deviceId === this.myDeviceId,
     })
     this.#advanceCursor(frame.seq)
@@ -1101,19 +1314,32 @@ export class ChatModel {
     const callId = String(frame.callId ?? '')
     const messageId = String(frame.messageId ?? '')
     if (callId === '' || messageId === '') return { handled: true, changed: false, frame }
-    const parts = this.parts.get(callId) ?? new Map()
-    const index = Number.isFinite(Number(frame.index)) ? Number(frame.index) : parts.size
-    parts.set(messageId, { index, text: String(frame.text ?? '') })
-    this.parts.set(callId, parts)
+    const text = String(frame.text ?? '')
+    // 空文本的 `chat/message` 只是「这一轮开始了」的占位，不能登记成「已收到全文」：
+    // 一旦登记，后续 `chat/delta` 会被 `#onDelta` 当成重复内容整段丢掉，手机上就只剩
+    // 工具行和三个点、正文永远空白（3.0.2 修过、3.0.3 又漏掉的那个 bug）。
+    if (text !== '') {
+      const parts = this.parts.get(callId) ?? new Map()
+      const index = Number.isFinite(Number(frame.index)) ? Number(frame.index) : parts.size
+      parts.set(messageId, { index, text })
+      this.parts.set(callId, parts)
+    }
     const { message, inserted } = this.#ensureAssistantMessage(callId, now)
     this.#advanceCursor(frame.seq)
     // 助手帧没有 `at`（手机只能拿接收时刻当时间），落位一律靠 seq：重连回放时
     // 一堆帧同时到达，接收时刻和真实发生顺序完全无关。
     if (this.#noteSeq(message, frame.seq)) this.#sortMessages()
-    // 已经 chat/done 收尾的消息不允许被迟到的 chat/message 回退（重连回放时可能出现）。
-    if (!inserted && message.status === MESSAGE_STATUS.DONE) return { handled: true, changed: false, frame }
-    const text = this.#joinParts(callId)
-    const nextText = text === '' ? message.text : text
+    const joined = this.#joinParts(callId)
+    // 正文只增不退：part 全文与已累积的 delta 取更长的那个。
+    const nextText = joined.length >= String(message.text ?? '').length ? joined : message.text
+    // 快照可能先把这条标成 DONE（迟到正文被「DONE 不再改动」挡住就是「回复被吞」）。
+    // 这里只允许变长，不允许回退或清空。
+    if (!inserted && message.status === MESSAGE_STATUS.DONE) {
+      if (nextText === '' || nextText === message.text) return { handled: true, changed: false, frame }
+      message.text = nextText
+      this.#touch(now)
+      return { handled: true, changed: true, frame }
+    }
     const changed = inserted || message.text !== nextText || message.status !== MESSAGE_STATUS.STREAMING
     message.text = nextText
     message.status = MESSAGE_STATUS.STREAMING
@@ -1133,9 +1359,14 @@ export class ChatModel {
       this.deltaSeq.set(callId, seq)
     }
     // 新版电脑端会用 chat/message 推全文；这时 delta 只是心跳，不能重复拼文本。
-    if (this.parts.has(callId)) return { handled: true, changed: false, frame }
+    // 注意判定的是「已经有正文」（joinParts 非空），不是「登记过 part」——空占位
+    // 也登记过，用它判定就会把正文整段丢掉。
+    if (this.#joinParts(callId) !== '') return { handled: true, changed: false, frame }
     const existing = this.byId.get(assistantMessageId(callId))
-    if (existing && existing.status === MESSAGE_STATUS.DONE) return { handled: true, changed: false, frame }
+    // 已经有正文并且已收尾：迟到 delta 不再追加（避免重复文本）。
+    if (existing && existing.status === MESSAGE_STATUS.DONE && String(existing.text ?? '') !== '') {
+      return { handled: true, changed: false, frame }
+    }
     const { message, inserted } = this.#ensureAssistantMessage(callId, now)
     const text = String(frame.text ?? '')
     message.text = `${message.text ?? ''}${text}`
@@ -1221,11 +1452,51 @@ export class ChatModel {
     return { handled: true, changed: true, frame }
   }
 
-  /** @param {any} frame @param {number} now */
+  /**
+   * 应用一份会话快照。
+   *
+   * 这里是「多个来源抢着改同一个列表」的唯一收敛点，规则只有三条：
+   *  1. **旧 generation 的快照直接丢**（同步期间又发起了新的同步）；
+   *  2. **已有底座时，比已知水位更旧的快照直接丢**（同一会话，`head < cursor`：它
+   *     必然缺少已经应用过的实时帧——这正是「回复被回滚 62→60」）。没有底座时
+   *     必须接收：此时快照是唯一的历史来源，落后只说明它取得比那几帧实时消息早；
+   *  3. **快照只负责 `<= head` 的那一段**：本地比 head 更新的消息、以及还没被
+   *     网关确认的乐观消息，重置后原样接回去，再按到达顺序重放 buffer。
+   *
+   * 原来那套「120 秒内同文本算同一条」「空快照不清空」的时间启发式全部删除：
+   * 顺序由 head/seq 保证，去重由 id（msgId / callId / hist_seq）与计数抵消保证。
+   * @param {any} frame
+   * @param {number} now
+   */
   #onSessionState(frame, now) {
     const sessionId = String(frame.sessionId ?? this.sessionId ?? '')
     const epoch = Number.isFinite(Number(frame.sessionEpoch)) ? Number(frame.sessionEpoch) : this.sessionEpoch
     const sessionChanged = sessionId !== this.sessionId || epoch !== this.sessionEpoch
+    const head = Number(frame.head)
+    const rid = typeof frame.rid === 'string' ? frame.rid : ''
+    const ridGeneration = rid !== '' ? this.syncRids.get(rid) : undefined
+
+    // 规则 1：这次快照属于一个已经被取代的同步。
+    if (rid !== '' && ridGeneration !== undefined && ridGeneration !== this.syncGeneration) {
+      this.syncStats.staleSnapshots += 1
+      return { handled: true, changed: false, stale: true, frame }
+    }
+    // 规则 2：同一会话里，比已知水位更旧的快照。
+    //
+    // 只有「已经有底座」时才丢：底座意味着本地列表本身就是从某份快照长出来的，
+    // 再来一份更旧的快照只可能是纯回退（它会缺掉已应用过的实时帧，正是「回复被
+    // 回滚 62→60」）。**还没有底座时不能丢**——这时候快照是唯一的历史来源，
+    // head 落后只是因为它比本地那几帧实时消息取得早；丢掉它等于把整段历史扔掉
+    // （真机症状：重连后只剩刚发的一条）。这种情况交给规则 3：快照负责 `<= head`
+    // 的部分，本地更新的消息按到达顺序接在后面。
+    const sameSession = this.sessionId == null || sessionId === this.sessionId
+    if (!sessionChanged && sameSession && this.hasSnapshotBase === true
+      && Number.isFinite(head) && head > 0
+      && this.cursor > 0 && head < this.cursor) {
+      this.syncStats.staleSnapshots += 1
+      if (this.syncState === 'syncing') this.endSync(ridGeneration)
+      return { handled: true, changed: false, stale: true, frame }
+    }
     if (sessionChanged) {
       // 只清输入态；**审批不能清**：手机切走会话再切回来时，待答审批必须还在
       // （真机反馈「切会话权限审核消失」）。审批按会话路由，不会串到别的标签。
@@ -1237,31 +1508,27 @@ export class ChatModel {
     const nextMessages = []
     /** @type {Map<string, any>} */
     const nextById = new Map()
-    /** 本地是否已有「同文本」的用户气泡（老服务端快照没有 msgId 时的去重兜底）。 */
-    const localUserText = message => {
-      if (message?.kind !== 'user' || typeof message.text !== 'string') return false
-      const text = message.text.trim()
-      if (text === '') return false
-      const at = Date.parse(String(message.at ?? '')) || 0
-      return message.optimistic === true || Math.abs(now - at) < 120_000
-    }
+    /**
+     * 本地还没被网关确认的用户气泡（老服务端快照没带 msgId 时的身份兜底）。
+     * 只认 `optimistic` 标记，不再看「时间接近」——那是个猜时间的启发式。
+     * @param {any} message
+     */
+    const unconfirmedUserText = message => message?.kind === 'user'
+      && message.optimistic === true
+      && typeof message.text === 'string'
+      && message.text.trim() !== ''
     for (const raw of incoming) {
       let normalized = this.#normalizeSnapshotMessage(raw, now)
       if (!normalized || nextById.has(normalized.id)) continue
-      // 兜底（服务端尚未带 msgId 的旧版本）：同文本且时间接近的本地用户气泡视为同一条，
-      // 沿用本地 id，避免重连/切标签后同一条消息出现两个蓝色气泡。
+      // 老服务端快照不带 msgId：同文本的**本地未确认**气泡就是同一条，沿用本地 id。
       if (normalized.kind === 'user' && (typeof normalized.msgId !== 'string' || normalized.msgId === '')) {
-        const duplicate = this.messages.find(message => localUserText(message)
+        const duplicate = this.messages.find(message => unconfirmedUserText(message)
           && message.text.trim() === normalized.text.trim()
           && !nextById.has(message.id))
         if (duplicate) normalized.id = duplicate.id
       }
-      // 同一条消息在本地可能已经有更完整的乐观气泡（附件卡、mine 标记、干净文本）。
+      // 同一条消息在本地可能已经有更完整的气泡（附件卡、mine 标记、干净文本、工具流）。
       // 快照是权威文本，但不要因此丢掉这些本地信息，更不能再插一条重复气泡。
-      //
-      // 助手消息还有第二层问题：快照 id 是 `hist_<seq>`，实时帧建的是 `asst_<callId>`，
-      // 只按 id 匹配会让「工具流」在切标签/熄屏重连后整段消失。这里按 seq → callId →
-      // 同文本找到本地旧消息，沿用它的 id（后续 tool 帧才会落到同一条气泡上）。
       const previous = this.byId.get(normalized.id) ?? this.#snapshotCounterpart(normalized)
       if (previous && previous.id !== normalized.id) normalized.id = previous.id
       if (previous) {
@@ -1312,78 +1579,91 @@ export class ChatModel {
       }
       if (activeCall.typing !== false) this.typing.add(activeCall.callId)
     }
-    // 快照是权威的，但**同会话里本地还没被确认的乐观消息**不能说没就没：重连时
-    // 快照可能先到、outbox 里的消息还在等补发，丢掉它就是「我先发出的消息消失了」。
-    // 换标签时必须丢掉（那些消息属于上一个会话，不能搬到新会话里）。
-    //
-    // 但也不能留着一条历史里**已经存在**的同内容消息（消息其实送到了、只是手机没
-    // 收到 echo，且事件日志已经轮转掉了它）——那会在流里变成两条一样的气泡。
-    // 这里按「kind + text」计数抵消，和网关 mergeSnapshotMessages 的思路一致。
-    const sameSession = this.sessionId == null || sessionId === this.sessionId
+    const hadMessages = this.messages.length > 0
+    if (sameSession && hadMessages && nextMessages.length === 0
+      && Number.isFinite(head) && head > 0) {
+      // 退化快照（历史没读到 / 事件日志已轮转）：整份为空但水位在前进。
+      // 这不是「会话清空了」，而是「这份快照不可用」——保留现有列表，**不推进
+      // cursor**，让下一次 session/sync 从旧水位重放，宁可重复也不吞消息。
+      this.syncStats.degraded += 1
+      if (this.sessionId == null) {
+        this.sessionId = sessionId
+        this.sessionEpoch = epoch
+      }
+      if (this.syncState === 'syncing') this.endSync(ridGeneration)
+      return { handled: true, changed: false, sessionChanged, frame, degraded: true }
+    }
+    // 规则 3：快照只覆盖 `<= head` 的那一段。剩下的本地消息按「同 kind + 同文本」
+    // 计数抵消（快照里已有同样内容就不再接回来，避免两条一样的气泡）。
     const snapshotKeys = new Map()
     for (const message of nextMessages) {
       const key = JSON.stringify([message.kind, message.text])
       snapshotKeys.set(key, (snapshotKeys.get(key) ?? 0) + 1)
     }
-    const pendingLocal = sameSession
-      ? this.messages.filter(message => {
-        if (message?.optimistic !== true || nextById.has(message.id)) return false
+    const carryOver = []
+    if (sameSession) {
+      for (const message of this.messages) {
+        if (!message || nextById.has(message.id)) continue
+        const seq = Number(message.seq)
+        // 「比快照新」只在同一套序号空间里成立：历史消息 id 是 hist_<DSH 事件 seq>，
+        // 实时帧的 seq 是插件事件日志序号，两套序号不能直接比大小。
+        const newer = Number.isFinite(seq) && Number.isFinite(head) && message.seqSpace === 'log' && seq > head
+        if (message.optimistic !== true && !newer) continue
         const key = JSON.stringify([message.kind, message.text])
         const count = snapshotKeys.get(key) ?? 0
         if (count > 0) {
           snapshotKeys.set(key, count - 1)
-          return false
+          continue
         }
-        return true
-      })
-      : []
-    const hadMessages = this.messages.length > 0
-    // 第一次收到快照时 this.sessionId 还是 null，也算「同一会话」：不能因为会话号
-    // 尚未落库就把已有消息当成别的会话清掉。
-    const sameSessionNow = this.sessionId == null || sessionId === this.sessionId
-    if (sameSessionNow && hadMessages && nextMessages.length === 0 && pendingLocal.length === 0) {
-      // 空快照不能把已有聊天记录清空：这通常是重连瞬间历史还没读到/读到空，
-      // 真机上表现为「发送后消息整条消失，刷新才回来」。保留原列表，等下次快照对账。
-      if (this.sessionId == null) {
-        this.sessionId = sessionId
-        this.sessionEpoch = epoch
+        // 比快照新的消息钉在快照之后（按到达顺序排，不按墙钟），不参与历史 seq 的排序。
+        if (newer) {
+          message.tail = true
+          this.#noteArrival(message)
+        }
+        carryOver.push(message)
       }
-      return { handled: true, changed: false, sessionChanged, frame }
     }
-    this.messages = [...nextMessages.slice(-this.limit), ...pendingLocal]
+    this.messages = [...nextMessages.slice(-this.limit), ...carryOver]
     // 快照消息按 seq（历史 id 是 `hist_<seq>`）排，乐观消息永远排最后：
     // 手机会话「我的提问排在回复后面」就是这里按墙钟排错的。
     this.#sortMessages()
     this.#trim()
     this.byId = new Map(this.messages.map(message => [message.id, message]))
+    this.hasSnapshotBase = true
     this.parts.clear()
     this.deltaSeq.clear()
     if (typeof frame.title === 'string' && frame.title !== '') this.sessionTitle = frame.title
     this.sessionId = sessionId
     this.sessionEpoch = epoch
-    const head = Number(frame.head)
     if (Number.isFinite(head)) {
       // 换会话后 cursor 必须跟着新会话走（取快照的 head，而不是和旧会话取 max），
       // 否则下一次 session/sync 会用旧会话的 seq 去要增量。
       this.cursor = sessionChanged ? Math.max(0, head) : Math.max(this.cursor, head)
     }
     this.#touch(now)
+    this.syncStats.snapshots += 1
+    // 快照落地 → 按到达顺序重放同步期间缓存的实时帧，然后才回到 ready。
+    if (this.syncState === 'syncing') this.endSync(ridGeneration)
     return { handled: true, changed: true, sessionChanged, frame }
   }
 
   /**
-   * 快照消息与本地已有消息的对应关系（按 seq → callId → 同文本，最近的优先）。
-   * 用于把实时帧积累的 `tools`（工具流）保留到快照重建后的气泡上。
+   * 快照消息与本地已有消息的对应关系（callId → 同文本，最近的优先）。
+   *
+   * 用途：把实时帧积累的 `tools`（工具流）保留到快照重建后的气泡上，并沿用实时
+   * 气泡的 id（后续 tool 帧才能落到同一条上）。
+   *
+   * 这里**不再按 seq 匹配**：快照的历史 id 是 `hist_<DSH 事件 seq>`，实时帧的 seq
+   * 是插件事件日志序号，两套序号只是碰巧可能相等，用它匹配会在长会话里把两条
+   * 不相干的消息合并成一条。
    * @param {any} normalized
    * @returns {any | undefined}
    */
   #snapshotCounterpart(normalized) {
-    const seq = Number(normalized.seq)
     const callId = typeof normalized.callId === 'string' ? normalized.callId : ''
     for (let index = this.messages.length - 1; index >= 0; index -= 1) {
       const message = this.messages[index]
       if (message?.kind !== normalized.kind) continue
-      if (Number.isFinite(seq) && seq > 0 && Number(message.seq) === seq) return message
       if (normalized.kind === 'assistant') {
         if (callId !== '' && message.callId === callId) return message
         if (normalized.text !== '' && message.text === normalized.text) return message
@@ -1403,16 +1683,22 @@ export class ChatModel {
     let id = typeof raw.id === 'string' && raw.id !== '' ? raw.id : ''
     // 用户消息只要带了 msgId，就一律用本地气泡 id（usr_<msgId>）：服务端历史里同一条
     // 手机消息的 id 是 hist_<seq>，不统一就会出现「同一句消息显示两遍」（真机反馈）。
+    // 助手消息带了 callId 时同理：快照与实时帧用同一个 id，后续 tool/done 才会落到
+    // 同一条气泡上，不用再靠文本/序号去猜对应关系。
     if (kind === 'user' && typeof raw.msgId === 'string' && raw.msgId !== '') {
       id = userMessageId(raw.msgId)
+    } else if (kind === 'assistant' && typeof raw.callId === 'string' && raw.callId !== '') {
+      id = assistantMessageId(raw.callId)
     } else if (id === '') {
       if (kind === 'user' && typeof raw.msgId === 'string') id = userMessageId(raw.msgId)
       else if (kind === 'assistant' && typeof raw.callId === 'string') id = assistantMessageId(raw.callId)
       else return undefined
     }
+    const seq = snapSeqOf(raw)
     return {
       id,
       kind,
+      fromSnapshot: true,
       text: kind === 'user' ? stripInjectedAttachmentNotice(String(raw.text ?? '')) : String(raw.text ?? ''),
       at: String(raw.at ?? new Date(now).toISOString()),
       files: normalizeAttachments(raw.files),
@@ -1421,7 +1707,10 @@ export class ChatModel {
       callId: raw.callId,
       // 网关的历史消息 id 是 `hist_<seq>`。能解析就用 seq 排序：at 只有毫秒精度，
       // 一轮问答里很容易撞在一起，而 seq 是会话内严格单调的。
-      seq: snapSeqOf(raw),
+      seq,
+      // 序号空间：历史消息（hist_<DSH 事件 seq>）与实时帧（插件事件日志序号）是
+      // 两套单调计数，不能混着比大小。
+      ...(seq !== undefined ? { seqSpace: /^hist_/.test(String(raw.id ?? '')) ? 'history' : 'log' } : {}),
       mine: kind === 'user' && this.myDeviceId !== '' ? false : undefined,
     }
   }
@@ -1444,16 +1733,19 @@ export class ChatModel {
       const seq = Number(event?.seq)
       if (Number.isFinite(seq)) {
         if (seq <= this.cursor) continue
-        const result = this.applyFrame(event, { now })
+        // 回放事件是权威顺序，直接分发（不能再进同步 buffer）。
+        const result = this.#dispatch(event, now)
         this.cursor = Math.max(this.cursor, seq)
         changed = changed || result.changed
       } else if (event && typeof event.t === 'string') {
-        const result = this.applyFrame(event, { now })
+        const result = this.#dispatch(event, now)
         changed = changed || result.changed
       }
     }
     if (Number.isFinite(Number(frame.head))) this.cursor = Math.max(this.cursor, Number(frame.head))
     if (changed) this.#touch(now)
+    // 事件回放就是这次同步的答案：重放同步期间缓存的实时帧，然后回到 ready。
+    if (this.syncState === 'syncing') this.endSync()
     return { handled: true, changed, sessionChanged, frame }
   }
 
@@ -1599,6 +1891,7 @@ export class ChatModel {
       callId: undefined,
       status: MESSAGE_STATUS.DONE,
       seq: meta.seq,
+      ...(meta.seq !== undefined ? { seqSpace: 'log' } : {}),
     })
     this.#advanceCursor(frame.seq)
     if (inserted) this.#touch(now)
@@ -1650,7 +1943,10 @@ export class ChatModel {
         // seq / optimistic 必须落盘：刷新后若丢掉 seq，消息就退回「按 at 兜底」，
         // 顺序会在一次刷新后重新洗牌（正是这次要修的 bug）。
         seq: Number.isFinite(Number(message.seq)) ? Number(message.seq) : undefined,
+        ...(message.seqSpace ? { seqSpace: message.seqSpace } : {}),
         ...(message.optimistic === true ? { optimistic: true } : {}),
+        ...(message.tail === true ? { tail: true } : {}),
+        ...(message.fromSnapshot === true ? { fromSnapshot: true } : {}),
       })),
       // 已收尾的提问摘要也落盘：刷新后聊天流里仍能看到之前问过什么、答了什么。
       questionLog: this.questionLog.slice(-QUESTION_LOG_LIMIT).map(entry => ({
@@ -1681,6 +1977,9 @@ export class ChatModel {
     this.typing.clear()
     this.files.clear()
     this.clearApprovals()
+    // 到达序号不落盘（跨进程没有意义）：按存档里的顺序重新发号，tail 段的相对
+    // 次序就和刷新前一致。计数器必须先清零，否则会与旧号交叉。
+    this.arrivalCounter = 0
     for (const raw of saved.messages) {
       if (!raw || typeof raw.id !== 'string') continue
       const message = { ...raw, tools: Array.isArray(raw.tools) ? raw.tools : [] }
@@ -1694,7 +1993,14 @@ export class ChatModel {
       // 缓存里的 seq 是权威次序的一部分，恢复时不能丢（丢了就退回按 at 兜底排序）。
       if (Number.isFinite(Number(raw.seq))) message.seq = Number(raw.seq)
       else delete message.seq
+      if (message.seq === undefined) delete message.seqSpace
+      else if (raw.seqSpace === 'history' || raw.seqSpace === 'log') message.seqSpace = raw.seqSpace
       message.optimistic = raw.optimistic === true
+      if (raw.tail === true) message.tail = true
+      else delete message.tail
+      if (raw.fromSnapshot === true) message.fromSnapshot = true
+      else delete message.fromSnapshot
+      message.arrival = this.#nextArrival()
       this.byId.set(message.id, message)
       this.messages.push(message)
     }
@@ -1704,6 +2010,7 @@ export class ChatModel {
       if (entry) this.questionLog.push(entry)
       if (this.questionLog.length >= QUESTION_LOG_LIMIT) break
     }
+    this.hasSnapshotBase = this.messages.some(message => message.fromSnapshot === true)
     this.sessionId = typeof saved.sessionId === 'string' ? saved.sessionId : null
     this.sessionEpoch = Number.isFinite(Number(saved.sessionEpoch)) ? Number(saved.sessionEpoch) : 0
     this.sessionTitle = typeof saved.sessionTitle === 'string' ? saved.sessionTitle : ''
@@ -1825,6 +2132,32 @@ export class ChatTabsModel {
 
   get isTyping() {
     return this.active?.isTyping === true
+  }
+
+  /**
+   * 开始一次同步（某个会话）。快照请求前调用：期间到达的实时帧先进 buffer，
+   * 快照落地后按序重放。
+   * @param {string} sessionId
+   * @param {{reason?: string, rid?: string}} [options]
+   * @returns {number | undefined} generation
+   */
+  beginSync(sessionId, options = {}) {
+    const chat = this.ensureChat(sessionId)
+    return chat?.beginSync(options)
+  }
+
+  /**
+   * 结束同步并重放 buffer。
+   * @param {string} sessionId
+   * @param {number} [generation]
+   */
+  endSync(sessionId, generation) {
+    return this.chats.get(String(sessionId ?? ''))?.endSync(generation) === true
+  }
+
+  /** 某个会话是否正在同步（在等快照）。 */
+  isSyncing(sessionId) {
+    return this.chats.get(String(sessionId ?? ''))?.isSyncing === true
   }
 
   get hasPendingApprovals() {
@@ -2363,6 +2696,13 @@ export class ChatTabsModel {
     const found = this.findUserMessage(msgId)
     if (!found) return false
     return found.chat.resetUserMessageForRetry(msgId)
+  }
+
+  /** 补上某条本地用户消息的附件（先上屏、后上传）。 */
+  setUserMessageFiles(msgId, files) {
+    const found = this.findUserMessage(msgId)
+    if (!found) return false
+    return found.chat.setUserMessageFiles(msgId, files)
   }
 
   /**

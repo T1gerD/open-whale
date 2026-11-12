@@ -123,3 +123,68 @@ test('readPairingFromBitmap：二维码是别的内容时给出「内容无效�
   assert.equal(result.ok, false)
   assert.match(result.error, /二维码内容无效/)
 })
+
+test('readPairingFromBitmap：官方短码（?s=）交给 resolveText 兑换', async () => {
+  const env = {
+    detectBarcodes: async () => ['http://192.168.43.5:8787/openwhale/app?s=SHORT_SECRET_123456'],
+    readImageData: async () => {
+      throw new Error('should not be called')
+    },
+    jsQR: () => null,
+  }
+  const seen = []
+  const result = await readPairingFromBitmap({ width: 600, height: 600 }, env, {
+    now: NOW,
+    resolveText: async text => {
+      seen.push(text)
+      return { ok: true, payload: JSON.parse(PAYLOAD_TEXT), source: 'secret' }
+    },
+  })
+  assert.deepEqual(seen, ['http://192.168.43.5:8787/openwhale/app?s=SHORT_SECRET_123456'])
+  assert.equal(result.ok, true)
+  assert.equal(result.payload.id, 'cmp_1')
+  assert.equal(result.source, 'secret')
+  // 来源要标出来：短码和整段载荷在诊断里是两回事。
+  assert.equal(result.method, 'barcode-detector')
+})
+
+test('readPairingFromBitmap：短码兑换失败时把真实原因带出来', async () => {
+  const env = {
+    detectBarcodes: async () => ['http://192.168.43.5:8787/openwhale/app?s=EXPIRED_SECRET_1234'],
+    readImageData: async () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+    jsQR: () => null,
+  }
+  const result = await readPairingFromBitmap({ width: 600, height: 600 }, env, {
+    now: NOW,
+    resolveText: async () => ({ ok: false, error: '这个二维码已过期或已被使用' }),
+  })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /已过期/)
+})
+
+test('readPairingFromBitmap：兑换函数抛错也不能把页面卡在「正在识别」', async () => {
+  const env = {
+    detectBarcodes: async () => ['http://192.168.43.5:8787/openwhale/app?s=BOOM_SECRET_123456'],
+    readImageData: async () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+    jsQR: () => null,
+  }
+  const result = await readPairingFromBitmap({ width: 600, height: 600 }, env, {
+    now: NOW,
+    resolveText: async () => {
+      throw new Error('offline')
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /无法兑换短二维码/)
+})
+
+test('readPairingFromBitmap：没有 resolveText 时短码仍然报「内容无效」', async () => {
+  const env = {
+    detectBarcodes: async () => ['http://192.168.43.5:8787/openwhale/app?s=SHORT_SECRET_123456'],
+    readImageData: async () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+    jsQR: () => null,
+  }
+  const result = await readPairingFromBitmap({ width: 600, height: 600 }, env, { now: NOW })
+  assert.equal(result.ok, false)
+  assert.match(result.error, /二维码内容无效/)
+})

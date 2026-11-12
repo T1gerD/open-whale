@@ -138,7 +138,12 @@ try {
 check('health endpoint answers', health.status === 200, `HTTP ${health.status}`)
 check('plugin reports ready', health.body?.ok === true, JSON.stringify(health.body))
 const version = String(health.body?.version ?? '')
-check('plugin version is 2.2.x or newer', version === '' || /^2\.(?:[2-9]|[1-9]\d)\./.test(version), version || 'not reported by /health')
+// 版本断言必须跟着产品版本走，否则每次发版都要改这里（写死 /^2\./ 时 3.0.4 直接被判红）。
+// 只要求「不低于 2.2.0」：2.2.0 是这套验收项（session-sync / 幂等 / 端点分类）的起点。
+const versionParts = /^(\d+)\.(\d+)\./.exec(version)
+const versionOk = version === '' || (versionParts !== null
+  && (Number(versionParts[1]) > 2 || (Number(versionParts[1]) === 2 && Number(versionParts[2]) >= 2)))
+check('plugin version is 2.2.0 or newer', versionOk, version || 'not reported by /health')
 
 // ---------------------------------------------------------------------------
 // 2. pairing payload
@@ -237,7 +242,9 @@ const capabilities = Array.isArray(ack.capabilities) ? ack.capabilities : []
 check('computer advertises 2.2.0 capabilities', capabilities.includes('session-sync-v1') && capabilities.includes('chat-echo-v1'), capabilities.join(','))
 check('hello/ack carries the session id', typeof ack.sessionId === 'string' && ack.sessionId.length > 0, String(ack.sessionId))
 check('hello/ack reports the plugin version', typeof ack.serverVersion === 'string' && ack.serverVersion.length > 0, String(ack.serverVersion))
-check('hello/ack reports collaboration state', typeof ack.collaboration === 'boolean', String(ack.collaboration))
+// 协作模式在 2.3.0 被整块删除（一台设备只驱动它自己的 DSH 会话）。这里反过来断言
+// 「不再出现」：如果哪天有人把 collaboration 加回来，这条会立刻变红。
+check('hello/ack no longer carries collaboration (removed in 2.3.0)', !('collaboration' in ack), String(ack.collaboration))
 
 // ---------------------------------------------------------------------------
 // 6. session snapshot / catch-up
