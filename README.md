@@ -93,9 +93,9 @@ open-whale/
 
 | 文件 | 装到哪 | 怎么装 |
 |---|---|---|
-| `dsh-openwhale-3.0.7.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-3.0.7.tgz`，然后重启 DSH |
+| `dsh-openwhale-3.0.8.tgz` | 电脑 | `dsh plugin --profile <你的profile> add ./dsh-openwhale-3.0.8.tgz`，然后重启 DSH |
 | `dsh-openwhale.tgz` | 电脑 | 同上（固定名字的别名，脚本里用方便） |
-| `open-whale-3.0.7.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
+| `open-whale-3.0.8.apk` | 安卓手机 | 允许「安装未知来源应用」后点击安装 |
 | `open-whale.apk` | 安卓手机 | 同上（固定名字的别名） |
 
 > npm 上的 `dsh-openwhale` **尚未发布**（v2.2.0 发布时 npm 网页注册被按出口 IP 拦截，见
@@ -110,7 +110,7 @@ keystore 签名，**适合个人自用安装**；要出正式签名的包见 [do
 自己打包插件：
 
 ```bash
-node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-3.0.7.tgz（含网页版与插件页）
+node scripts/build-plugin-package.mjs            # → release/dsh-openwhale-3.0.8.tgz（含网页版与插件页）
 node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（npm publish 用）
 ```
 
@@ -123,7 +123,7 @@ node scripts/build-plugin-package.mjs --npm-dir  # → release/npm-package/（np
 从 Release 的 tarball 安装：
 
 ```bash
-dsh plugin --profile desktop add ./dsh-openwhale-3.0.7.tgz
+dsh plugin --profile desktop add ./dsh-openwhale-3.0.8.tgz
 ```
 
 开发时可以直接装源码目录（改动只需重启 DSH）：
@@ -223,7 +223,7 @@ dsh plugin --profile desktop add ./packages/plugin
 
 ```bash
 cd open-whale
-node scripts/run-tests.mjs          # 全部：57 个测试文件 / 973 项测试（v3.0.7 基线）
+node scripts/run-tests.mjs          # 全部：57 个测试文件 / 975 项测试（v3.0.8 基线）
 node scripts/run-tests.mjs qr       # 只跑文件名含 "qr" 的
 node scripts/run-tests.mjs --self-test          # 自检运行器本身（CI 也跑这一步）
 node scripts/check-docs.mjs                     # 版本 / 产物名 / 文档测试计数一致性

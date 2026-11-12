@@ -1992,6 +1992,34 @@ test('the binding page carries the v2.3.0 features the user has to see', async t
   assert.match(html, /192\.168\.1\.9:8787\/openwhale\/app/, 'the web client URL uses a phone-reachable endpoint')
 })
 
+test('连接方式选成「只走 Tailscale」时，局域网按钮不能被一起禁掉', async t => {
+  // 报过的真机问题：默认方式切成 tailscale 后，页面上「局域网」「公网隧道」
+  // 都变成「（当前不可用）」并禁用 —— 因为可选线路是用**已过滤**的地址列表算的。
+  // 用户于是再也切不回局域网，只能看着一个能用的地址被锁掉。
+  const { gateway, store, port } = await makeGateway({
+    lanUrls: ['http://192.168.1.9:8787'],
+    tunnelUrls: ['https://example.trycloudflare.com'],
+  })
+  t.after(() => gateway.close())
+  store.setPreference('connectionMode', 'tailscale')
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
+  const button = kind => html.match(new RegExp(`<button class="choice" data-mode="${kind}"[^>]*>`))?.[0] ?? ''
+  assert.ok(button('lan'), '局域网按钮必须存在')
+  assert.equal(button('lan').includes('disabled'), false, '局域网有地址就不该禁用')
+  assert.equal(button('tunnel').includes('disabled'), false, '隧道有地址就不该禁用')
+  assert.equal(html.includes('局域网（当前不可用）'), false)
+  // 地址列表确实被 mode 过滤了，页面要把这件事说清楚。
+  assert.match(html, /已按「只走 Tailscale（独立于局域网）」过滤/)
+})
+
+test('线路确实没有地址时，按钮要写明原因而不是只说不可用', async t => {
+  const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
+  t.after(() => gateway.close())
+  const html = await (await fetch(`http://127.0.0.1:${port}/openwhale`)).text()
+  assert.match(html, /公网隧道（当前不可用）/)
+  assert.match(html, /没有隧道地址：电脑端未开启隧道，或没装 cloudflared/)
+})
+
 test('a page opened through the tunnel is read-only and says so', async t => {
   const { gateway, port } = await makeGateway({ lanUrls: ['http://192.168.1.9:8787'] })
   t.after(() => gateway.close())

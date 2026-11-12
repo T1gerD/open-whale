@@ -106,8 +106,24 @@ export function renderPageHtml(view, deps) {
     }).join('')}</ul>`
     : '<p class="hint">还没有绑定任何手机。用 Open Whale 应用扫描二维码即可绑定。</p>'
 
-  // 向导第二步：只有真的存在对应地址的线路才可点（Tailscale/隧道没开就禁用）。
-  const hasKind = kind => endpoints.some(endpoint => endpoint.kind === kind)
+  // 向导第二步：线路能不能点，要看**检测到的地址**（report.detected），
+  // 不能看 endpoints —— 后者已经按当前连接方式偏好过滤过。
+  //
+  // 之前用的是 endpoints，于是出现一个死锁：把默认方式切成「只走 Tailscale」
+  // 之后，endpoints 里只剩 Tailscale，局域网按钮就被标成「当前不可用」并禁用，
+  // 用户再也切不回局域网。可选线路本来就不该被当前选择限制。
+  const detectedKinds = new Set(
+    Object.entries(report.detected ?? {})
+      .filter(([kind, urls]) => kind !== 'loopback' && Array.isArray(urls) && urls.length > 0)
+      .map(([kind]) => kind),
+  )
+  const hasKind = kind => detectedKinds.has(kind) || endpoints.some(endpoint => endpoint.kind === kind)
+  // 不可用时要说清「为什么」：是没装/没登录，还是电脑端根本没启用。
+  const unavailableWhy = {
+    lan: '没检测到局域网地址：电脑可能只监听了本机回环。',
+    tailscale: '没检测到 Tailscale 地址：电脑端 Tailscale 未登录或未连接。',
+    tunnel: '没有隧道地址：电脑端未开启隧道，或没装 cloudflared。',
+  }
   const modeList = [
     { kind: 'lan', title: '局域网', desc: '手机和电脑同一个 Wi-Fi；最省事、延迟最低。' },
     { kind: 'tailscale', title: 'Tailscale', desc: '外网也能连；手机需安装并登录同一 Tailscale 账号。' },
@@ -117,7 +133,9 @@ export function renderPageHtml(view, deps) {
     const usable = hasKind(item.kind) && local
     return `<button class="choice" data-mode="${item.kind}" ${usable ? '' : 'disabled'}>`
       + `<b>${item.title}${hasKind(item.kind) ? '' : '（当前不可用）'}</b>`
-      + `<span>${item.desc}</span></button>`
+      + `<span>${item.desc}</span>`
+      + `${usable ? '' : `<span class="why">${unavailableWhy[item.kind] ?? '当前没有该线路的地址。'}${local ? '' : '（远程打开时不可修改）'}</span>`}`
+      + '</button>'
   }).join('')
 
   return `<!doctype html>
@@ -159,6 +177,7 @@ export function renderPageHtml(view, deps) {
  .choice[disabled]{opacity:.45;cursor:not-allowed}
  .choice b{display:block;font-size:15px;margin-bottom:4px}
  .choice span{color:#93a4c8;font-size:13px;line-height:1.5}
+ .choice .why{display:block;margin-top:6px;color:#ffd479;font-size:12px}
  .back{background:#334155;color:#e8eefc;border:0;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;margin-top:12px}
  .back:hover{background:#475569}
  .web-entry{margin-top:10px}
@@ -192,7 +211,7 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
     <p><b>已绑定设备</b>：${boundDevices.length} 台 · 还可绑定 ${remaining} 台${remaining === 0 ? ' · <span class="bad">已达上限，需先移除不用的设备</span>' : ''}</p>
     ${deviceRows}
     <p><b>公钥指纹</b>：<span class="fp">${escapeHtml(formatFp(payload.ok ? payload.payload.fp : fingerprint))}</span></p>
-    <p><b>可用地址</b>：</p><ul>${addressList}</ul>
+    <p><b>可用地址</b>${mode === 'auto' ? '' : `（已按「${escapeHtml(connectionModeLabel(mode))}」过滤，其它线路见下表）`}：</p><ul>${addressList}</ul>
     <p class="hint">检测到的地址：</p><ul>${detectedSection}</ul>
   </div>
 
@@ -212,7 +231,8 @@ ${local ? '' : `<div class="banner">当前页面不是在这台电脑上打开�
 <section id="step2" hidden>
   <div class="card">
     <h2>选择第一次连接方式</h2>
-    <p class="hint">这一步选定的线路会保存为默认连接方式；手机端设置里仍可修改。灰色表示当前没有该线路的可用地址。</p>
+    <p class="hint">这一步选定的线路会保存为默认连接方式；手机端设置里仍可修改。灰色表示电脑上确实没有这类地址（原因写在按钮里）。</p>
+    <p class="hint">当前默认连接方式：<b>${escapeHtml(connectionModeLabel(mode))}</b>${mode === 'auto' ? '' : '——上方的「可用地址」只列这一类，其他线路的地址仍然存在，换一个方式即可。'}</p>
     <div class="choice-row">${modeButtons}</div>
     <p class="hint" id="mode-note"></p>
     <button class="back" id="back1">← 上一步</button>
