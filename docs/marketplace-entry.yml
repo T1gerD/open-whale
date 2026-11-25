@@ -1,0 +1,11 @@
+# Marketplace entry for awesome-dsh-plugin.
+# Mirrored to data/plugins/T1gerD__open-whale--packages-plugin.yml when the
+# listing description changes; the catalog file there is the live source.
+url: https://github.com/T1gerD/open-whale/tree/main/packages/plugin
+name: T1gerD/open-whale#dsh-openwhale
+category: remote
+description:
+  en: 'Pair once by QR code and turn your phone into a pocket entrance to the DeepSeek Harness on your computer — streamed chat, approvals and structured questions on the phone, two-way file transfer, multi-session tabs, and remote shutdown/restart over LAN, Tailscale or a tunnel. Ships an Android APK, an iOS build pipeline and a zero-install web/PWA client for iOS and HarmonyOS.'
+  zh: '扫一次码，把手机变成你这台电脑上 DeepSeek Harness 的随身入口：远程对话、手机审批与提问、双向传文件、多会话切换、远程开关机，连接可选局域网 / Tailscale / 公网隧道自动竞速。附安卓 APK、iOS 流水线与鸿蒙 / iOS 网页版（PWA）。'
+icon: https://raw.githubusercontent.com/T1gerD/open-whale/main/docs/assets/icon-360.png
+tarball: https://github.com/T1gerD/open-whale/releases/latest/download/dsh-openwhale.tgz
